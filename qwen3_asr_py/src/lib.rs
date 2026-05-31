@@ -1,5 +1,7 @@
-use pyo3::prelude::*;
+#![allow(clippy::useless_conversion)]
+
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 
 use qwen3_asr_core::{Qwen3Asr, TranscribeOptions};
 
