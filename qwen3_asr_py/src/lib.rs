@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use qwen3_asr_core::{Qwen3Asr, TranscribeOptions};
 
 fn to_py_err(err: anyhow::Error) -> PyErr {
-    PyRuntimeError::new_err(err.to_string())
+    PyRuntimeError::new_err(format!("{err:#}"))
 }
 
 #[pyclass(name = "TranscriptionResult")]
