@@ -1,0 +1,11 @@
+# Conservative default merge terms for Japanese forced-aligner token post-processing.
+#
+# This list intentionally avoids aggressive mixed Latin/digit merges so the default
+# Lindera path stays closer to official nagisa boundaries.
+
+OpenAI
+testexamplecom
+トランスフォーマー
+ファインチューニング
+マルチモーダル
+リアルタイム

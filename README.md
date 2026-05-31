@@ -2,7 +2,7 @@
 
 Python bindings for Qwen3-ASR inference using Rust and Candle.
 
-The package wraps the Candle implementation from [`lumosimmo/qwen3-asr-rs`](https://github.com/lumosimmo/qwen3-asr-rs) and exposes a small Python API.
+The package contains its own Rust/Candle runtime crate and exposes a small Python API.
 
 ## Development
 

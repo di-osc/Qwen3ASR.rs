@@ -1,6 +1,10 @@
 import pytest
+from pathlib import Path
 
 from qwen3_asr_rs import Qwen3ASR, __version__
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_is_exposed():
@@ -23,3 +27,11 @@ def test_unknown_device_has_clear_error():
 def test_empty_model_id_has_clear_error():
     with pytest.raises(RuntimeError, match="model_id_or_path must not be empty"):
         Qwen3ASR.from_pretrained("", device="cpu")
+
+
+def test_project_does_not_depend_on_reference_runtime_git_repo():
+    cargo_lock = (ROOT / "Cargo.lock").read_text()
+    core_manifest = (ROOT / "qwen3_asr_core" / "Cargo.toml").read_text()
+    combined = cargo_lock + "\n" + core_manifest
+    assert "github.com/lumosimmo/qwen3-asr-rs" not in combined
+    assert "git+https://github.com/lumosimmo/qwen3-asr-rs" not in combined

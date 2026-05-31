@@ -1,5 +1,5 @@
 [workspace]
-members = ["qwen3_asr_core", "qwen3_asr_py"]
+members = ["qwen3_asr_core", "qwen3_asr_py", "qwen3_asr_runtime"]
 resolver = "3"
 
 [workspace.package]
