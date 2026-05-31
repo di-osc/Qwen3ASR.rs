@@ -7,9 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow = "1"
 candle-core = { version = "0.9" }
+qwen3_asr_runtime = { git = "https://github.com/lumosimmo/qwen3-asr-rs.git", rev = "7984967e8701cc90bb17d06453901036e36ca578", package = "qwen3_asr", features = ["audio-loading"] }
 serde = { version = "1", features = ["derive"] }
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
-metal = ["candle-core/metal"]
+cuda = ["candle-core/cuda", "qwen3_asr_runtime/cuda"]
+metal = ["candle-core/metal", "qwen3_asr_runtime/metal"]

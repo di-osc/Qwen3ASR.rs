@@ -40,6 +40,15 @@ impl DTypePreference {
             other => bail!("unknown dtype {other:?}; expected auto, f32, f16, or bf16"),
         }
     }
+
+    pub fn to_candle(self) -> candle_core::DType {
+        match self {
+            Self::Auto => candle_core::DType::F32,
+            Self::F32 => candle_core::DType::F32,
+            Self::F16 => candle_core::DType::F16,
+            Self::BF16 => candle_core::DType::BF16,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +72,36 @@ impl fmt::Display for ResolvedDevice {
 pub struct ResolvedOptions {
     pub device: ResolvedDevice,
     pub dtype: DTypePreference,
+}
+
+impl ResolvedOptions {
+    pub fn to_candle_device(self) -> Result<candle_core::Device> {
+        match self.device {
+            ResolvedDevice::Cpu => Ok(candle_core::Device::Cpu),
+            ResolvedDevice::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    candle_core::Device::new_cuda(0)
+                        .map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"))
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    bail!("cuda device requested but this package was built without CUDA support")
+                }
+            }
+            ResolvedDevice::Metal => {
+                #[cfg(feature = "metal")]
+                {
+                    candle_core::Device::new_metal(0)
+                        .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    bail!("metal device requested but this package was built without Metal support")
+                }
+            }
+        }
+    }
 }
 
 pub fn resolve_options(device: &str, dtype: &str) -> Result<ResolvedOptions> {

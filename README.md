@@ -2,7 +2,7 @@
 
 Python bindings for Qwen3-ASR inference using Rust and Candle.
 
-The first development milestone provides the Python package shape, device/dtype validation, and a stable API for the upcoming Candle inference port.
+The package wraps the Candle implementation from [`lumosimmo/qwen3-asr-rs`](https://github.com/lumosimmo/qwen3-asr-rs) and exposes a small Python API.
 
 ## Development
 
@@ -15,6 +15,18 @@ pytest
 cargo test --workspace
 ```
 
+Build with Apple Metal support:
+
+```bash
+maturin develop --features metal
+```
+
+Build with CUDA support:
+
+```bash
+maturin develop --features cuda
+```
+
 ## Python API
 
 ```python
@@ -25,4 +37,4 @@ result = model.transcribe("audio.wav", language="Chinese")
 print(result.text)
 ```
 
-Real Candle inference is being ported from `lumosimmo/qwen3-asr-rs` in the next milestone.
+`device` accepts `auto`, `cpu`, `metal`, or `cuda`. The first real run downloads model files through Hugging Face cache if you pass a model id.
