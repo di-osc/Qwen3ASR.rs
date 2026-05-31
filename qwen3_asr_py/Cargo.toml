@@ -1,0 +1,18 @@
+[package]
+name = "qwen3_asr_py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "qwen3_asr_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+qwen3_asr_core = { path = "../qwen3_asr_core" }
+pyo3 = { version = "0.22", features = ["abi3-py39"] }
+
+[features]
+default = []
+cuda = ["qwen3_asr_core/cuda"]
+metal = ["qwen3_asr_core/metal"]

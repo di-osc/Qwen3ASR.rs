@@ -1,0 +1,15 @@
+[package]
+name = "qwen3_asr_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+candle-core = { version = "0.9" }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
