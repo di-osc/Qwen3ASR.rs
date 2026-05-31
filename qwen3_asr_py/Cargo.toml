@@ -1,14 +1,16 @@
 [package]
 name = "qwen3_asr_py"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 
 [lib]
 name = "qwen3_asr_rs"
 crate-type = ["cdylib"]
+test = false
 
 [dependencies]
+anyhow = "1"
 qwen3_asr_core = { path = "../qwen3_asr_core" }
 pyo3 = { version = "0.22", features = ["abi3-py39"] }
 

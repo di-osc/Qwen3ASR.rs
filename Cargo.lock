@@ -1072,6 +1072,7 @@ dependencies = [
 name = "qwen3_asr_py"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "pyo3",
  "qwen3_asr_core",
 ]
