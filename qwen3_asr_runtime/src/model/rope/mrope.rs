@@ -133,8 +133,8 @@ fn apply_multimodal_rotary_pos_emb_standard(
 
     let q = q.contiguous()?;
     let k = k.contiguous()?;
-    let q_embed = candle_nn::rotary_emb::rope(&q, &cos_half, &sin_half)?;
-    let k_embed = candle_nn::rotary_emb::rope(&k, &cos_half, &sin_half)?;
+    let q_embed = apply_rope_batched(&q, &cos_half, &sin_half)?;
+    let k_embed = apply_rope_batched(&k, &cos_half, &sin_half)?;
     Ok((q_embed, k_embed))
 }
 
@@ -210,9 +210,45 @@ fn apply_multimodal_rotary_pos_emb_interleaved(
 
     let q = q.contiguous()?;
     let k = k.contiguous()?;
-    let q_embed = candle_nn::rotary_emb::rope(&q, &cos_half, &sin_half)?;
-    let k_embed = candle_nn::rotary_emb::rope(&k, &cos_half, &sin_half)?;
+    let q_embed = apply_rope_batched(&q, &cos_half, &sin_half)?;
+    let k_embed = apply_rope_batched(&k, &cos_half, &sin_half)?;
     Ok((q_embed, k_embed))
+}
+
+fn apply_rope_batched(x: &Tensor, cos_half: &Tensor, sin_half: &Tensor) -> Result<Tensor> {
+    let (batch, _heads, seq_len, head_dim) = x.dims4()?;
+    let (cos_batch, cos_seq, cos_half_dim) = cos_half.dims3()?;
+    let (sin_batch, sin_seq, sin_half_dim) = sin_half.dims3()?;
+    if cos_batch != batch || sin_batch != batch {
+        candle_core::bail!("mRoPE batch mismatch: x={batch}, cos={cos_batch}, sin={sin_batch}");
+    }
+    if cos_seq < seq_len || sin_seq < seq_len {
+        candle_core::bail!("mRoPE seq mismatch: x={seq_len}, cos={cos_seq}, sin={sin_seq}");
+    }
+    if cos_half_dim * 2 != head_dim || sin_half_dim * 2 != head_dim {
+        candle_core::bail!(
+            "mRoPE dim mismatch: x={head_dim}, cos_half={cos_half_dim}, sin_half={sin_half_dim}"
+        );
+    }
+
+    let cos = Tensor::cat(&[cos_half, cos_half], candle_core::D::Minus1)?
+        .narrow(1, 0, seq_len)?
+        .unsqueeze(1)?;
+    let sin = Tensor::cat(&[sin_half, sin_half], candle_core::D::Minus1)?
+        .narrow(1, 0, seq_len)?
+        .unsqueeze(1)?;
+    (x.broadcast_mul(&cos)? + rotate_half(x)?.broadcast_mul(&sin)?)?.contiguous()
+}
+
+fn rotate_half(x: &Tensor) -> Result<Tensor> {
+    let last_dim = x.dim(candle_core::D::Minus1)?;
+    let x1 = x.narrow(candle_core::D::Minus1, 0, last_dim / 2)?;
+    let x2 = x.narrow(
+        candle_core::D::Minus1,
+        last_dim / 2,
+        last_dim - last_dim / 2,
+    )?;
+    Tensor::cat(&[&x2.neg()?, &x1], candle_core::D::Minus1)
 }
 
 #[cfg(test)]

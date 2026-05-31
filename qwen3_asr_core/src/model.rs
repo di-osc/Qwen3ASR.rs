@@ -8,12 +8,14 @@ use qwen3_asr_runtime::{
 };
 
 use crate::device::{ResolvedOptions, resolve_options};
+use crate::stream::{Qwen3AsrStream, StreamOptions};
 use crate::transcribe::{TranscribeOptions, TranscriptionResult};
 
 pub struct Qwen3Asr {
     model_id_or_path: String,
     options: ResolvedOptions,
     use_flash_attn: bool,
+    isq: Option<String>,
     inner: RuntimeQwen3Asr,
 }
 
@@ -23,6 +25,7 @@ impl fmt::Debug for Qwen3Asr {
             .field("model_id_or_path", &self.model_id_or_path)
             .field("options", &self.options)
             .field("use_flash_attn", &self.use_flash_attn)
+            .field("isq", &self.isq)
             .finish_non_exhaustive()
     }
 }
@@ -33,6 +36,7 @@ impl Qwen3Asr {
         device: &str,
         dtype: &str,
         use_flash_attn: bool,
+        isq: Option<&str>,
     ) -> Result<Self> {
         let trimmed = model_id_or_path.trim();
         if trimmed.is_empty() {
@@ -43,6 +47,7 @@ impl Qwen3Asr {
         let load_options = LoadOptions {
             dtype: options.dtype.to_candle(),
             use_flash_attn,
+            isq: isq.map(str::to_string),
         };
         let inner = RuntimeQwen3Asr::from_pretrained(trimmed, &candle_device, &load_options)
             .with_context(|| format!("failed to load Qwen3-ASR model from {trimmed:?}"))?;
@@ -50,6 +55,7 @@ impl Qwen3Asr {
             model_id_or_path: trimmed.to_string(),
             options,
             use_flash_attn,
+            isq: isq.map(str::to_string),
             inner,
         })
     }
@@ -64,6 +70,10 @@ impl Qwen3Asr {
 
     pub fn use_flash_attn(&self) -> bool {
         self.use_flash_attn
+    }
+
+    pub fn isq(&self) -> Option<&str> {
+        self.isq.as_deref()
     }
 
     pub fn transcribe_path(
@@ -92,11 +102,15 @@ impl Qwen3Asr {
         let output = outputs
             .pop()
             .ok_or_else(|| anyhow::anyhow!("runtime returned no transcription results"))?;
-        Ok(TranscriptionResult {
-            text: output.text,
-            language: Some(output.language),
-            raw: String::new(),
-        })
+        Ok(output.into())
+    }
+
+    pub fn start_stream(&self, options: StreamOptions) -> Result<Qwen3AsrStream> {
+        let runtime_stream = self
+            .inner
+            .start_stream(options.to_runtime())
+            .context("failed to start Qwen3-ASR stream")?;
+        Ok(Qwen3AsrStream::new(runtime_stream))
     }
 }
 
@@ -119,6 +133,7 @@ mod tests {
             "cpu",
             "auto",
             false,
+            None,
         )
         .unwrap_err()
         .to_string();

@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use candle_core::Device;
+use candle_core::{DType, Device, Shape, Tensor};
 use candle_nn::VarBuilder;
+use candle_nn::var_builder::SimpleBackend;
 use serde::Deserialize;
 
 use crate::config::AsrConfig;
@@ -14,6 +15,7 @@ use crate::config::AsrConfig;
 pub struct LoadOptions {
     pub dtype: candle_core::DType,
     pub use_flash_attn: bool,
+    pub isq: Option<String>,
 }
 
 impl Default for LoadOptions {
@@ -21,6 +23,7 @@ impl Default for LoadOptions {
         Self {
             dtype: candle_core::DType::F32,
             use_flash_attn: false,
+            isq: None,
         }
     }
 }
@@ -37,13 +40,13 @@ pub fn load_model_from_pretrained(
     let weights_paths = ensure_weights_files(model_id_or_path, &model_dir)?;
 
     let weight_refs: Vec<&Path> = weights_paths.iter().map(PathBuf::as_path).collect();
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(weight_refs.as_slice(), opts.dtype, device)? };
+    let vb = unsafe { var_builder_from_safetensors(weight_refs.as_slice(), opts.dtype, device)? };
     let thinker = super::thinker::ThinkerForConditionalGeneration::load(
         &config.thinker_config,
         vb.pp("thinker"),
         device,
         opts.use_flash_attn,
+        opts.isq.as_deref(),
     )?;
 
     Ok((
@@ -56,21 +59,84 @@ pub fn load_model_from_pretrained(
     ))
 }
 
+unsafe fn var_builder_from_safetensors(
+    paths: &[&Path],
+    dtype: DType,
+    device: &Device,
+) -> candle_core::Result<VarBuilder<'static>> {
+    if device.is_metal() {
+        let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(paths)? };
+        let backend = CpuStagedSafeTensors { tensors };
+        Ok(VarBuilder::from_backend(
+            Box::new(backend),
+            dtype,
+            device.clone(),
+        ))
+    } else {
+        unsafe { VarBuilder::from_mmaped_safetensors(paths, dtype, device) }
+    }
+}
+
+struct CpuStagedSafeTensors {
+    tensors: candle_core::safetensors::MmapedSafetensors,
+}
+
+impl CpuStagedSafeTensors {
+    fn load_tensor(
+        &self,
+        name: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        self.tensors
+            .load(name, &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(device)
+    }
+}
+
+impl SimpleBackend for CpuStagedSafeTensors {
+    fn get(
+        &self,
+        shape: Shape,
+        name: &str,
+        _hint: candle_nn::Init,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let tensor = self.load_tensor(name, dtype, device)?;
+        if tensor.shape() != &shape {
+            candle_core::bail!(
+                "shape mismatch for {name}: expected={shape:?}, got={:?}",
+                tensor.shape()
+            );
+        }
+        Ok(tensor)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.tensors.get(name).is_ok()
+    }
+}
+
 #[cfg(not(feature = "flash-attn"))]
-fn validate_load_options(_device: &Device, opts: &LoadOptions) -> Result<()> {
+fn validate_load_options(device: &Device, opts: &LoadOptions) -> Result<()> {
     if opts.use_flash_attn {
         bail!(
             "flash-attn was requested but is not enabled in this build. Rebuild with `--features flash-attn`."
         );
     }
+    validate_metal_dtype(device, opts)?;
     Ok(())
 }
 
 #[cfg(feature = "flash-attn")]
 fn validate_load_options(device: &Device, opts: &LoadOptions) -> Result<()> {
     if !opts.use_flash_attn {
-        return Ok(());
+        return validate_metal_dtype(device, opts);
     }
+
+    validate_metal_dtype(device, opts)?;
 
     if !device.is_cuda() {
         bail!(
@@ -84,6 +150,13 @@ fn validate_load_options(device: &Device, opts: &LoadOptions) -> Result<()> {
         other => bail!("flash-attn requires dtype f16/bf16, got {other:?}"),
     }
 
+    Ok(())
+}
+
+fn validate_metal_dtype(device: &Device, opts: &LoadOptions) -> Result<()> {
+    if device.is_metal() && opts.dtype == DType::BF16 {
+        bail!("Metal bf16 kernels are incomplete in Candle; use dtype=\"auto\" or dtype=\"f16\"");
+    }
     Ok(())
 }
 

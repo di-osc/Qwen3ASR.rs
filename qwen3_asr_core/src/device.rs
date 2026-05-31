@@ -193,4 +193,13 @@ mod tests {
         assert_eq!(resolved.dtype, DTypePreference::BF16);
         Ok(())
     }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_auto_dtype_uses_f16_compute() -> anyhow::Result<()> {
+        let resolved = resolve_options("metal", "auto")?;
+        assert_eq!(resolved.device, ResolvedDevice::Metal);
+        assert_eq!(resolved.dtype, DTypePreference::F16);
+        Ok(())
+    }
 }

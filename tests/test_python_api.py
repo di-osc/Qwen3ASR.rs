@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from qwen3_asr_rs import Qwen3ASR, __version__
+from qwen3_asr_rs import Qwen3ASR, Qwen3ASRStream, __version__
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,9 +29,19 @@ def test_empty_model_id_has_clear_error():
         Qwen3ASR.from_pretrained("", device="cpu")
 
 
+def test_stream_type_is_exposed():
+    assert Qwen3ASRStream.__name__ == "Qwen3ASRStream"
+
+
 def test_project_does_not_depend_on_reference_runtime_git_repo():
     cargo_lock = (ROOT / "Cargo.lock").read_text()
     core_manifest = (ROOT / "qwen3_asr_core" / "Cargo.toml").read_text()
     combined = cargo_lock + "\n" + core_manifest
     assert "github.com/lumosimmo/qwen3-asr-rs" not in combined
     assert "git+https://github.com/lumosimmo/qwen3-asr-rs" not in combined
+
+
+def test_backend_feature_builds_keep_pyo3_extension_module_enabled():
+    py_manifest = (ROOT / "qwen3_asr_py" / "Cargo.toml").read_text()
+    assert 'default = ["extension-module"]' in py_manifest
+    assert 'extension-module = ["pyo3/extension-module"]' in py_manifest

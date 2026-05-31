@@ -12,6 +12,7 @@ pub mod forced_aligner;
 
 use anyhow::Result;
 use candle_core::Device;
+use std::sync::Arc;
 
 pub use audio::input::AudioInput;
 pub use inference::streaming::AsrStream;
@@ -23,10 +24,10 @@ pub use processor::AsrProcessor;
 
 #[derive(Debug)]
 pub struct Qwen3Asr {
-    device: Device,
+    device: Arc<Device>,
     config: config::AsrConfig,
-    processor: AsrProcessor,
-    _model: model::AsrModel,
+    processor: Arc<AsrProcessor>,
+    _model: Arc<model::AsrModel>,
 }
 
 impl Qwen3Asr {
@@ -55,15 +56,15 @@ impl Qwen3Asr {
         let tokenizer = processor::tokenizer::Tokenizer::from_pretrained(model_id_or_path)?;
         let processor = AsrProcessor::new(tokenizer);
         Ok(Self {
-            device: device.clone(),
+            device: Arc::new(device.clone()),
             config,
-            processor,
-            _model: model,
+            processor: Arc::new(processor),
+            _model: Arc::new(model),
         })
     }
 
     pub fn device(&self) -> &Device {
-        &self.device
+        self.device.as_ref()
     }
 
     pub fn config(&self) -> &config::AsrConfig {
@@ -71,7 +72,7 @@ impl Qwen3Asr {
     }
 
     pub fn processor(&self) -> &AsrProcessor {
-        &self.processor
+        self.processor.as_ref()
     }
 
     pub fn transcribe(
@@ -80,9 +81,9 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<Vec<AsrTranscription>> {
         inference::transcribe::transcribe(
-            &self._model,
-            &self.processor,
-            &self.device,
+            self._model.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
             &audio,
             &opts,
         )
@@ -95,9 +96,9 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<(Vec<AsrTranscription>, TranscribeTimings)> {
         inference::transcribe::transcribe_timed(
-            &self._model,
-            &self.processor,
-            &self.device,
+            self._model.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
             &audio,
             &opts,
         )
@@ -111,9 +112,9 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<Vec<AsrTranscription>> {
         inference::transcribe::transcribe_with_forced_aligner(
-            &self._model,
-            &self.processor,
-            &self.device,
+            self._model.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
             forced_aligner,
             &audio,
             &opts,
@@ -128,17 +129,22 @@ impl Qwen3Asr {
         opts: TranscribeOptions,
     ) -> Result<(Vec<AsrTranscription>, TranscribeTimings)> {
         inference::transcribe::transcribe_with_forced_aligner_timed(
-            &self._model,
-            &self.processor,
-            &self.device,
+            self._model.as_ref(),
+            self.processor.as_ref(),
+            self.device.as_ref(),
             forced_aligner,
             &audio,
             &opts,
         )
     }
 
-    pub fn start_stream(&self, opts: StreamOptions) -> Result<AsrStream<'_>> {
-        inference::streaming::start_stream(&self._model, &self.processor, &self.device, &opts)
+    pub fn start_stream(&self, opts: StreamOptions) -> Result<AsrStream> {
+        inference::streaming::start_stream(
+            Arc::clone(&self._model),
+            Arc::clone(&self.processor),
+            Arc::clone(&self.device),
+            &opts,
+        )
     }
 
     pub fn require_ready(&self) -> Result<()> {

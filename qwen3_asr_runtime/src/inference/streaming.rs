@@ -13,6 +13,7 @@
 
 use anyhow::{Result, bail};
 use candle_core::{Device, Tensor};
+use std::sync::Arc;
 
 use crate::audio::SAMPLE_RATE_HZ;
 use crate::audio::input::AudioInput;
@@ -50,10 +51,10 @@ fn recompute_from_for_stream_append(cache_frames: usize, segment_frames: usize) 
 }
 
 #[derive(Debug)]
-pub struct AsrStream<'a> {
-    model: &'a AsrModel,
-    processor: &'a AsrProcessor,
-    device: &'a Device,
+pub struct AsrStream {
+    model: Arc<AsrModel>,
+    processor: Arc<AsrProcessor>,
+    device: Arc<Device>,
     opts: StreamOptions,
 
     chunk_size_samples: usize,
@@ -72,7 +73,7 @@ pub struct AsrStream<'a> {
     last: Option<AsrTranscription>,
 }
 
-impl<'a> AsrStream<'a> {
+impl AsrStream {
     fn audio_window_frames(&self) -> Result<Option<usize>> {
         let Some(sec) = self.opts.audio_window_sec else {
             return Ok(None);
@@ -175,7 +176,8 @@ impl<'a> AsrStream<'a> {
             feats_flat.extend_from_slice(slice);
         }
 
-        let input_features = Tensor::from_vec(feats_flat, (1usize, mel, frames), self.device)?;
+        let input_features =
+            Tensor::from_vec(feats_flat, (1usize, mel, frames), self.device.as_ref())?;
 
         let mask = self.features.feature_attention_mask();
         let mask_slice = mask.get(frames_range.start..frames_range.end).ok_or_else(|| {
@@ -373,7 +375,7 @@ impl<'a> AsrStream<'a> {
     ) -> Result<Vec<u32>> {
         greedy_generate_cached(
             &self.model.thinker,
-            self.device,
+            self.device.as_ref(),
             input_ids,
             attention_mask,
             Some(audio_features),
@@ -726,12 +728,12 @@ impl<'a> AsrStream<'a> {
     }
 }
 
-pub fn start_stream<'a>(
-    model: &'a AsrModel,
-    processor: &'a AsrProcessor,
-    device: &'a Device,
+pub fn start_stream(
+    model: Arc<AsrModel>,
+    processor: Arc<AsrProcessor>,
+    device: Arc<Device>,
     opts: &StreamOptions,
-) -> Result<AsrStream<'a>> {
+) -> Result<AsrStream> {
     let mut opts = opts.clone();
 
     if !opts.chunk_size_sec.is_finite() || opts.chunk_size_sec <= 0.0 {
@@ -773,7 +775,7 @@ pub fn start_stream<'a>(
     chunk_size_samples = chunk_size_samples.max(1);
 
     let prompt_raw = processor.build_text_prompt(opts.context.as_str(), opts.language.as_deref());
-    let eos_token_ids = build_eos_token_ids(processor)?;
+    let eos_token_ids = build_eos_token_ids(processor.as_ref())?;
 
     Ok(AsrStream {
         model,

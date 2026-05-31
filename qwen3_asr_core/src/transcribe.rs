@@ -33,6 +33,16 @@ pub struct TranscriptionResult {
     pub raw: String,
 }
 
+impl From<qwen3_asr_runtime::AsrTranscription> for TranscriptionResult {
+    fn from(output: qwen3_asr_runtime::AsrTranscription) -> Self {
+        Self {
+            text: output.text,
+            language: Some(output.language),
+            raw: String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TranscribeOptions;

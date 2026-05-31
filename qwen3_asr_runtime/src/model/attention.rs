@@ -226,4 +226,31 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_make_causal_mask_cached_decode_one_without_padding_is_noop() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let batch = 2usize;
+        let cache_len = 5usize;
+        let new_len = 1usize;
+
+        let mask = make_causal_mask_cached(
+            None,
+            batch,
+            cache_len,
+            new_len,
+            candle_core::DType::F32,
+            &device,
+        )?;
+        if mask.dims() != vec![batch, 1, new_len, cache_len + new_len] {
+            anyhow::bail!("unexpected mask dims: {:?}", mask.dims());
+        }
+
+        let values = mask.flatten_all()?.to_vec1::<f32>()?;
+        if values.iter().any(|&v| v != 0.0) {
+            anyhow::bail!("decode-one no-padding mask should be all zeros: {values:?}");
+        }
+
+        Ok(())
+    }
 }

@@ -1,0 +1,92 @@
+use std::path::Path;
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use candle_core::{DType, Device};
+use qwen3_asr_runtime::model::isq_linear::{isq_quantize_time_us, reset_isq_quantize_time};
+use qwen3_asr_runtime::{AudioInput, Batch, LoadOptions, Qwen3Asr, TranscribeOptions};
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let model = args
+        .next()
+        .unwrap_or_else(|| "Qwen/Qwen3-ASR-0.6B".to_string());
+    let audio = args
+        .next()
+        .unwrap_or_else(|| "fixtures/audio/asr_en_16k.wav".to_string());
+    let repeats = args
+        .next()
+        .as_deref()
+        .unwrap_or("3")
+        .parse::<usize>()
+        .context("failed to parse repeats")?;
+    let max_new_tokens = args
+        .next()
+        .as_deref()
+        .unwrap_or("128")
+        .parse::<usize>()
+        .context("failed to parse max_new_tokens")?;
+    let isq = args.next();
+
+    let device = Device::new_metal(0).context("failed to create Metal device")?;
+    reset_isq_quantize_time();
+    let start_load = Instant::now();
+    let model = Qwen3Asr::from_pretrained(
+        &model,
+        &device,
+        &LoadOptions {
+            dtype: DType::F16,
+            use_flash_attn: false,
+            isq,
+        },
+    )
+    .context("failed to load model")?;
+    let load_ms = start_load.elapsed().as_secs_f64() * 1000.0;
+    let isq_quant_ms = isq_quantize_time_us() as f64 / 1000.0;
+    println!("load_ms={load_ms:.3} isq_quant_ms={isq_quant_ms:.3}");
+
+    let opts = TranscribeOptions {
+        context: Batch::one(String::new()),
+        language: Batch::one(Some("English".to_string())),
+        return_timestamps: false,
+        max_new_tokens,
+        max_batch_size: 1,
+        chunk_max_sec: None,
+        bucket_by_length: false,
+    };
+
+    let audio_path = Path::new(&audio);
+    let mut totals = Vec::with_capacity(repeats);
+    for run in 0..repeats {
+        let start = Instant::now();
+        let (out, timings) =
+            model.transcribe_timed(vec![AudioInput::Path(audio_path)], opts.clone())?;
+        let total = start.elapsed();
+        let text = out.first().map(|o| o.text.as_str()).unwrap_or("");
+        let decode_ms = timings.generation.decode_us as f64 / 1000.0;
+        let decode_tokens_per_s = if timings.generation.decode_us == 0 {
+            0.0
+        } else {
+            timings.generation.tokens_generated as f64
+                / (timings.generation.decode_us as f64 / 1_000_000.0)
+        };
+        println!(
+            "run={} wall_ms={} timed_total_ms={} audio_encoder_ms={} prefill_ms={} decode_ms={} steps={} tokens={} decode_tokens_per_s={:.3} text={:?}",
+            run + 1,
+            total.as_millis(),
+            timings.total_us / 1000,
+            timings.audio_encoder_us / 1000,
+            timings.generation.prefill_us / 1000,
+            decode_ms.round() as u64,
+            timings.generation.steps,
+            timings.generation.tokens_generated,
+            decode_tokens_per_s,
+            text
+        );
+        totals.push(total.as_secs_f64());
+    }
+
+    let avg = totals.iter().sum::<f64>() / totals.len().max(1) as f64;
+    println!("avg_wall_ms={:.3}", avg * 1000.0);
+    Ok(())
+}

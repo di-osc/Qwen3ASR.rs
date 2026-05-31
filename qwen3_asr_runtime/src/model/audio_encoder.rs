@@ -31,6 +31,53 @@ fn maybe_contiguous_for_metal(x: Tensor) -> Result<Tensor> {
     }
 }
 
+fn cast_input_features_to_weight_dtype(
+    input_features: &Tensor,
+    want_dtype: DType,
+) -> Result<Tensor> {
+    if input_features.dtype() == want_dtype {
+        return Ok(input_features.clone());
+    }
+
+    if input_features.device().is_metal() && want_dtype == DType::BF16 {
+        return input_features
+            .to_device(&Device::Cpu)?
+            .to_dtype(want_dtype)?
+            .to_device(input_features.device());
+    }
+
+    input_features.to_dtype(want_dtype)
+}
+
+fn pad_audio_chunk(chunk: &Tensor, dim: usize, left: usize, right: usize) -> Result<Tensor> {
+    if chunk.device().is_metal() && chunk.dtype() == DType::BF16 && (left != 0 || right != 0) {
+        return chunk
+            .to_device(&Device::Cpu)?
+            .contiguous()?
+            .pad_with_zeros(dim, left, right)?
+            .to_device(chunk.device());
+    }
+
+    chunk.pad_with_zeros(dim, left, right)
+}
+
+fn stack_audio_chunks(chunks: &[Tensor]) -> Result<Tensor> {
+    let first = chunks
+        .first()
+        .ok_or_else(|| candle_core::Error::Msg("missing audio chunks".to_string()))?;
+
+    if first.device().is_metal() && first.dtype() == DType::BF16 {
+        let cpu_chunks = chunks
+            .iter()
+            .map(|chunk| chunk.to_device(&Device::Cpu)?.contiguous())
+            .collect::<Result<Vec<_>>>()?;
+        let stacked = Tensor::stack(&cpu_chunks.iter().collect::<Vec<_>>(), 0)?;
+        return stacked.to_device(first.device());
+    }
+
+    Tensor::stack(&chunks.iter().collect::<Vec<_>>(), 0)
+}
+
 fn cu_seqlens_from_aftercnn_len(
     aftercnn_len: usize,
     max_chunk_len_aftercnn: usize,
@@ -501,11 +548,7 @@ impl AudioTower {
         feature_lens: &[usize],
     ) -> Result<Tensor> {
         let want_dtype = self.conv2d1.weight().dtype();
-        let input_features = if input_features.dtype() == want_dtype {
-            input_features.clone()
-        } else {
-            input_features.to_dtype(want_dtype)?
-        };
+        let input_features = cast_input_features_to_weight_dtype(input_features, want_dtype)?;
 
         let (batch, mel, frames) = input_features.dims3()?;
         if mel != self.config.num_mel_bins {
@@ -585,7 +628,7 @@ impl AudioTower {
             }
             let chunk = input_t.narrow(0, offset, len)?; // (len, mel)
             let pad = max_chunk_len.saturating_sub(len);
-            padded_chunks.push(chunk.pad_with_zeros(0, 0, pad)?);
+            padded_chunks.push(pad_audio_chunk(&chunk, 0, 0, pad)?);
             aftercnn_lens.push(feat_extract_output_length(len));
             offset = offset.saturating_add(len);
         }
@@ -604,7 +647,7 @@ impl AudioTower {
         }
 
         // (chunk_num, max_chunk_len, mel) -> (chunk_num, mel, max_chunk_len)
-        let padded_feature = Tensor::stack(&padded_chunks, 0)?.transpose(1, 2)?;
+        let padded_feature = stack_audio_chunks(&padded_chunks)?.transpose(1, 2)?;
         let padded_feature = padded_feature.unsqueeze(1)?; // (chunk_num, 1, mel, max_chunk_len)
 
         // Convolution stack (split along chunk dimension to avoid OOM).
@@ -782,6 +825,86 @@ mod tests {
         if max_abs > 1e-6 {
             anyhow::bail!("forward mismatch: max_abs={max_abs}");
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_input_features_can_be_cast_to_bf16() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let input =
+            candle_core::Tensor::from_vec(vec![1f32, 2.0], (1usize, 1usize, 2usize), &device)?;
+
+        let got = super::cast_input_features_to_weight_dtype(&input, candle_core::DType::BF16)?;
+
+        assert_eq!(got.dtype(), candle_core::DType::BF16);
+        assert!(got.device().is_metal());
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_bf16_transpose_can_be_materialized_contiguous() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let input =
+            candle_core::Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (2usize, 2usize), &device)?;
+        let input = super::cast_input_features_to_weight_dtype(&input, candle_core::DType::BF16)?;
+
+        let got = input.transpose(0, 1)?.contiguous()?;
+
+        assert_eq!(got.dtype(), candle_core::DType::BF16);
+        assert!(got.device().is_metal());
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_bf16_audio_chunk_padding_avoids_strided_copy_kernel() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let mel = 128usize;
+        let frames = 1505usize;
+        let input = candle_core::Tensor::from_vec(
+            (0..mel * frames).map(|i| i as f32).collect::<Vec<_>>(),
+            (1usize, mel, frames),
+            &device,
+        )?;
+        let input = super::cast_input_features_to_weight_dtype(&input, candle_core::DType::BF16)?;
+        let input = input.narrow(0, 0, 1)?.squeeze(0)?;
+
+        let input_t = input.transpose(0, 1)?;
+        let chunk = input_t.narrow(0, 1500, 5)?;
+        let padded = super::pad_audio_chunk(&chunk, 0, 0, 95)?;
+
+        assert_eq!(padded.dtype(), candle_core::DType::BF16);
+        assert!(padded.device().is_metal());
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_metal_bf16_audio_chunks_can_be_stacked() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let mel = 128usize;
+        let frames = 1505usize;
+        let input = candle_core::Tensor::from_vec(
+            (0..mel * frames).map(|i| i as f32).collect::<Vec<_>>(),
+            (1usize, mel, frames),
+            &device,
+        )?;
+        let input = super::cast_input_features_to_weight_dtype(&input, candle_core::DType::BF16)?;
+        let input = input.narrow(0, 0, 1)?.squeeze(0)?;
+
+        let input_t = input.transpose(0, 1)?;
+        let mut chunks = Vec::new();
+        for offset in (0..frames).step_by(100) {
+            let len = (frames - offset).min(100);
+            let chunk = input_t.narrow(0, offset, len)?;
+            chunks.push(super::pad_audio_chunk(&chunk, 0, 0, 100 - len)?);
+        }
+        let stacked = super::stack_audio_chunks(&chunks)?;
+
+        assert_eq!(stacked.dtype(), candle_core::DType::BF16);
+        assert!(stacked.device().is_metal());
         Ok(())
     }
 

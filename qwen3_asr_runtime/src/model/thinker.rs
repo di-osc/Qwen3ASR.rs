@@ -9,7 +9,10 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::config::asr_config::ThinkerConfig;
 use crate::model::audio_encoder::AudioTower;
+use crate::model::isq_linear::IsqLinear;
 use crate::model::kv_cache::KVCache;
+#[cfg(feature = "paged-attn")]
+use crate::model::paged_kv_cache::PagedKvCache;
 use crate::model::thinker_text::ThinkerTextModel;
 
 pub fn get_rope_index(attention_mask: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -126,7 +129,7 @@ fn merge_audio_features(
 pub struct ThinkerForConditionalGeneration {
     audio_tower: AudioTower,
     text_model: ThinkerTextModel,
-    lm_head: Linear,
+    lm_head: IsqLinear,
     audio_token_id: u32,
 }
 
@@ -148,6 +151,7 @@ impl ThinkerForConditionalGeneration {
         vb: VarBuilder,
         device: &candle_core::Device,
         use_flash_attn: bool,
+        isq: Option<&str>,
     ) -> Result<Self> {
         let audio_token_id = cfg
             .audio_token_id
@@ -167,16 +171,30 @@ impl ThinkerForConditionalGeneration {
 
         let audio_tower =
             AudioTower::load(&cfg.audio_config, vb.pp("audio_tower"), use_flash_attn)?;
-        let text_model =
-            ThinkerTextModel::load(&cfg.text_config, vb.pp("model"), device, use_flash_attn)?;
+        let text_model = ThinkerTextModel::load(
+            &cfg.text_config,
+            vb.pp("model"),
+            device,
+            use_flash_attn,
+            isq,
+        )?;
 
         let lm_head = if cfg.text_config.tie_word_embeddings {
             if is_forced_aligner {
                 bail!("forced aligner does not support tie_word_embeddings=true");
             }
-            Linear::new(text_model.embed_tokens_weight().clone(), None)
+            IsqLinear::new(
+                Linear::new(text_model.embed_tokens_weight().clone(), None),
+                None,
+                device,
+            )?
         } else {
-            candle_nn::linear_no_bias(cfg.text_config.hidden_size, lm_head_out, vb.pp("lm_head"))?
+            let lm_head = candle_nn::linear_no_bias(
+                cfg.text_config.hidden_size,
+                lm_head_out,
+                vb.pp("lm_head"),
+            )?;
+            IsqLinear::new(lm_head, None, device)?
         };
 
         Ok(Self {
@@ -245,6 +263,46 @@ impl ThinkerForConditionalGeneration {
             position_ids,
             inputs_embeds,
             kv_cache,
+        )?;
+        Ok(self.lm_head.forward(&hidden_states)?)
+    }
+
+    pub fn forward_decode_one_without_padding(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        kv_cache: &mut KVCache,
+    ) -> Result<Tensor> {
+        let hidden_states = self.text_model.forward_decode_one_without_padding(
+            position_ids,
+            inputs_embeds,
+            kv_cache,
+        )?;
+        Ok(self.lm_head.forward(&hidden_states)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn paged_cache_config(&self) -> (usize, usize, usize) {
+        (
+            self.text_model.num_layers(),
+            self.text_model.num_key_value_heads(),
+            self.text_model.head_dim(),
+        )
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn forward_embeds_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &attention_rs::InputMetadata,
+    ) -> Result<Tensor> {
+        let hidden_states = self.text_model.forward_with_paged_cache(
+            position_ids,
+            inputs_embeds,
+            paged_cache,
+            input_metadata,
         )?;
         Ok(self.lm_head.forward(&hidden_states)?)
     }

@@ -8,10 +8,11 @@ categories = ["science"]
 keywords = ["asr", "speech-recognition", "machine-learning", "qwen"]
 
 [dependencies]
-candle-core = { version = "0.9" }
-candle-nn = { version = "0.9" }
-candle-transformers = { version = "0.9" }
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
+candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
 candle-flash-attn = { version = "0.9", optional = true }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", rev = "8fdb7ab", optional = true }
 # Keep in sync with Candle/cudarc constraints (mirrors qwen3-tts-rs).
 float8 = "=0.5.0"
 
@@ -57,7 +58,7 @@ cuda = [
   "candle-transformers/cuda",
   "dep:bindgen_cuda",
 ]
-cudnn = ["candle-core/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
+cudnn = ["cuda", "candle-core/cudnn"]
 flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 mkl = [
   "dep:intel-mkl-src",
@@ -67,6 +68,8 @@ mkl = [
 ]
 nccl = ["cuda", "cudarc/nccl", "dep:half"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+paged-attn = ["dep:attention-rs"]
+metal-paged-attn = ["metal", "paged-attn", "attention-rs/metal", "attention-rs/metal-flash"]
 cudarc = ["dep:cudarc"]
 
 audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64", "dep:reqwest"]
@@ -94,3 +97,7 @@ test-all-cuda = ["test-all", "cuda", "audio-loading"]
 
 [dev-dependencies]
 fs2 = "0.4"
+
+[[example]]
+name = "bench_transcribe"
+required-features = ["audio-loading", "timing", "metal"]

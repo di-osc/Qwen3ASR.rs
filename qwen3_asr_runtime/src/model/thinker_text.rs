@@ -5,13 +5,31 @@
 //! `Qwen3-ASR/qwen_asr/core/transformers_backend/modeling_qwen3_asr.py`.
 
 use candle_core::{Result, Tensor};
-use candle_nn::{
-    Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias, rms_norm,
-};
+use candle_nn::{Embedding, Module, RmsNorm, VarBuilder, embedding, rms_norm};
+#[cfg(feature = "paged-attn")]
+use std::sync::Arc;
 
 use crate::config::{RopeScaling, TextConfig};
+use crate::model::isq_linear::{self, IsqLinear};
 use crate::model::kv_cache::KVCache;
 use crate::model::{attention, rope};
+
+#[cfg(feature = "paged-attn")]
+use crate::model::paged_kv_cache::PagedKvCache;
+
+#[cfg(feature = "paged-attn")]
+use attention_rs::{InputMetadata, PagedAttention};
+
+#[cfg(feature = "paged-attn")]
+#[derive(Clone)]
+struct PagedAttentionHandle(Arc<PagedAttention>);
+
+#[cfg(feature = "paged-attn")]
+impl std::fmt::Debug for PagedAttentionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PagedAttention").finish()
+    }
+}
 
 #[cfg(feature = "flash-attn")]
 use candle_core::{DType, Device};
@@ -174,17 +192,32 @@ impl ThinkerTextRotaryEmbedding {
 
 #[derive(Debug, Clone)]
 struct ThinkerTextMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: IsqLinear,
+    up_proj: IsqLinear,
+    down_proj: IsqLinear,
     hidden_act: String,
 }
 
 impl ThinkerTextMlp {
-    fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
-        let gate_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(cfg.hidden_size, cfg.intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("down_proj"))?;
+    fn load(cfg: &TextConfig, vb: VarBuilder, isq: Option<&str>) -> Result<Self> {
+        let gate_proj = isq_linear::linear_no_bias(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            vb.pp("gate_proj"),
+            isq,
+        )?;
+        let up_proj = isq_linear::linear_no_bias(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            vb.pp("up_proj"),
+            isq,
+        )?;
+        let down_proj = isq_linear::linear_no_bias(
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            vb.pp("down_proj"),
+            isq,
+        )?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -215,16 +248,27 @@ struct ThinkerTextAttention {
     num_key_value_groups: usize,
     head_dim: usize,
     scaling: f64,
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: IsqLinear,
+    k_proj: IsqLinear,
+    v_proj: IsqLinear,
+    o_proj: IsqLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    #[cfg(feature = "paged-attn")]
+    paged_attn: Option<PagedAttentionHandle>,
 }
 
 impl ThinkerTextAttention {
-    fn load(cfg: &TextConfig, vb: VarBuilder, use_flash_attn: bool) -> Result<Self> {
+    fn load(
+        cfg: &TextConfig,
+        vb: VarBuilder,
+        device: &candle_core::Device,
+        use_flash_attn: bool,
+        isq: Option<&str>,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "paged-attn"))]
+        let _ = device;
+
         let head_dim = cfg.head_dim;
         let num_attention_heads = cfg.num_attention_heads;
         let num_key_value_heads = cfg.num_key_value_heads;
@@ -233,13 +277,49 @@ impl ThinkerTextAttention {
         let q_out = num_attention_heads * head_dim;
         let kv_out = num_key_value_heads * head_dim;
 
-        let q_proj = linear_b(cfg.hidden_size, q_out, cfg.attention_bias, vb.pp("q_proj"))?;
-        let k_proj = linear_b(cfg.hidden_size, kv_out, cfg.attention_bias, vb.pp("k_proj"))?;
-        let v_proj = linear_b(cfg.hidden_size, kv_out, cfg.attention_bias, vb.pp("v_proj"))?;
-        let o_proj = linear_b(q_out, cfg.hidden_size, cfg.attention_bias, vb.pp("o_proj"))?;
+        let q_proj = isq_linear::linear_b(
+            cfg.hidden_size,
+            q_out,
+            cfg.attention_bias,
+            vb.pp("q_proj"),
+            isq,
+        )?;
+        let k_proj = isq_linear::linear_b(
+            cfg.hidden_size,
+            kv_out,
+            cfg.attention_bias,
+            vb.pp("k_proj"),
+            isq,
+        )?;
+        let v_proj = isq_linear::linear_b(
+            cfg.hidden_size,
+            kv_out,
+            cfg.attention_bias,
+            vb.pp("v_proj"),
+            isq,
+        )?;
+        let o_proj = isq_linear::linear_b(
+            q_out,
+            cfg.hidden_size,
+            cfg.attention_bias,
+            vb.pp("o_proj"),
+            isq,
+        )?;
 
         let q_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = rms_norm(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+
+        #[cfg(feature = "paged-attn")]
+        let paged_attn = Some(PagedAttentionHandle(Arc::new(PagedAttention::new(
+            num_attention_heads,
+            head_dim,
+            (head_dim as f32).powf(-0.5),
+            Some(num_key_value_heads),
+            None,
+            device.clone(),
+            None,
+            false,
+        )?)));
 
         Ok(Self {
             use_flash_attn,
@@ -254,6 +334,8 @@ impl ThinkerTextAttention {
             o_proj,
             q_norm,
             k_norm,
+            #[cfg(feature = "paged-attn")]
+            paged_attn,
         })
     }
 
@@ -403,7 +485,7 @@ impl ThinkerTextAttention {
         hidden_states: &Tensor,
         position_embeddings: (&Tensor, &Tensor),
         attention_mask: Option<&Tensor>,
-        token_attention_mask: &Tensor,
+        token_attention_mask: Option<&Tensor>,
         rope_scaling: &ThinkerTextRotaryEmbedding,
         layer_cache: (&mut KVCache, usize),
     ) -> Result<Tensor> {
@@ -446,6 +528,11 @@ impl ThinkerTextAttention {
             #[cfg(feature = "flash-attn")]
             {
                 let softmax_scale = self.scaling as f32;
+                let Some(token_attention_mask) = token_attention_mask else {
+                    candle_core::bail!(
+                        "flash-attn cached decode without a token attention mask is unsupported"
+                    );
+                };
 
                 let (_b2, total_len) = token_attention_mask.dims2()?;
                 if _b2 != batch {
@@ -624,6 +711,60 @@ impl ThinkerTextAttention {
             attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
         self.o_proj.forward(&attn_output)
     }
+
+    #[cfg(feature = "paged-attn")]
+    fn forward_with_paged_cache(
+        &self,
+        hidden_states: &Tensor,
+        position_embeddings: (&Tensor, &Tensor),
+        input_metadata: &InputMetadata,
+        rope_scaling: &ThinkerTextRotaryEmbedding,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, _hidden) = hidden_states.dims3()?;
+        let paged_attn = self
+            .paged_attn
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("paged attention is not initialized".into()))?;
+
+        let q = self.q_proj.forward(hidden_states)?;
+        let q = q.reshape((batch, seq_len, self.num_attention_heads, self.head_dim))?;
+        let q = self.q_norm.forward(&q)?;
+        let q = q.transpose(1, 2)?; // (b, h, s, d)
+
+        let k = self.k_proj.forward(hidden_states)?;
+        let k = k.reshape((batch, seq_len, self.num_key_value_heads, self.head_dim))?;
+        let k = self.k_norm.forward(&k)?;
+        let k = k.transpose(1, 2)?; // (b, kv, s, d)
+
+        let v = self.v_proj.forward(hidden_states)?;
+        let v = v.reshape((batch, seq_len, self.num_key_value_heads, self.head_dim))?;
+        let v = v.transpose(1, 2)?; // (b, kv, s, d)
+
+        let (cos, sin) = position_embeddings;
+        let (q, k) = rope::mrope::apply_multimodal_rotary_pos_emb(
+            &q,
+            &k,
+            cos,
+            sin,
+            rope_scaling.mrope_section.as_slice(),
+            rope_scaling.interleaved,
+        )?;
+
+        let attn = paged_attn.0.forward(
+            &q,
+            &k,
+            &v,
+            None,
+            Some(key_cache.clone()),
+            Some(value_cache.clone()),
+            input_metadata,
+            None,
+        )?;
+        let attn = attn.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
+        self.o_proj.forward(&attn)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -635,9 +776,16 @@ struct ThinkerTextDecoderLayer {
 }
 
 impl ThinkerTextDecoderLayer {
-    fn load(cfg: &TextConfig, vb: VarBuilder, use_flash_attn: bool) -> Result<Self> {
-        let self_attn = ThinkerTextAttention::load(cfg, vb.pp("self_attn"), use_flash_attn)?;
-        let mlp = ThinkerTextMlp::load(cfg, vb.pp("mlp"))?;
+    fn load(
+        cfg: &TextConfig,
+        vb: VarBuilder,
+        device: &candle_core::Device,
+        use_flash_attn: bool,
+        isq: Option<&str>,
+    ) -> Result<Self> {
+        let self_attn =
+            ThinkerTextAttention::load(cfg, vb.pp("self_attn"), device, use_flash_attn, isq)?;
+        let mlp = ThinkerTextMlp::load(cfg, vb.pp("mlp"), isq)?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = rms_norm(
@@ -683,7 +831,7 @@ impl ThinkerTextDecoderLayer {
         hidden_states: &Tensor,
         position_embeddings: (&Tensor, &Tensor),
         attention_mask: Option<&Tensor>,
-        token_attention_mask: &Tensor,
+        token_attention_mask: Option<&Tensor>,
         rope_scaling: &ThinkerTextRotaryEmbedding,
         layer_cache: (&mut KVCache, usize),
     ) -> Result<Tensor> {
@@ -696,6 +844,34 @@ impl ThinkerTextDecoderLayer {
             token_attention_mask,
             rope_scaling,
             layer_cache,
+        )?;
+        let x = (&residual + &x)?;
+
+        let residual = x.clone();
+        let x = self.post_attention_layernorm.forward(&x)?;
+        let x = self.mlp.forward(&x)?;
+        &residual + &x
+    }
+
+    #[cfg(feature = "paged-attn")]
+    fn forward_with_paged_cache(
+        &self,
+        hidden_states: &Tensor,
+        position_embeddings: (&Tensor, &Tensor),
+        input_metadata: &InputMetadata,
+        rope_scaling: &ThinkerTextRotaryEmbedding,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+    ) -> Result<Tensor> {
+        let residual = hidden_states.clone();
+        let x = self.input_layernorm.forward(hidden_states)?;
+        let x = self.self_attn.forward_with_paged_cache(
+            &x,
+            position_embeddings,
+            input_metadata,
+            rope_scaling,
+            key_cache,
+            value_cache,
         )?;
         let x = (&residual + &x)?;
 
@@ -723,6 +899,7 @@ impl ThinkerTextModel {
         vb: VarBuilder,
         device: &candle_core::Device,
         use_flash_attn: bool,
+        isq: Option<&str>,
     ) -> Result<Self> {
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
 
@@ -731,7 +908,9 @@ impl ThinkerTextModel {
             layers.push(ThinkerTextDecoderLayer::load(
                 cfg,
                 vb.pp("layers").pp(idx.to_string()),
+                device,
                 use_flash_attn,
+                isq,
             )?);
         }
 
@@ -758,6 +937,27 @@ impl ThinkerTextModel {
 
     pub fn hidden_size(&self) -> usize {
         self.hidden_size
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn num_key_value_heads(&self) -> usize {
+        self.layers
+            .first()
+            .map(|layer| layer.self_attn.num_key_value_heads)
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn head_dim(&self) -> usize {
+        self.layers
+            .first()
+            .map(|layer| layer.self_attn.head_dim)
+            .unwrap_or(0)
     }
 
     pub fn forward(
@@ -857,7 +1057,91 @@ impl ThinkerTextModel {
                 &hidden_states,
                 position_embeddings,
                 causal_mask.as_ref(),
-                attention_mask,
+                Some(attention_mask),
+                &self.rotary_emb,
+                (&mut *kv_cache, layer_idx),
+            )?;
+        }
+
+        self.norm.forward(&hidden_states)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn forward_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        let (batch, _seq_len, hidden) = inputs_embeds.dims3()?;
+        if hidden != self.hidden_size {
+            candle_core::bail!(
+                "inputs_embeds hidden mismatch: expected={}, got={hidden}",
+                self.hidden_size
+            );
+        }
+        if batch != 1 {
+            candle_core::bail!("paged attention phase 1 expects batch=1, got={batch}");
+        }
+
+        let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
+        let position_embeddings = (&cos, &sin);
+
+        let mut hidden_states = inputs_embeds.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let (key_cache, value_cache) = paged_cache.key_value_cache(layer_idx)?;
+            hidden_states = layer.forward_with_paged_cache(
+                &hidden_states,
+                position_embeddings,
+                input_metadata,
+                &self.rotary_emb,
+                key_cache,
+                value_cache,
+            )?;
+        }
+
+        self.norm.forward(&hidden_states)
+    }
+
+    pub fn forward_decode_one_without_padding(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        kv_cache: &mut KVCache,
+    ) -> Result<Tensor> {
+        let (batch, seq_len, hidden) = inputs_embeds.dims3()?;
+        if hidden != self.hidden_size {
+            candle_core::bail!(
+                "inputs_embeds hidden mismatch: expected={}, got={hidden}",
+                self.hidden_size
+            );
+        }
+        if seq_len != 1 {
+            candle_core::bail!("decode-one fast path expects seq_len=1, got={seq_len}");
+        }
+
+        let token_attention_mask = if self.use_flash_attn {
+            let total_len = kv_cache.seq_len().saturating_add(seq_len);
+            Some(Tensor::ones(
+                (batch, total_len),
+                candle_core::DType::U32,
+                inputs_embeds.device(),
+            )?)
+        } else {
+            None
+        };
+
+        let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
+        let position_embeddings = (&cos, &sin);
+
+        let mut hidden_states = inputs_embeds.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer.forward_with_kv_cache(
+                &hidden_states,
+                position_embeddings,
+                None,
+                token_attention_mask.as_ref(),
                 &self.rotary_emb,
                 (&mut *kv_cache, layer_idx),
             )?;
