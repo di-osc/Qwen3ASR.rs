@@ -433,6 +433,30 @@ fn generate_raw_prepared_batch_timed(
         .generation
         .decode_us
         .saturating_add(gen_timings.decode_us);
+    timings.generation.decode_token_tensor_us = timings
+        .generation
+        .decode_token_tensor_us
+        .saturating_add(gen_timings.decode_token_tensor_us);
+    timings.generation.decode_embed_us = timings
+        .generation
+        .decode_embed_us
+        .saturating_add(gen_timings.decode_embed_us);
+    timings.generation.decode_position_us = timings
+        .generation
+        .decode_position_us
+        .saturating_add(gen_timings.decode_position_us);
+    timings.generation.decode_metadata_us = timings
+        .generation
+        .decode_metadata_us
+        .saturating_add(gen_timings.decode_metadata_us);
+    timings.generation.decode_graph_replay_us = timings
+        .generation
+        .decode_graph_replay_us
+        .saturating_add(gen_timings.decode_graph_replay_us);
+    timings.generation.decode_argmax_us = timings
+        .generation
+        .decode_argmax_us
+        .saturating_add(gen_timings.decode_argmax_us);
     timings.generation.steps = timings.generation.steps.saturating_add(gen_timings.steps);
     timings.generation.tokens_generated = timings
         .generation

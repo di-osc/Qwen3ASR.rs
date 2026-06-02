@@ -4,12 +4,16 @@ use std::path::PathBuf;
 
 pub mod attention;
 pub mod audio_encoder;
+#[cfg(feature = "cuda-graph")]
+pub mod cuda_graph;
 pub mod generation;
 pub mod isq_linear;
 pub mod kv_cache;
 pub mod name_map;
 #[cfg(feature = "paged-attn")]
 pub mod paged_kv_cache;
+#[cfg(feature = "cuda")]
+mod q8_mmvq;
 pub mod rope;
 pub mod thinker;
 pub mod thinker_text;

@@ -28,7 +28,8 @@ fn main() -> Result<()> {
         .context("failed to parse max_new_tokens")?;
     let isq = args.next();
 
-    let device = Device::new_metal(0).context("failed to create Metal device")?;
+    let device = default_gpu_device()?;
+    let use_flash_attn = cfg!(feature = "flash-attn") && device.is_cuda();
     reset_isq_quantize_time();
     let start_load = Instant::now();
     let model = Qwen3Asr::from_pretrained(
@@ -36,7 +37,7 @@ fn main() -> Result<()> {
         &device,
         &LoadOptions {
             dtype: DType::F16,
-            use_flash_attn: false,
+            use_flash_attn,
             isq,
         },
     )
@@ -71,13 +72,19 @@ fn main() -> Result<()> {
                 / (timings.generation.decode_us as f64 / 1_000_000.0)
         };
         println!(
-            "run={} wall_ms={} timed_total_ms={} audio_encoder_ms={} prefill_ms={} decode_ms={} steps={} tokens={} decode_tokens_per_s={:.3} text={:?}",
+            "run={} wall_ms={} timed_total_ms={} audio_encoder_ms={} prefill_ms={} decode_ms={} decode_token_tensor_ms={:.3} decode_embed_ms={:.3} decode_position_ms={:.3} decode_metadata_ms={:.3} decode_graph_replay_ms={:.3} decode_argmax_ms={:.3} steps={} tokens={} decode_tokens_per_s={:.3} text={:?}",
             run + 1,
             total.as_millis(),
             timings.total_us / 1000,
             timings.audio_encoder_us / 1000,
             timings.generation.prefill_us / 1000,
             decode_ms.round() as u64,
+            timings.generation.decode_token_tensor_us as f64 / 1000.0,
+            timings.generation.decode_embed_us as f64 / 1000.0,
+            timings.generation.decode_position_us as f64 / 1000.0,
+            timings.generation.decode_metadata_us as f64 / 1000.0,
+            timings.generation.decode_graph_replay_us as f64 / 1000.0,
+            timings.generation.decode_argmax_us as f64 / 1000.0,
             timings.generation.steps,
             timings.generation.tokens_generated,
             decode_tokens_per_s,
@@ -89,4 +96,21 @@ fn main() -> Result<()> {
     let avg = totals.iter().sum::<f64>() / totals.len().max(1) as f64;
     println!("avg_wall_ms={:.3}", avg * 1000.0);
     Ok(())
+}
+
+fn default_gpu_device() -> Result<Device> {
+    #[cfg(feature = "cuda")]
+    {
+        return Device::new_cuda_with_stream(0).context("failed to create CUDA device 0");
+    }
+
+    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
+    {
+        return Device::new_metal(0).context("failed to create Metal device 0");
+    }
+
+    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
+    {
+        anyhow::bail!("bench_transcribe requires a GPU build; enable `cuda` or `metal`");
+    }
 }

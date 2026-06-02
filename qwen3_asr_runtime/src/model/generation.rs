@@ -6,6 +6,8 @@
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
 
+#[cfg(feature = "cuda-graph")]
+use crate::model::cuda_graph::DecodeCudaGraph;
 use crate::model::isq_linear::set_linear_is_prefill;
 use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
@@ -26,6 +28,10 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
     }
 }
 
+fn argmax_token_id(logits: &Tensor) -> Result<u32> {
+    Ok(logits.argmax(0usize)?.to_scalar::<u32>()?)
+}
+
 #[cfg(feature = "timing")]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GenerationTimings {
@@ -35,6 +41,18 @@ pub struct GenerationTimings {
     pub prefill_us: u64,
     /// Time spent in the token-by-token decode loop (including mRoPE indices).
     pub decode_us: u64,
+    /// Time spent creating the one-token decode input tensor.
+    pub decode_token_tensor_us: u64,
+    /// Time spent embedding the one-token decode input.
+    pub decode_embed_us: u64,
+    /// Time spent creating decode position ids.
+    pub decode_position_us: u64,
+    /// Time spent creating paged-attention decode metadata.
+    pub decode_metadata_us: u64,
+    /// Time spent replaying the CUDA graph.
+    pub decode_graph_replay_us: u64,
+    /// Time spent selecting and copying the next token back to host.
+    pub decode_argmax_us: u64,
     /// Number of decode loop iterations executed (<= `max_new_tokens`).
     pub steps: usize,
     /// Total non-EOS tokens produced across the batch.
@@ -97,7 +115,7 @@ pub fn greedy_generate(
         )?;
 
         let last = logits.i((0usize, seq_len.saturating_sub(1)))?;
-        let next_id = last.argmax(0usize)?.to_scalar::<u32>()?;
+        let next_id = argmax_token_id(&last)?;
 
         if eos_token_ids.contains(&next_id) {
             break;
@@ -171,10 +189,7 @@ pub fn greedy_generate_cached(
         )?
     };
 
-    let mut next_id = logits
-        .i((0usize, seq_len.saturating_sub(1)))?
-        .argmax(0usize)?
-        .to_scalar::<u32>()?;
+    let mut next_id = argmax_token_id(&logits.i((0usize, seq_len.saturating_sub(1)))?)?;
 
     let dense_attention = attention_mask_is_dense(attention_mask);
     let prompt_len = prompt_len_from_left_padded_mask(attention_mask, seq_len)?;
@@ -219,10 +234,7 @@ pub fn greedy_generate_cached(
                 )?
             }
         };
-        next_id = logits_new
-            .i((0usize, 0usize))?
-            .argmax(0usize)?
-            .to_scalar::<u32>()?;
+        next_id = argmax_token_id(&logits_new.i((0usize, 0usize))?)?;
     }
 
     Ok(generated)
@@ -342,7 +354,10 @@ fn greedy_generate_cached_batch_impl(
     }
 
     #[cfg(all(feature = "paged-attn", feature = "timing"))]
-    if batch == 1 && device.is_metal() && attention_masks_are_dense(attention_mask) {
+    if batch == 1
+        && (device.is_metal() || device.is_cuda())
+        && attention_masks_are_dense(attention_mask)
+    {
         let out = greedy_generate_paged(
             thinker,
             device,
@@ -356,7 +371,10 @@ fn greedy_generate_cached_batch_impl(
         return Ok(vec![out]);
     }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
-    if batch == 1 && device.is_metal() && attention_masks_are_dense(attention_mask) {
+    if batch == 1
+        && (device.is_metal() || device.is_cuda())
+        && attention_masks_are_dense(attention_mask)
+    {
         let out = greedy_generate_paged(
             thinker,
             device,
@@ -599,6 +617,17 @@ fn greedy_generate_paged(
         inputs_embeds.dtype(),
         device,
     )?;
+    #[cfg(feature = "cuda-graph")]
+    let decode_graph = if device.is_cuda() {
+        Some(DecodeCudaGraph::capture(
+            thinker,
+            &paged_cache,
+            device,
+            max_tokens,
+        )?)
+    } else {
+        None
+    };
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
     let input_metadata = paged_prefill_metadata(&paged_cache, seq_len, device)?;
     let logits = {
@@ -610,10 +639,7 @@ fn greedy_generate_paged(
             &input_metadata,
         )?
     };
-    let mut next_id = logits
-        .i((0usize, seq_len.saturating_sub(1)))?
-        .argmax(0usize)?
-        .to_scalar::<u32>()?;
+    let mut next_id = argmax_token_id(&logits.i((0usize, seq_len.saturating_sub(1)))?)?;
 
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
@@ -640,23 +666,142 @@ fn greedy_generate_paged(
 
         generated.push(next_id);
 
+        #[cfg(feature = "timing")]
+        let start_token_tensor = std::time::Instant::now();
         let input_ids_new = Tensor::from_vec(vec![next_id], (1usize, 1usize), device)?;
-        let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_token_tensor_us = t
+                .decode_token_tensor_us
+                .saturating_add(duration_to_us(start_token_tensor.elapsed()));
+        }
+
+        #[cfg(feature = "cuda-graph")]
+        let graph_decode = decode_graph.is_some();
+        #[cfg(not(feature = "cuda-graph"))]
+        let graph_decode = false;
+
+        #[cfg(feature = "timing")]
+        let start_embed = std::time::Instant::now();
+        let inputs_embeds_new = if graph_decode {
+            None
+        } else {
+            Some(thinker.embed_tokens(&input_ids_new)?)
+        };
+        #[cfg(feature = "timing")]
+        if !graph_decode {
+            if let Some(t) = timings.as_mut() {
+                t.decode_embed_us = t
+                    .decode_embed_us
+                    .saturating_add(duration_to_us(start_embed.elapsed()));
+            }
+        }
+
+        #[cfg(feature = "timing")]
+        if graph_decode {
+            if let Some(t) = timings.as_mut() {
+                t.decode_embed_us = t
+                    .decode_embed_us
+                    .saturating_add(duration_to_us(start_embed.elapsed()));
+            }
+        }
+
+        #[cfg(feature = "timing")]
+        let start_position = std::time::Instant::now();
         let position_ids_new = position_ids_for_step(&[prompt_len], step, device)?;
-        let input_metadata = paged_decode_metadata(&paged_cache, seq_len, step, device)?;
-        let logits_new = {
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_position_us = t
+                .decode_position_us
+                .saturating_add(duration_to_us(start_position.elapsed()));
+        }
+
+        let (slot_pos, context_len) = decode_slot_and_context_len(seq_len, step)?;
+
+        #[cfg(feature = "timing")]
+        let start_metadata = std::time::Instant::now();
+        let input_metadata = if graph_decode {
+            None
+        } else {
+            Some(paged_decode_metadata(&paged_cache, seq_len, step, device)?)
+        };
+        #[cfg(feature = "timing")]
+        if !graph_decode {
+            if let Some(t) = timings.as_mut() {
+                t.decode_metadata_us = t
+                    .decode_metadata_us
+                    .saturating_add(duration_to_us(start_metadata.elapsed()));
+            }
+        }
+        #[cfg(feature = "timing")]
+        if graph_decode {
+            if let Some(t) = timings.as_mut() {
+                t.decode_metadata_us = t
+                    .decode_metadata_us
+                    .saturating_add(duration_to_us(start_metadata.elapsed()));
+            }
+        }
+
+        #[cfg(feature = "timing")]
+        let start_graph_replay = std::time::Instant::now();
+        #[cfg(feature = "cuda-graph")]
+        let logits_new = if let Some(graph) = &decode_graph {
+            graph.replay_step(
+                &position_ids_new,
+                &input_ids_new,
+                slot_pos,
+                context_len,
+                device,
+            )?
+        } else {
             let _linear_decode_guard = set_linear_is_prefill(false);
+            let inputs_embeds_new = inputs_embeds_new
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing decode inputs_embeds"))?;
+            let input_metadata = input_metadata
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing decode input metadata"))?;
             thinker.forward_embeds_with_paged_cache(
                 &position_ids_new,
-                &inputs_embeds_new,
+                inputs_embeds_new,
                 &paged_cache,
-                &input_metadata,
+                input_metadata,
             )?
         };
-        next_id = logits_new
-            .i((0usize, 0usize))?
-            .argmax(0usize)?
-            .to_scalar::<u32>()?;
+        #[cfg(not(feature = "cuda-graph"))]
+        let logits_new = {
+            let _linear_decode_guard = set_linear_is_prefill(false);
+            let inputs_embeds_new = inputs_embeds_new
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing decode inputs_embeds"))?;
+            let input_metadata = input_metadata
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing decode input metadata"))?;
+            thinker.forward_embeds_with_paged_cache(
+                &position_ids_new,
+                inputs_embeds_new,
+                &paged_cache,
+                input_metadata,
+            )?
+        };
+        #[cfg(all(feature = "timing", feature = "cuda-graph"))]
+        if decode_graph.is_some() {
+            if let Some(t) = timings.as_mut() {
+                t.decode_graph_replay_us = t
+                    .decode_graph_replay_us
+                    .saturating_add(duration_to_us(start_graph_replay.elapsed()));
+            }
+        }
+
+        #[cfg(feature = "timing")]
+        let start_argmax = std::time::Instant::now();
+        next_id = argmax_token_id(&logits_new.i((0usize, 0usize))?)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_argmax_us = t
+                .decode_argmax_us
+                .saturating_add(duration_to_us(start_argmax.elapsed()));
+        }
     }
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
@@ -709,12 +854,7 @@ fn paged_decode_metadata(
     step: usize,
     device: &Device,
 ) -> Result<attention_rs::InputMetadata> {
-    let slot_pos = prompt_len
-        .checked_add(step)
-        .ok_or_else(|| anyhow::anyhow!("decode slot position overflow"))?;
-    let context_len = slot_pos
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("decode context length overflow"))?;
+    let (slot_pos, context_len) = decode_slot_and_context_len(prompt_len, step)?;
     Ok(attention_rs::InputMetadata {
         is_prefill: false,
         is_mla: false,
@@ -731,6 +871,16 @@ fn paged_decode_metadata(
         seqlens: None,
         flashinfer_metadata: None,
     })
+}
+
+fn decode_slot_and_context_len(prompt_len: usize, step: usize) -> Result<(usize, usize)> {
+    let slot_pos = prompt_len
+        .checked_add(step)
+        .ok_or_else(|| anyhow::anyhow!("decode slot position overflow"))?;
+    let context_len = slot_pos
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("decode context length overflow"))?;
+    Ok((slot_pos, context_len))
 }
 
 fn count_audio_placeholders(ids: &[u32], audio_token_id: u32) -> usize {
@@ -814,8 +964,8 @@ fn position_ids_for_step(prompt_lens: &[i64], step: usize, device: &Device) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_mask_is_dense, attention_masks_are_dense, position_ids_for_step,
-        prompt_lens_from_attention_masks,
+        attention_mask_is_dense, attention_masks_are_dense, decode_slot_and_context_len,
+        position_ids_for_step, prompt_lens_from_attention_masks,
     };
 
     #[test]
@@ -872,5 +1022,12 @@ mod tests {
 
         let padded_rows: Vec<&[u32]> = vec![&[1, 1], &[0, 1]];
         assert!(!attention_masks_are_dense(padded_rows.as_slice()));
+    }
+
+    #[test]
+    fn test_decode_slot_and_context_len_matches_paged_decode_steps() -> anyhow::Result<()> {
+        assert_eq!(decode_slot_and_context_len(42, 0)?, (42, 43));
+        assert_eq!(decode_slot_and_context_len(42, 7)?, (49, 50));
+        Ok(())
     }
 }

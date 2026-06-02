@@ -37,6 +37,25 @@ use candle_core::{DType, Device};
 #[cfg(feature = "flash-attn")]
 use candle_flash_attn::{flash_attn, flash_attn_varlen};
 
+fn maybe_contiguous_for_accelerator(x: Tensor) -> Result<Tensor> {
+    if x.device().is_metal() || x.device().is_cuda() {
+        x.contiguous()
+    } else {
+        Ok(x)
+    }
+}
+
+fn initial_hidden_states_for_paged_decode(inputs_embeds: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda-graph")]
+    {
+        let seq_len = inputs_embeds.dim(1)?;
+        if inputs_embeds.device().is_cuda() && seq_len == 1 {
+            return inputs_embeds.affine(1.0, 0.0);
+        }
+    }
+    Ok(inputs_embeds.clone())
+}
+
 #[cfg(feature = "flash-attn")]
 fn seqlens_from_left_padded_attention_mask(mask: &Tensor, seq_len: usize) -> Result<Vec<usize>> {
     let (batch, t2) = mask.dims2()?;
@@ -229,6 +248,15 @@ impl ThinkerTextMlp {
 
 impl Module for ThinkerTextMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if matches!(self.hidden_act.as_str(), "silu" | "swish") {
+            if let Some(hidden) =
+                isq_linear::try_fused_q8_silu_gate_up(&self.gate_proj, &self.up_proj, xs)?
+            {
+                return self.down_proj.forward(&hidden);
+            }
+        }
+
         let gate = self.gate_proj.forward(xs)?;
         let up = self.up_proj.forward(xs)?;
         let gate = match self.hidden_act.as_str() {
@@ -465,7 +493,9 @@ impl ThinkerTextAttention {
         let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
         let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
 
-        let k_t = k.transpose(2, 3)?; // (b, h, d, s)
+        let q = maybe_contiguous_for_accelerator(q)?;
+        let v = maybe_contiguous_for_accelerator(v)?;
+        let k_t = maybe_contiguous_for_accelerator(k.transpose(2, 3)?)?; // (b, h, d, s)
         let mut attn_weights = q.matmul(&k_t)?.affine(self.scaling, 0.0)?;
 
         if let Some(mask) = attention_mask {
@@ -697,7 +727,9 @@ impl ThinkerTextAttention {
         let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
         let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
 
-        let k_t = k.transpose(2, 3)?; // (b, h, d, s)
+        let q = maybe_contiguous_for_accelerator(q)?;
+        let v = maybe_contiguous_for_accelerator(v)?;
+        let k_t = maybe_contiguous_for_accelerator(k.transpose(2, 3)?)?; // (b, h, d, s)
         let mut attn_weights = q.matmul(&k_t)?.affine(self.scaling, 0.0)?;
 
         if let Some(mask) = attention_mask {
@@ -751,6 +783,19 @@ impl ThinkerTextAttention {
             rope_scaling.mrope_section.as_slice(),
             rope_scaling.interleaved,
         )?;
+
+        let q = q
+            .transpose(1, 2)?
+            .reshape((seq_len, self.num_attention_heads, self.head_dim))?;
+        let k = k
+            .transpose(1, 2)?
+            .reshape((seq_len, self.num_key_value_heads, self.head_dim))?;
+        let v = v
+            .transpose(1, 2)?
+            .reshape((seq_len, self.num_key_value_heads, self.head_dim))?;
+        let q = maybe_contiguous_for_accelerator(q)?;
+        let k = maybe_contiguous_for_accelerator(k)?;
+        let v = maybe_contiguous_for_accelerator(v)?;
 
         let attn = paged_attn.0.forward(
             &q,
@@ -1051,7 +1096,7 @@ impl ThinkerTextModel {
         let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
         let position_embeddings = (&cos, &sin);
 
-        let mut hidden_states = inputs_embeds.clone();
+        let mut hidden_states = initial_hidden_states_for_paged_decode(inputs_embeds)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden_states = layer.forward_with_kv_cache(
                 &hidden_states,
