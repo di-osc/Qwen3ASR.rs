@@ -183,10 +183,11 @@ impl ThinkerForConditionalGeneration {
             if is_forced_aligner {
                 bail!("forced aligner does not support tie_word_embeddings=true");
             }
-            IsqLinear::new(
+            IsqLinear::new_with_module_path(
                 Linear::new(text_model.embed_tokens_weight().clone(), None),
-                None,
+                isq,
                 device,
+                "lm_head",
             )?
         } else {
             let lm_head = candle_nn::linear_no_bias(
@@ -194,7 +195,7 @@ impl ThinkerForConditionalGeneration {
                 lm_head_out,
                 vb.pp("lm_head"),
             )?;
-            IsqLinear::new(lm_head, None, device)?
+            IsqLinear::new_with_module_path(lm_head, isq, device, "lm_head")?
         };
 
         Ok(Self {
@@ -305,6 +306,23 @@ impl ThinkerForConditionalGeneration {
             input_metadata,
         )?;
         Ok(self.lm_head.forward(&hidden_states)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn forward_input_ids_with_paged_cache(
+        &self,
+        input_ids: &Tensor,
+        position_ids: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &attention_rs::InputMetadata,
+    ) -> Result<Tensor> {
+        let inputs_embeds = self.embed_tokens(input_ids)?;
+        self.forward_embeds_with_paged_cache(
+            position_ids,
+            &inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )
     }
 
     pub fn forward_with_audio_features(

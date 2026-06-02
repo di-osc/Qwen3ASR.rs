@@ -159,8 +159,44 @@ impl QLinear {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub fn try_fused_q8_silu_gate_up(
+    gate: &IsqLinear,
+    up: &IsqLinear,
+    x: &Tensor,
+) -> Result<Option<Tensor>> {
+    let (LinearX::QLinear(gate), LinearX::QLinear(up)) = (gate, up) else {
+        return Ok(None);
+    };
+    if gate.bias.is_some() || up.bias.is_some() {
+        return Ok(None);
+    }
+    let (QMatMul::QTensor(gate_q), QMatMul::QTensor(up_q)) =
+        (gate.matmul.as_ref(), up.matmul.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !crate::model::q8_mmvq::can_run_fused_glu(gate_q, up_q, x) {
+        return Ok(None);
+    }
+    Ok(Some(crate::model::q8_mmvq::fused_glu_silu(
+        gate_q, up_q, x,
+    )?))
+}
+
 impl candle_core::Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let QMatMul::QTensor(qtensor) = self.matmul.as_ref() {
+            if crate::model::q8_mmvq::can_run(qtensor, x) {
+                let mut ys = crate::model::q8_mmvq::plain(qtensor, x)?;
+                if let Some(bias) = &self.bias {
+                    ys = ys.broadcast_add(&bias.to_dtype(ys.dtype())?.to_device(x.device())?)?;
+                }
+                return Ok(ys);
+            }
+        }
+
         let xs = if x.dtype() == DType::F32 {
             x.clone()
         } else {
@@ -311,7 +347,7 @@ struct IsqSpec {
 
 fn parse_isq_spec(value: &str) -> Result<IsqSpec> {
     let dtype = parse_isq_dtype(value)?;
-    let mut modules_to_not_convert = vec!["lm_head".to_string()];
+    let mut modules_to_not_convert = Vec::new();
 
     for part in value.split([';', ',']) {
         let part = part.trim();
@@ -375,6 +411,8 @@ fn compatible_dtype(weight: &Tensor, requested: GgmlDType) -> Option<GgmlDType> 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    use super::try_fused_q8_silu_gate_up;
     use super::{
         IsqLinear, LinearX, linear_is_prefill, module_path_matches_not_convert, parse_isq_dtype,
         set_linear_is_prefill,
@@ -435,6 +473,75 @@ mod tests {
             "thinker.lm_head",
             "lm_head"
         ));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_q8_mmvq_fast_path_matches_fallback_on_cuda() -> anyhow::Result<()> {
+        use candle_core::Module;
+
+        let device = candle_core::Device::new_cuda(0)?;
+        let weight = candle_core::Tensor::randn(0f32, 0.02f32, (64usize, 128usize), &device)?
+            .to_dtype(candle_core::DType::BF16)?;
+        let linear = candle_nn::Linear::new(weight, None);
+        let linear = IsqLinear::new(linear, Some("q8_0"), &device)?;
+        let LinearX::QLinear(qlinear) = linear else {
+            anyhow::bail!("expected QLinear");
+        };
+        let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, 1usize, 128usize), &device)?
+            .to_dtype(candle_core::DType::BF16)?;
+
+        let fast = qlinear.forward(&x)?.to_dtype(candle_core::DType::F32)?;
+        let fallback = qlinear
+            .matmul
+            .as_ref()
+            .forward(&x.to_dtype(candle_core::DType::F32)?)?
+            .to_dtype(candle_core::DType::BF16)?
+            .to_dtype(candle_core::DType::F32)?;
+        let diff = (fast - fallback)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 0.05,
+            "q8 mmvq fast path diverged from fallback: max abs diff {diff}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_q8_mmvq_fused_silu_gate_up_matches_unfused_on_cuda() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_cuda(0)?;
+        let gate_weight = candle_core::Tensor::randn(0f32, 0.02f32, (64usize, 128usize), &device)?
+            .to_dtype(candle_core::DType::BF16)?;
+        let up_weight = candle_core::Tensor::randn(0f32, 0.02f32, (64usize, 128usize), &device)?
+            .to_dtype(candle_core::DType::BF16)?;
+        let gate = IsqLinear::new(
+            candle_nn::Linear::new(gate_weight, None),
+            Some("q8_0"),
+            &device,
+        )?;
+        let up = IsqLinear::new(
+            candle_nn::Linear::new(up_weight, None),
+            Some("q8_0"),
+            &device,
+        )?;
+        let x = candle_core::Tensor::randn(0f32, 0.02f32, (1usize, 1usize, 128usize), &device)?
+            .to_dtype(candle_core::DType::BF16)?;
+
+        let fused = try_fused_q8_silu_gate_up(&gate, &up, &x)?
+            .ok_or_else(|| anyhow::anyhow!("expected fused q8 gate/up path"))?
+            .to_dtype(candle_core::DType::F32)?;
+        let gate_y = gate.forward(&x)?;
+        let up_y = up.forward(&x)?;
+        let unfused = candle_nn::ops::silu(&gate_y)?
+            .broadcast_mul(&up_y)?
+            .to_dtype(candle_core::DType::F32)?;
+
+        let diff = (fused - unfused)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            diff < 0.05,
+            "q8 fused gate/up path diverged from unfused: max abs diff {diff}"
+        );
         Ok(())
     }
 }

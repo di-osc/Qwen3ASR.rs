@@ -145,7 +145,27 @@ fn apply_multimodal_rotary_pos_emb_interleaved(
     sin: &Tensor,
     mrope_section: &[usize],
 ) -> Result<(Tensor, Tensor)> {
-    let (_modalities, _batch, _seq_len, half_dim) = cos.dims4()?;
+    let (_modalities, _batch, seq_len, half_dim) = cos.dims4()?;
+    if seq_len == 1 {
+        let cos_half = cos.i(0)?.contiguous()?;
+        let sin_half = sin.i(0)?.contiguous()?;
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        #[cfg(feature = "cuda-paged-attn")]
+        if q.device().is_cuda() {
+            let cos_table = cos_half.reshape((1usize, half_dim))?.contiguous()?;
+            let sin_table = sin_half.reshape((1usize, half_dim))?.contiguous()?;
+            let positions = Tensor::zeros((1usize,), DType::I64, q.device())?;
+            attention_rs::fused_rope::FusedRope::apply_inplace(
+                &q, &k, &cos_table, &sin_table, &positions, false,
+            )?;
+            return Ok((q, k));
+        }
+        let q_embed = apply_rope_batched(&q, &cos_half, &sin_half)?;
+        let k_embed = apply_rope_batched(&k, &cos_half, &sin_half)?;
+        return Ok((q_embed, k_embed));
+    }
+
     let modality_num = mrope_section.len();
 
     let original_dtype = cos.dtype();

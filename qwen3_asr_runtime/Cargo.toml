@@ -11,7 +11,7 @@ keywords = ["asr", "speech-recognition", "machine-learning", "qwen"]
 candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
 candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
 candle-transformers = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7" }
-candle-flash-attn = { version = "0.9", optional = true }
+candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "15b70c7", optional = true }
 attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", rev = "8fdb7ab", optional = true }
 # Keep in sync with Candle/cudarc constraints (mirrors qwen3-tts-rs).
 float8 = "=0.5.0"
@@ -22,7 +22,7 @@ serde_json = "1"
 tracing = "0.1"
 
 tokenizers = "0.21"
-hf-hub = "0.4"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 safetensors = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 rustfft = "6"
@@ -37,7 +37,7 @@ intel-mkl-src = { version = "0.8.1", optional = true }
 symphonia = { version = "0.5", features = ["all-codecs", "all-formats"], optional = true }
 rubato = { version = "0.16", optional = true }
 base64 = { version = "0.22", optional = true }
-reqwest = { version = "0.12", features = ["blocking"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
 lindera = { version = "2.2.0", optional = true }
 lindera-ipadic = { version = "2.2.0", optional = true }
 unicode-general-category = "1.1.0"
@@ -57,7 +57,9 @@ cuda = [
   "candle-nn/cuda",
   "candle-transformers/cuda",
   "dep:bindgen_cuda",
+  "dep:half",
 ]
+cuda-graph = ["cuda-paged-attn", "attention-rs/graph", "candle-core/graph"]
 cudnn = ["cuda", "candle-core/cudnn"]
 flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 mkl = [
@@ -70,6 +72,7 @@ nccl = ["cuda", "cudarc/nccl", "dep:half"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 paged-attn = ["dep:attention-rs"]
 metal-paged-attn = ["metal", "paged-attn", "attention-rs/metal", "attention-rs/metal-flash"]
+cuda-paged-attn = ["cuda", "paged-attn", "attention-rs/cuda"]
 cudarc = ["dep:cudarc"]
 
 audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64", "dep:reqwest"]
@@ -98,6 +101,9 @@ test-all-cuda = ["test-all", "cuda", "audio-loading"]
 [dev-dependencies]
 fs2 = "0.4"
 
+[build-dependencies]
+bindgen_cuda = { version = "0.1.5", optional = true }
+
 [[example]]
 name = "bench_transcribe"
-required-features = ["audio-loading", "timing", "metal"]
+required-features = ["audio-loading", "timing"]

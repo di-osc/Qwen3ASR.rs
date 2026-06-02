@@ -24,7 +24,7 @@ use candle_flash_attn::flash_attn_varlen;
 const LAYER_NORM_EPS: f64 = 1e-5;
 
 fn maybe_contiguous_for_metal(x: Tensor) -> Result<Tensor> {
-    if x.device().is_metal() {
+    if x.device().is_metal() || x.device().is_cuda() {
         x.contiguous()
     } else {
         Ok(x)
@@ -360,9 +360,9 @@ impl AudioAttention {
         let k = k.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
         let v = v.transpose(0, 1)?.unsqueeze(0)?; // (1, h, s, d)
 
-        // Metal GEMM kernels only support contiguous (or simple transposed) layouts.
+        // GPU GEMM kernels only support contiguous (or simple transposed) layouts.
         // These tensors are produced via reshapes/transposes that yield strided views,
-        // so materialize contiguous buffers when running on Metal.
+        // so materialize contiguous buffers when running on Metal or CUDA.
         let q = maybe_contiguous_for_metal(q)?;
         let v = maybe_contiguous_for_metal(v)?;
 

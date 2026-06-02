@@ -18,5 +18,7 @@ pyo3 = { version = "0.22", features = ["abi3-py39"] }
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
 cuda = ["qwen3_asr_core/cuda"]
+cuda-graph = ["qwen3_asr_core/cuda-graph"]
 metal = ["qwen3_asr_core/metal"]
 metal-paged-attn = ["qwen3_asr_core/metal-paged-attn"]
+cuda-paged-attn = ["qwen3_asr_core/cuda-paged-attn"]
