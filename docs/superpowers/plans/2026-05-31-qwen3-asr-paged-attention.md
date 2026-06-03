@@ -12,13 +12,13 @@
 
 ## File Structure
 
-- Modify `qwen3_asr_runtime/Cargo.toml`: add optional `attention-rs` dependency and feature gates.
-- Create `qwen3_asr_runtime/src/model/paged_kv_cache.rs`: preallocated page tensors, block table, slot mapping, and metadata helpers.
-- Modify `qwen3_asr_runtime/src/model/mod.rs`: expose `paged_kv_cache` behind the feature.
-- Modify `qwen3_asr_runtime/src/model/thinker_text.rs`: create paged attention objects per layer and add paged forward methods.
-- Modify `qwen3_asr_runtime/src/model/thinker.rs`: expose a thinker-level paged forward method.
-- Modify `qwen3_asr_runtime/src/model/generation.rs`: add an opt-in paged greedy path for batch size 1 dense prompts.
-- Modify `qwen3_asr_runtime/src/inference/transcribe.rs`: choose paged generation only when feature/device/input constraints match.
+- Modify `vasr_models_qwen3_asr/Cargo.toml`: add optional `attention-rs` dependency and feature gates.
+- Create `vasr_models_qwen3_asr/src/model/paged_kv_cache.rs`: preallocated page tensors, block table, slot mapping, and metadata helpers.
+- Modify `vasr_models_qwen3_asr/src/model/mod.rs`: expose `paged_kv_cache` behind the feature.
+- Modify `vasr_models_qwen3_asr/src/model/thinker_text.rs`: create paged attention objects per layer and add paged forward methods.
+- Modify `vasr_models_qwen3_asr/src/model/thinker.rs`: expose a thinker-level paged forward method.
+- Modify `vasr_models_qwen3_asr/src/model/generation.rs`: add an opt-in paged greedy path for batch size 1 dense prompts.
+- Modify `vasr_models_qwen3_asr/src/inference/transcribe.rs`: choose paged generation only when feature/device/input constraints match.
 - Test with `cargo test`, `cargo test --features metal-paged-attn`, `maturin develop`, and the fixture audio.
 
 ---
@@ -26,7 +26,7 @@
 ### Task 1: Dependency Probe
 
 **Files:**
-- Modify: `qwen3_asr_runtime/Cargo.toml`
+- Modify: `vasr_models_qwen3_asr/Cargo.toml`
 
 - [ ] **Step 1: Add optional dependency and feature gates**
 
@@ -48,7 +48,7 @@ metal-paged-attn = ["metal", "paged-attn", "attention-rs/metal", "attention-rs/m
 Run:
 
 ```bash
-cargo check -p qwen3_asr_runtime --features metal-paged-attn
+cargo check -p vasr-models-qwen3-asr --features metal-paged-attn
 ```
 
 Expected success: Cargo resolves one Candle version and the crate compiles far enough to reach this project code.
@@ -58,7 +58,7 @@ Expected dependency failure: duplicate `candle-core` type errors or git dependen
 - [ ] **Step 3: Commit**
 
 ```bash
-git add qwen3_asr_runtime/Cargo.toml Cargo.lock
+git add vasr_models_qwen3_asr/Cargo.toml Cargo.lock
 git commit -m "build: add optional paged attention dependency"
 ```
 
@@ -67,8 +67,8 @@ git commit -m "build: add optional paged attention dependency"
 ### Task 2: Paged KV Cache Unit
 
 **Files:**
-- Create: `qwen3_asr_runtime/src/model/paged_kv_cache.rs`
-- Modify: `qwen3_asr_runtime/src/model/mod.rs`
+- Create: `vasr_models_qwen3_asr/src/model/paged_kv_cache.rs`
+- Modify: `vasr_models_qwen3_asr/src/model/mod.rs`
 
 - [ ] **Step 1: Write tests for block math**
 
@@ -102,7 +102,7 @@ fn test_paged_cache_single_sequence_layout() -> anyhow::Result<()> {
 Run:
 
 ```bash
-cargo test -p qwen3_asr_runtime model::paged_kv_cache::tests::test_paged_cache_single_sequence_layout
+cargo test -p vasr-models-qwen3-asr model::paged_kv_cache::tests::test_paged_cache_single_sequence_layout
 ```
 
 Expected: FAIL because `PagedKvCache` does not exist.
@@ -149,7 +149,7 @@ For phase 1, `block_tables_tensor` returns shape `(1, num_blocks)` and `context_
 Run:
 
 ```bash
-cargo test -p qwen3_asr_runtime model::paged_kv_cache::tests
+cargo test -p vasr-models-qwen3-asr model::paged_kv_cache::tests
 ```
 
 Expected: PASS.
@@ -157,7 +157,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add qwen3_asr_runtime/src/model/paged_kv_cache.rs qwen3_asr_runtime/src/model/mod.rs
+git add vasr_models_qwen3_asr/src/model/paged_kv_cache.rs vasr_models_qwen3_asr/src/model/mod.rs
 git commit -m "feat: add paged kv cache metadata"
 ```
 
@@ -166,7 +166,7 @@ git commit -m "feat: add paged kv cache metadata"
 ### Task 3: Text Attention Paged Forward
 
 **Files:**
-- Modify: `qwen3_asr_runtime/src/model/thinker_text.rs`
+- Modify: `vasr_models_qwen3_asr/src/model/thinker_text.rs`
 
 - [ ] **Step 1: Add feature-gated imports and layer state**
 
@@ -228,8 +228,8 @@ Do not alter `forward_with_kv_cache` except for sharing private helper code if t
 Run:
 
 ```bash
-cargo check -p qwen3_asr_runtime
-cargo check -p qwen3_asr_runtime --features metal-paged-attn
+cargo check -p vasr-models-qwen3-asr
+cargo check -p vasr-models-qwen3-asr --features metal-paged-attn
 ```
 
 Expected: both pass.
@@ -237,7 +237,7 @@ Expected: both pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add qwen3_asr_runtime/src/model/thinker_text.rs
+git add vasr_models_qwen3_asr/src/model/thinker_text.rs
 git commit -m "feat: add paged text attention forward path"
 ```
 
@@ -246,8 +246,8 @@ git commit -m "feat: add paged text attention forward path"
 ### Task 4: Paged Greedy Generation
 
 **Files:**
-- Modify: `qwen3_asr_runtime/src/model/thinker.rs`
-- Modify: `qwen3_asr_runtime/src/model/generation.rs`
+- Modify: `vasr_models_qwen3_asr/src/model/thinker.rs`
+- Modify: `vasr_models_qwen3_asr/src/model/generation.rs`
 
 - [ ] **Step 1: Add a failing dense-path test**
 
@@ -297,8 +297,8 @@ It calls paged generation only when the feature is enabled, the device is Metal,
 Run:
 
 ```bash
-cargo test -p qwen3_asr_runtime model::generation::tests
-cargo check -p qwen3_asr_runtime --features metal-paged-attn
+cargo test -p vasr-models-qwen3-asr model::generation::tests
+cargo check -p vasr-models-qwen3-asr --features metal-paged-attn
 ```
 
 Expected: PASS.
@@ -306,7 +306,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add qwen3_asr_runtime/src/model/thinker.rs qwen3_asr_runtime/src/model/generation.rs
+git add vasr_models_qwen3_asr/src/model/thinker.rs vasr_models_qwen3_asr/src/model/generation.rs
 git commit -m "feat: add paged greedy decode path"
 ```
 
@@ -315,7 +315,7 @@ git commit -m "feat: add paged greedy decode path"
 ### Task 5: Inference Wiring and Verification
 
 **Files:**
-- Modify: `qwen3_asr_runtime/src/inference/transcribe.rs`
+- Modify: `vasr_models_qwen3_asr/src/inference/transcribe.rs`
 
 - [ ] **Step 1: Route single-item transcription through auto generation**
 
@@ -362,7 +362,7 @@ Run:
 cargo fmt --all -- --check
 cargo test --workspace
 python -m pytest tests/test_python_api.py -q
-cargo test -p qwen3_asr_runtime --features metal-paged-attn
+cargo test -p vasr-models-qwen3-asr --features metal-paged-attn
 ```
 
 Expected: all pass.
@@ -370,7 +370,7 @@ Expected: all pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add qwen3_asr_runtime/src/inference/transcribe.rs
+git add vasr_models_qwen3_asr/src/inference/transcribe.rs
 git commit -m "feat: enable paged attention transcription path"
 ```
 

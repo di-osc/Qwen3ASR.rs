@@ -1,0 +1,36 @@
+[package]
+name = "vasr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vasr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+clap = { version = "4", features = ["derive", "env"] }
+vasr-models-qwen3-asr = { path = "../vasr_models_qwen3_asr" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt", "time"] }
+vasr-audio = { path = "../vasr_audio" }
+vasr-runtime = { path = "../vasr_runtime" }
+vasr-server = { path = "../vasr_server" }
+
+[features]
+default = []
+accelerate = ["vasr-runtime/accelerate"]
+cuda = ["vasr-runtime/cuda"]
+cuda-graph = ["vasr-runtime/cuda-graph"]
+metal = ["vasr-runtime/metal"]
+metal-paged-attn = ["metal", "vasr-runtime/metal-paged-attn"]
+cuda-paged-attn = ["cuda", "vasr-runtime/cuda-paged-attn"]
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "vasr-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+vasr-data = { path = "../vasr_data" }
+vasr-models-qwen3-asr = { path = "../vasr_models_qwen3_asr", features = ["audio-loading"] }
+
+[lints]
+workspace = true
