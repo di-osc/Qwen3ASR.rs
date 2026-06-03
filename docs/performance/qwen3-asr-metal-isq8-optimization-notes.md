@@ -909,3 +909,62 @@ Notes:
    reductions on Metal.
 2. Port fuller eager `SingleCache` semantics to keep closing the non-paged gap.
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 4: Mistral-Style Gathered KV Unpack (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed
+
+File:
+
+- `vasr_models/src/model/thinker_text.rs` (`unpack_gathered_kv_for_attention`)
+
+Behavior:
+
+- Align mixed-length paged prefill unpack with mistral.rs `unpack_gathered_kv`:
+  - keep native `num_kv_heads` and defer GQA expansion to `run_attention`
+  - pad only the trailing tail when `kv_len < max_kv` via `Tensor::cat`
+  - remove full `(attn_heads, max_kv)` zero buffers plus `slice_set`
+- Add equal-length fast path: when all `kv_lens` match, reshape gathered KV
+  directly to `(batch, num_kv_heads, max_kv, head_size)` without per-row cat.
+
+Why:
+
+- The old unpack path expanded GQA inside unpack and always materialized padded
+  zero tensors, adding avoidable Metal memory traffic before SDPA.
+
+### Measured Results (this pass)
+
+Single-sequence paged decode (`asr_en_16k.wav`, hot runs):
+
+| Run | `prefill_ms` | `decode_tokens_per_s` |
+| --- | ---: | ---: |
+| 2 | `234.0` | `175.0` |
+| 3 | `234.0` | `173.9` |
+
+Mixed-length batch (`asr_en_16k.wav` + `audio (12).wav`, batch=2):
+
+| Run | `prefill_ms` | `decode_ms` | `batch_decode_tokens_per_s` |
+| --- | ---: | ---: | ---: |
+| 1 | `367.4` | `276.9` | `220.3` |
+| 2 | `362.6` | `281.1` | `217.0` |
+
+Compared with Pass 3 on the same machine:
+
+- Mixed-length **prefill improved by ~15-20 ms** (~4-5%) on hot runs
+  (`~378-384 ms` -> `~362-367 ms`).
+- Decode throughput stayed in the same band; output text remained stable.
+
+### Next Steps (Metal-first)
+
+1. Add `adjust_kv_mask`-style narrowing when custom masks exceed gathered `max_kv`.
+2. Port fuller eager `SingleCache` semantics for the remaining non-paged gap.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

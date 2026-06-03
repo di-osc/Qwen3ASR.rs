@@ -60,34 +60,51 @@ fn unpack_gathered_kv_for_attention(
     packed: &Tensor,
     kv_lens: &[usize],
     num_kv_heads: usize,
-    num_kv_groups: usize,
+    _num_kv_groups: usize,
     head_size: usize,
     device: &candle_core::Device,
 ) -> Result<Tensor> {
+    if kv_lens.is_empty() {
+        candle_core::bail!("unpack_gathered_kv_for_attention requires at least one sequence");
+    }
+
     let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+    let batch = kv_lens.len();
+    if max_kv == 0 {
+        return Tensor::zeros(
+            (batch, num_kv_heads, 0usize, head_size),
+            packed.dtype(),
+            device,
+        );
+    }
+
+    if kv_lens.iter().all(|&len| len == max_kv) {
+        let total = batch
+            .checked_mul(max_kv)
+            .ok_or_else(|| candle_core::Error::Msg("gathered kv token count overflow".into()))?;
+        return Ok(packed
+            .narrow(0, 0, total)?
+            .reshape((batch, max_kv, num_kv_heads, head_size))?
+            .transpose(1, 2)?);
+    }
+
     let mut start = 0usize;
-    let mut unpacked: Vec<Tensor> = Vec::with_capacity(kv_lens.len());
-    let attn_heads = num_kv_heads.saturating_mul(num_kv_groups);
+    let mut unpacked: Vec<Tensor> = Vec::with_capacity(batch);
 
     for &kv_len in kv_lens {
-        let seq = packed
+        let mut seq = packed
             .narrow(0, start, kv_len)?
             .transpose(0, 1)?
             .unsqueeze(0)?;
-        let seq = if num_kv_groups > 1 {
-            seq.unsqueeze(2)?
-                .broadcast_as((1usize, num_kv_heads, num_kv_groups, kv_len, head_size))?
-                .reshape((1usize, attn_heads, kv_len, head_size))?
-        } else {
-            seq
-        };
-        let row = Tensor::zeros(
-            (1usize, attn_heads, max_kv, head_size),
-            packed.dtype(),
-            device,
-        )?;
-        row.slice_set(&seq, 2, 0)?;
-        unpacked.push(row);
+        if kv_len < max_kv {
+            let pad = Tensor::zeros(
+                (1usize, num_kv_heads, max_kv - kv_len, head_size),
+                packed.dtype(),
+                device,
+            )?;
+            seq = Tensor::cat(&[&seq, &pad], 2)?;
+        }
+        unpacked.push(seq);
         start = start.saturating_add(kv_len);
     }
 
@@ -1403,11 +1420,26 @@ mod tests {
         )?;
         let out = unpack_gathered_kv_for_attention(&packed, &[2, 1], 2, 2, 1, &device)?;
         let got = out.flatten_all()?.to_vec1::<f32>()?;
-        let expected = vec![
-            1.0, 2.0, 1.0, 2.0, 10.0, 20.0, 10.0, 20.0, 3.0, 0.0, 3.0, 0.0, 30.0, 0.0, 30.0, 0.0,
-        ];
+        let expected = vec![1.0, 2.0, 10.0, 20.0, 3.0, 0.0, 30.0, 0.0];
         if got != expected {
             anyhow::bail!("unexpected unpacked kv: expected={expected:?} got={got:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_unpack_gathered_kv_for_attention_equal_length_fast_path() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let packed = candle_core::Tensor::from_vec(
+            vec![1f32, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0],
+            (4usize, 2usize, 1usize),
+            &device,
+        )?;
+        let out = unpack_gathered_kv_for_attention(&packed, &[2, 2], 2, 2, 1, &device)?;
+        let got = out.flatten_all()?.to_vec1::<f32>()?;
+        let expected = vec![1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0];
+        if got != expected {
+            anyhow::bail!("unexpected equal-length unpacked kv: expected={expected:?} got={got:?}");
         }
         Ok(())
     }
