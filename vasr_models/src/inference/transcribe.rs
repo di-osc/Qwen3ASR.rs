@@ -494,6 +494,10 @@ fn generate_raw_prepared_batch_timed(
         .generation
         .decode_graph_replay_us
         .saturating_add(gen_timings.decode_graph_replay_us);
+    timings.generation.decode_forward_us = timings
+        .generation
+        .decode_forward_us
+        .saturating_add(gen_timings.decode_forward_us);
     timings.generation.decode_argmax_us = timings
         .generation
         .decode_argmax_us

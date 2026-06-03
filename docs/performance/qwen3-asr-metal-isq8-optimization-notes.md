@@ -1112,3 +1112,159 @@ Takeaways:
 1. Reduce paged decode argmax overhead (currently ~60 ms / 44 steps).
 2. Port snapshot/rollback `SingleCache` semantics if needed for speculative paths.
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 7: Metal Argmax Scratch + Decode Timing Split (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed
+
+#### 1. Reusable Metal argmax workspace
+
+Files:
+
+- `vasr_models/src/model/metal_argmax.rs`
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- Added `MetalArgmaxScratch` to reuse topk stage1/stage2 Metal buffers across decode
+  steps instead of allocating five buffers on every argmax call.
+- `greedy_generate_paged` keeps one scratch for prefill + all decode steps.
+- Skip redundant `contiguous()` when logits are already contiguous.
+
+Why:
+
+- Each decode step previously allocated ~75-block topk workspace from scratch.
+- Confirms prior note: argmax kernel choice matters less than sync behavior.
+
+#### 2. Split paged decode timing (`decode_forward_us`)
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/examples/bench_transcribe.rs`
+- `vasr_models/src/inference/transcribe.rs`
+
+Behavior:
+
+- Time paged decode forward separately from argmax readback.
+- Bench output adds `decode_forward_ms` alongside `decode_argmax_ms`.
+
+Why:
+
+- Makes it explicit that most `decode_argmax_ms` is GPU pipeline drain at the
+  first host readback, not topk compute or buffer allocation.
+
+### Measured Results (this pass)
+
+Single-sequence paged-attn (`fixtures/audio/asr_en_16k.wav`, 3 hot runs):
+
+| Run | `decode_tokens_per_s` | `decode_forward_ms` | `decode_argmax_ms` | Notes |
+| --- | ---: | ---: | ---: | --- |
+| 2 | `172.3` | `169.4` | `84.2` | `prompt_len=214`, `steps=44` |
+| 3 | `169.1` | `173.0` | `85.2` | stable transcription |
+
+Reference (Pass 6 hot band on a faster session): `~202-204 tok/s`.
+
+Control (`VASR_DISABLE_METAL_ARGMAX=1`, candle argmax): `~170 tok/s` — custom
+Metal topk remains faster than candle fallback.
+
+Takeaways:
+
+- **`decode_forward_ms + decode_argmax_ms ≈ decode_ms`** on paged path
+  (~171 ms + ~85 ms ≈ 256 ms for 44 tokens).
+- **`decode_argmax_ms` is dominated by GPU synchronization**, not buffer alloc;
+  scratch reuse is hygiene but does not materially move tok/s alone.
+- Session-to-session Metal variance remains large (`~170-204 tok/s` observed).
+
+### Next Steps (Metal-first)
+
+1. Reduce paged decode forward cost (true gap vs eager ~232 tok/s on same fixture).
+2. Explore Metal command-buffer batching / fewer sync points across decode steps.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 7: Metal Argmax Scratch + Decode Timing Split (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed
+
+#### 1. Reusable Metal argmax workspace
+
+Files:
+
+- `vasr_models/src/model/metal_argmax.rs`
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- Added `MetalArgmaxScratch` to reuse topk stage1/stage2 Metal buffers across decode
+  steps instead of allocating five buffers on every argmax call.
+- `greedy_generate_paged` keeps one scratch for prefill + all decode steps.
+- Skip redundant `contiguous()` when logits are already contiguous.
+
+Why:
+
+- Each decode step previously allocated ~75-block topk workspace from scratch.
+- Confirms prior note: argmax kernel choice matters less than sync behavior.
+
+#### 2. Split paged decode timing (`decode_forward_us`)
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/examples/bench_transcribe.rs`
+- `vasr_models/src/inference/transcribe.rs`
+
+Behavior:
+
+- Time paged decode forward separately from argmax readback.
+- Bench output adds `decode_forward_ms` alongside `decode_argmax_ms`.
+
+Why:
+
+- Makes it explicit that most `decode_argmax_ms` is GPU pipeline drain at the
+  first host readback, not topk compute or buffer allocation.
+
+### Measured Results (this pass)
+
+Single-sequence paged-attn (`fixtures/audio/asr_en_16k.wav`, 3 hot runs):
+
+| Run | `decode_tokens_per_s` | `decode_forward_ms` | `decode_argmax_ms` | Notes |
+| --- | ---: | ---: | ---: | --- |
+| 2 | `172.3` | `169.4` | `84.2` | `prompt_len=214`, `steps=44` |
+| 3 | `169.1` | `173.0` | `85.2` | stable transcription |
+
+Reference (Pass 6 hot band on a faster session): `~202-204 tok/s`.
+
+Control (`VASR_DISABLE_METAL_ARGMAX=1`, candle argmax): `~170 tok/s` — custom
+Metal topk remains faster than candle fallback.
+
+Takeaways:
+
+- **`decode_forward_ms + decode_argmax_ms ≈ decode_ms`** on paged path
+  (~171 ms + ~85 ms ≈ 256 ms for 44 tokens).
+- **`decode_argmax_ms` is dominated by GPU synchronization**, not buffer alloc;
+  scratch reuse is hygiene but does not materially move tok/s alone.
+- Session-to-session Metal variance remains large (`~170-204 tok/s` observed).
+
+### Next Steps (Metal-first)
+
+1. Reduce paged decode forward cost (true gap vs eager ~232 tok/s on same fixture).
+2. Explore Metal command-buffer batching / fewer sync points across decode steps.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

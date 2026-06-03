@@ -44,6 +44,38 @@ fn argmax_token_id(logits: &Tensor) -> Result<u32> {
     Ok(logits.argmax(0usize)?.to_scalar::<u32>()?)
 }
 
+#[cfg(feature = "metal-paged-attn")]
+fn metal_argmax_scratch_for_device(
+    device: &Device,
+) -> Option<crate::model::metal_argmax::MetalArgmaxScratch> {
+    if device.is_metal() && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none() {
+        Some(crate::model::metal_argmax::MetalArgmaxScratch::new())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "metal-paged-attn"))]
+fn metal_argmax_scratch_for_device(_device: &Device) -> Option<()> {
+    None
+}
+
+#[cfg(feature = "metal-paged-attn")]
+fn argmax_token_id_with_scratch(
+    logits: &Tensor,
+    scratch: Option<&mut crate::model::metal_argmax::MetalArgmaxScratch>,
+) -> Result<u32> {
+    if let Some(scratch) = scratch {
+        if logits.device().is_metal()
+            && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none()
+            && matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        {
+            return Ok(scratch.argmax_token_id(logits)?);
+        }
+    }
+    argmax_token_id(logits)
+}
+
 #[cfg(feature = "timing")]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GenerationTimings {
@@ -63,6 +95,8 @@ pub struct GenerationTimings {
     pub decode_metadata_us: u64,
     /// Time spent replaying the CUDA graph.
     pub decode_graph_replay_us: u64,
+    /// Time spent in paged decode forward passes (excluding argmax sync).
+    pub decode_forward_us: u64,
     /// Time spent selecting and copying the next token back to host.
     pub decode_argmax_us: u64,
     /// Prompt/context length at the start of token-by-token decoding.
@@ -780,7 +814,19 @@ fn greedy_generate_paged(
             &input_metadata,
         )?
     };
-    let mut next_id = argmax_token_id(&logits.i((0usize, seq_len.saturating_sub(1)))?)?;
+    #[cfg(feature = "metal-paged-attn")]
+    let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
+    let mut next_id = {
+        let last_logits = logits.i((0usize, seq_len.saturating_sub(1)))?;
+        #[cfg(feature = "metal-paged-attn")]
+        {
+            argmax_token_id_with_scratch(&last_logits, metal_argmax_scratch.as_mut())?
+        }
+        #[cfg(not(feature = "metal-paged-attn"))]
+        {
+            argmax_token_id(&last_logits)?
+        }
+    };
 
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
@@ -915,18 +961,27 @@ fn greedy_generate_paged(
         };
         #[cfg(not(feature = "cuda-graph"))]
         let logits_new = {
+            #[cfg(feature = "timing")]
+            let start_forward = std::time::Instant::now();
             let _linear_decode_guard = set_linear_is_prefill(false);
             let inputs_embeds_new = inputs_embeds_new
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing decode inputs_embeds"))?;
             let input_metadata =
                 input_metadata.ok_or_else(|| anyhow::anyhow!("missing decode input metadata"))?;
-            thinker.forward_embeds_with_paged_cache(
+            let logits_new = thinker.forward_embeds_with_paged_cache(
                 &position_ids_new,
                 inputs_embeds_new,
                 &paged_cache,
                 input_metadata,
-            )?
+            )?;
+            #[cfg(feature = "timing")]
+            if let Some(t) = timings.as_mut() {
+                t.decode_forward_us = t
+                    .decode_forward_us
+                    .saturating_add(duration_to_us(start_forward.elapsed()));
+            }
+            logits_new
         };
         #[cfg(all(feature = "timing", feature = "cuda-graph"))]
         if decode_graph.is_some() {
@@ -939,7 +994,17 @@ fn greedy_generate_paged(
 
         #[cfg(feature = "timing")]
         let start_argmax = std::time::Instant::now();
-        next_id = argmax_token_id(&logits_new.i((0usize, 0usize))?)?;
+        let step_logits = logits_new.i((0usize, 0usize))?;
+        next_id = {
+            #[cfg(feature = "metal-paged-attn")]
+            {
+                argmax_token_id_with_scratch(&step_logits, metal_argmax_scratch.as_mut())?
+            }
+            #[cfg(not(feature = "metal-paged-attn"))]
+            {
+                argmax_token_id(&step_logits)?
+            }
+        };
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
             t.decode_argmax_us = t

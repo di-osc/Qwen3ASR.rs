@@ -80,7 +80,7 @@ fn main() -> Result<()> {
                 / (timings.generation.decode_us as f64 / 1_000_000.0)
         };
         println!(
-            "run={} wall_ms={} timed_total_ms={} audio_encoder_ms={} prefill_ms={} decode_ms={} decode_token_tensor_ms={:.3} decode_embed_ms={:.3} decode_position_ms={:.3} decode_metadata_ms={:.3} decode_graph_replay_ms={:.3} decode_argmax_ms={:.3} prompt_len={} steps={} tokens={} decode_tokens_per_s={:.3} text={:?}",
+            "run={} wall_ms={} timed_total_ms={} audio_encoder_ms={} prefill_ms={} decode_ms={} decode_token_tensor_ms={:.3} decode_embed_ms={:.3} decode_position_ms={:.3} decode_metadata_ms={:.3} decode_graph_replay_ms={:.3} decode_forward_ms={:.3} decode_argmax_ms={:.3} prompt_len={} steps={} tokens={} decode_tokens_per_s={:.3} text={:?}",
             run + 1,
             total.as_millis(),
             timings.total_us / 1000,
@@ -92,6 +92,7 @@ fn main() -> Result<()> {
             timings.generation.decode_position_us as f64 / 1000.0,
             timings.generation.decode_metadata_us as f64 / 1000.0,
             timings.generation.decode_graph_replay_us as f64 / 1000.0,
+            timings.generation.decode_forward_us as f64 / 1000.0,
             timings.generation.decode_argmax_us as f64 / 1000.0,
             timings.generation.prompt_len,
             timings.generation.steps,
