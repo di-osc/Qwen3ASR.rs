@@ -50,7 +50,14 @@ async fn handle_transcribe(
         match service.loader.load(&source, &AudioLoadOptions::default()) {
             Ok(waveform) => {
                 total_audio_duration_seconds += waveform.duration_seconds();
-                match service.pipeline.transcribe(&waveform, &service.options) {
+                let pipeline = Arc::clone(&service.pipeline);
+                let options = service.options.clone();
+                let task =
+                    tokio::task::spawn_blocking(move || pipeline.transcribe(&waveform, &options));
+                match task
+                    .await
+                    .unwrap_or_else(|err| Err(anyhow::anyhow!("transcribe task join error: {err}")))
+                {
                     Ok(timeline) => data.push(InferenceData::from_timeline("", &timeline)),
                     Err(err) => data.push(error_data("recognizer", err.to_string())),
                 }

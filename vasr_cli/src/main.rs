@@ -13,7 +13,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the fasr-compatible HTTP/WebSocket service.
+    /// Start a fasr-compatible transcribe or realtime service.
     Serve(serve::ServeArgs),
 }
 

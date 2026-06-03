@@ -33,6 +33,17 @@ impl Qwen3AsrModel {
 
 impl AsrModel for Qwen3AsrModel {
     fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
+        let mut timelines = self.transcribe_batch(std::slice::from_ref(waveform), options)?;
+        timelines
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR returned no transcription"))
+    }
+
+    fn transcribe_batch(
+        &self,
+        waveforms: &[Waveform],
+        options: &AsrOptions,
+    ) -> Result<Vec<Timeline>> {
         let runtime_options = RuntimeTranscribeOptions {
             context: Batch::one(options.context.clone()),
             language: Batch::one(options.language.clone()),
@@ -42,41 +53,51 @@ impl AsrModel for Qwen3AsrModel {
             chunk_max_sec: None,
             bucket_by_length: false,
         };
-        let outputs = self.inner.transcribe(
-            vec![AudioInput::Waveform {
+        let audio = waveforms
+            .iter()
+            .map(|waveform| AudioInput::Waveform {
                 samples: &waveform.samples,
                 sample_rate: waveform.sample_rate,
-            }],
-            runtime_options,
-        )?;
-        let output = outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Qwen3-ASR returned no transcription"))?;
-        let mut timeline = Timeline::new("qwen3_asr_audio");
-        let range = TimeRange::new(
-            vasr_data::DurationMs(0),
-            vasr_data::DurationMs(waveform.duration_ms().round() as u64),
-        );
-        if !output.language.is_empty() {
-            timeline.push(Annotation::new(
-                range,
-                AnnotationPayload::Language(output.language.clone()),
-                AnnotationSource::Model("qwen3_asr".to_string()),
-                AnnotationStatus::Final,
-            ));
+            })
+            .collect::<Vec<_>>();
+        let outputs = self.inner.transcribe(audio, runtime_options)?;
+        if outputs.len() != waveforms.len() {
+            anyhow::bail!(
+                "Qwen3-ASR returned {} transcriptions for {} inputs",
+                outputs.len(),
+                waveforms.len()
+            );
         }
-        timeline.push(Annotation::new(
-            range,
-            AnnotationPayload::Segment(TextSegment {
-                text: output.text,
-                tokens: Vec::new(),
-                language: Some(output.language),
-            }),
-            AnnotationSource::Model("qwen3_asr".to_string()),
-            AnnotationStatus::Final,
-        ));
-        Ok(timeline)
+        Ok(outputs
+            .into_iter()
+            .zip(waveforms)
+            .map(|(output, waveform)| {
+                let mut timeline = Timeline::new("qwen3_asr_audio");
+                let range = TimeRange::new(
+                    vasr_data::DurationMs(0),
+                    vasr_data::DurationMs(waveform.duration_ms().round() as u64),
+                );
+                if !output.language.is_empty() {
+                    timeline.push(Annotation::new(
+                        range,
+                        AnnotationPayload::Language(output.language.clone()),
+                        AnnotationSource::Model("qwen3_asr".to_string()),
+                        AnnotationStatus::Final,
+                    ));
+                }
+                timeline.push(Annotation::new(
+                    range,
+                    AnnotationPayload::Segment(TextSegment {
+                        text: output.text,
+                        tokens: Vec::new(),
+                        language: Some(output.language),
+                    }),
+                    AnnotationSource::Model("qwen3_asr".to_string()),
+                    AnnotationStatus::Final,
+                ));
+                timeline
+            })
+            .collect())
     }
 
     fn start_stream(&self, options: &AsrOptions) -> Result<Box<dyn StreamingAsrModel>> {

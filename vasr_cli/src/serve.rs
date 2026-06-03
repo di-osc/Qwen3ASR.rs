@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
-use clap::Args;
+use clap::{Args, Subcommand};
 use vasr_audio::AudioLoader;
 use vasr_models::qwen3_asr::LoadOptions;
 use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
@@ -13,10 +13,26 @@ use vasr_runtime::{
     AsrModel, AsrOptions, OfflinePipeline, Qwen3AsrModel, RealtimePipeline, SileroVadModel,
     VadModel, VadOptions,
 };
-use vasr_server::{RealtimeService, RealtimeSession, TranscribeService};
+use vasr_server::{
+    InferenceScheduler, RealtimeService, RealtimeSession, ScheduledAsrModel, TranscribeService,
+};
 
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
+    #[command(subcommand)]
+    pub service: ServeService,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServeService {
+    /// Start only the offline transcribe HTTP service.
+    Transcribe(TranscribeServeArgs),
+    /// Start only the realtime WebSocket service.
+    Realtime(RealtimeServeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CommonServeArgs {
     /// Qwen3-ASR model id or local model directory.
     #[arg(long, env = "VASR_MODEL")]
     pub model: String,
@@ -45,27 +61,125 @@ pub struct ServeArgs {
     #[arg(long, env = "VASR_ISQ")]
     pub isq: Option<String>,
 
-    /// Disable VAD annotations in offline transcribe.
+    /// Maximum decode tokens per request.
+    #[arg(long, default_value_t = 256, env = "VASR_MAX_NEW_TOKENS")]
+    pub max_new_tokens: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TranscribeServeArgs {
+    #[command(flatten)]
+    pub common: CommonServeArgs,
+
+    /// Disable VAD segmentation in offline transcribe.
     #[arg(long, default_value_t = false)]
     pub no_vad: bool,
 
     /// Silero VAD ONNX model path. If omitted, vASR searches local Silero caches.
     #[arg(long, env = "VASR_VAD_MODEL")]
     pub vad_model: Option<String>,
+}
 
-    /// Maximum decode tokens per request.
-    #[arg(long, default_value_t = 256, env = "VASR_MAX_NEW_TOKENS")]
-    pub max_new_tokens: usize,
+#[derive(Debug, Clone, Args)]
+pub struct RealtimeServeArgs {
+    #[command(flatten)]
+    pub common: CommonServeArgs,
+
+    /// Silero VAD ONNX model path. If omitted, vASR searches local Silero caches.
+    #[arg(long, env = "VASR_VAD_MODEL")]
+    pub vad_model: Option<String>,
 }
 
 pub async fn run(args: ServeArgs) -> Result<()> {
+    match args.service {
+        ServeService::Transcribe(args) => run_transcribe(args).await,
+        ServeService::Realtime(args) => run_realtime(args).await,
+    }
+}
+
+async fn run_transcribe(args: TranscribeServeArgs) -> Result<()> {
+    validate_common(&args.common)?;
+    let asr = load_asr_model(&args.common)?;
+
+    let offline_vad = if args.no_vad {
+        tracing::info!(
+            target: "vasr_cli::serve",
+            "Offline Silero VAD segmentation disabled."
+        );
+        None
+    } else {
+        let vad_load_start = Instant::now();
+        let vad = load_silero(&args.vad_model)?;
+        tracing::info!(
+            target: "vasr_cli::serve",
+            "Silero VAD loaded from `{}` in {:.3}s.",
+            vad.path().display(),
+            vad_load_start.elapsed().as_secs_f64()
+        );
+        Some(Box::new(vad) as Box<dyn VadModel>)
+    };
+    let offline = OfflinePipeline {
+        vad: offline_vad,
+        asr,
+    };
+    let transcribe_service = Arc::new(TranscribeService {
+        pipeline: Arc::new(offline),
+        loader: AudioLoader,
+        options: AsrOptions {
+            max_new_tokens: args.common.max_new_tokens,
+            ..AsrOptions::default()
+        },
+    });
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(vasr_server::transcribe_router(transcribe_service));
+    let addr = bind_addr(&args.common)?;
+    serve_app(app, addr, "transcribe").await
+}
+
+async fn run_realtime(args: RealtimeServeArgs) -> Result<()> {
+    validate_common(&args.common)?;
+    let asr = load_asr_model(&args.common)?;
+
+    let realtime_asr = Arc::clone(&asr);
+    let max_new_tokens = args.common.max_new_tokens;
+    let vad_model = args.vad_model.clone();
+    let realtime_service = Arc::new(RealtimeService {
+        make_session: Arc::new(move || {
+            let vad = load_silero(&vad_model)?.start_stream(&VadOptions::default())?;
+            let asr_stream = realtime_asr.start_stream(&AsrOptions {
+                max_new_tokens,
+                ..AsrOptions::default()
+            })?;
+            Ok(RealtimeSession::new(
+                16_000,
+                RealtimePipeline {
+                    vad,
+                    asr: asr_stream,
+                },
+            ))
+        }),
+    });
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(vasr_server::realtime_router(realtime_service));
+    let addr = bind_addr(&args.common)?;
+    serve_app(app, addr, "realtime").await
+}
+
+fn validate_common(args: &CommonServeArgs) -> Result<()> {
     if args.model.trim().is_empty() {
         bail!("--model must not be empty");
     }
     if args.max_new_tokens == 0 {
         bail!("--max-new-tokens must be greater than zero");
     }
+    Ok(())
+}
 
+fn load_asr_model(args: &CommonServeArgs) -> Result<Arc<dyn AsrModel>> {
     let device = resolve_device(&args.device)?;
     let dtype = resolve_dtype(&args.dtype, &device)?;
     let load_options = LoadOptions {
@@ -116,75 +230,35 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         "Model loaded in {:.3}s.",
         model_load_start.elapsed().as_secs_f64()
     );
-    let asr: Arc<dyn AsrModel> = Arc::new(qwen3_asr);
+    let asr_scheduler = InferenceScheduler::start("asr");
+    let base_asr: Arc<dyn AsrModel> = Arc::new(qwen3_asr);
+    let asr: Arc<dyn AsrModel> = Arc::new(ScheduledAsrModel::new(
+        Arc::clone(&base_asr),
+        asr_scheduler.clone(),
+    ));
+    Ok(asr)
+}
 
-    let offline_vad = if args.no_vad {
-        tracing::info!(
-            target: "vasr_cli::serve",
-            "Offline Silero VAD annotations disabled."
-        );
-        None
-    } else {
-        let vad_load_start = Instant::now();
-        let vad = load_silero(&args.vad_model)?;
-        tracing::info!(
-            target: "vasr_cli::serve",
-            "Silero VAD loaded from `{}` in {:.3}s.",
-            vad.path().display(),
-            vad_load_start.elapsed().as_secs_f64()
-        );
-        Some(Box::new(vad) as Box<dyn VadModel>)
-    };
-    let offline = OfflinePipeline {
-        vad: offline_vad,
-        asr: Arc::clone(&asr),
-    };
-    let transcribe_service = Arc::new(TranscribeService {
-        pipeline: Arc::new(offline),
-        loader: AudioLoader,
-        options: AsrOptions {
-            max_new_tokens: args.max_new_tokens,
-            ..AsrOptions::default()
-        },
-    });
+fn bind_addr(args: &CommonServeArgs) -> Result<SocketAddr> {
+    Ok(format!("{}:{}", args.host, args.port).parse()?)
+}
 
-    let realtime_asr = Arc::clone(&asr);
-    let max_new_tokens = args.max_new_tokens;
-    let vad_model = args.vad_model.clone();
-    let realtime_service = Arc::new(RealtimeService {
-        make_session: Arc::new(move || {
-            let vad = load_silero(&vad_model)?.start_stream(&VadOptions::default())?;
-            let asr_stream = realtime_asr.start_stream(&AsrOptions {
-                max_new_tokens,
-                ..AsrOptions::default()
-            })?;
-            Ok(RealtimeSession::new(
-                16_000,
-                RealtimePipeline {
-                    vad,
-                    asr: asr_stream,
-                },
-            ))
-        }),
-    });
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(vasr_server::transcribe_router(transcribe_service))
-        .merge(vasr_server::realtime_router(realtime_service));
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
+async fn serve_app(app: Router, addr: SocketAddr, service: &'static str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    match service {
+        "transcribe" => tracing::info!(
+            target: "vasr_cli::serve",
+            "HTTP endpoints: GET /health, POST /transcribe, POST /inference"
+        ),
+        "realtime" => tracing::info!(
+            target: "vasr_cli::serve",
+            "WebSocket endpoints: /v1/realtime, /api-ws/v1/realtime"
+        ),
+        _ => {}
+    }
     tracing::info!(
         target: "vasr_cli::serve",
-        "HTTP endpoints: GET /health, POST /transcribe, POST /inference"
-    );
-    tracing::info!(
-        target: "vasr_cli::serve",
-        "WebSocket endpoints: /v1/realtime, /api-ws/v1/realtime"
-    );
-    tracing::info!(
-        target: "vasr_cli::serve",
-        "vASR service listening on http://{addr}"
+        "vASR {service} service listening on http://{addr}"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

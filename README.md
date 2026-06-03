@@ -12,7 +12,7 @@ protocol DTOs, and HTTP/WebSocket service entry points.
 - `vasr-audio`: audio source loading into normalized 16 kHz mono waveforms.
 - `vasr-runtime`: model capability traits, Qwen3-ASR ASR model wrapper, Silero ONNX VAD, offline/realtime pipelines.
 - `vasr-protocol`: fasr-compatible transcribe and realtime DTOs.
-- `vasr-server`: axum routes for `/transcribe`, `/inference`, `/v1/realtime`, and `/api-ws/v1/realtime`.
+- `vasr-server`: axum routes for split transcribe and realtime services.
 - `vasr-models`: Candle Qwen3-ASR model implementation.
 
 ## Development
@@ -35,10 +35,10 @@ cargo test --workspace --features vasr-runtime/cuda
 
 ## Serve
 
-Start a CPU service:
+Start the CPU transcribe service:
 
 ```bash
-cargo run -p vasr-cli --bin vasr -- serve \
+cargo run -p vasr-cli --bin vasr -- serve transcribe \
   --model /path/to/Qwen3-ASR-0.6B \
   --vad-model /path/to/silero_vad.onnx \
   --host 127.0.0.1 \
@@ -47,13 +47,25 @@ cargo run -p vasr-cli --bin vasr -- serve \
   --dtype bf16
 ```
 
-Start a Metal service:
+Start the Metal transcribe service:
 
 ```bash
-cargo run -p vasr-cli --bin vasr --features metal-paged-attn -- serve \
+cargo run -p vasr-cli --bin vasr --features metal-paged-attn -- serve transcribe \
   --model /path/to/Qwen3-ASR-0.6B \
   --host 127.0.0.1 \
   --port 8000 \
+  --device metal \
+  --dtype bf16 \
+  --isq q8_0
+```
+
+Start the realtime service as a separate process:
+
+```bash
+cargo run -p vasr-cli --bin vasr --features metal-paged-attn -- serve realtime \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --host 127.0.0.1 \
+  --port 8001 \
   --device metal \
   --dtype bf16 \
   --isq q8_0
@@ -63,13 +75,14 @@ Build a release binary:
 
 ```bash
 cargo build --release -p vasr-cli --bin vasr --features metal-paged-attn
-./target/release/vasr serve --model /path/to/Qwen3-ASR-0.6B --device metal --dtype bf16 --isq q8_0
+./target/release/vasr serve transcribe --model /path/to/Qwen3-ASR-0.6B --device metal --dtype bf16 --isq q8_0
+./target/release/vasr serve realtime --model /path/to/Qwen3-ASR-0.6B --host 127.0.0.1 --port 8001 --device metal --dtype bf16 --isq q8_0
 ```
 
-Silero VAD is enabled by default for offline `/transcribe` annotations and realtime speech
+Silero VAD is enabled by default for offline `/transcribe` segmentation and realtime speech
 events. Pass `--vad-model /path/to/silero_vad.onnx` to choose an ONNX model explicitly, or
-`--no-vad` to disable offline VAD annotations. When `--vad-model` is omitted, vASR searches
-common local Silero cache locations under `$HOME/.cache`.
+`--no-vad` on `serve transcribe` to disable offline VAD segmentation. When `--vad-model` is
+omitted, vASR searches common local Silero cache locations under `$HOME/.cache`.
 
 The default Qwen3-ASR weight dtype is `bf16`, including Metal builds. Use `--dtype f16`
 as a fallback if a future model path hits a backend kernel limitation.
@@ -99,8 +112,8 @@ curl -X POST http://127.0.0.1:8000/transcribe \
 Realtime WebSocket endpoints:
 
 ```text
-ws://127.0.0.1:8000/v1/realtime
-ws://127.0.0.1:8000/api-ws/v1/realtime
+ws://127.0.0.1:8001/v1/realtime
+ws://127.0.0.1:8001/api-ws/v1/realtime
 ```
 
 The realtime API accepts fasr-style JSON events such as `session.update`,

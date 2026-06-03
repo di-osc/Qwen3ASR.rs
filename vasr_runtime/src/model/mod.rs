@@ -21,6 +21,17 @@ impl Default for AsrOptions {
 pub trait AsrModel: Send + Sync {
     fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline>;
 
+    fn transcribe_batch(
+        &self,
+        waveforms: &[Waveform],
+        options: &AsrOptions,
+    ) -> Result<Vec<Timeline>> {
+        waveforms
+            .iter()
+            .map(|waveform| self.transcribe(waveform, options))
+            .collect()
+    }
+
     fn start_stream(&self, options: &AsrOptions) -> Result<Box<dyn StreamingAsrModel>>;
 }
 
