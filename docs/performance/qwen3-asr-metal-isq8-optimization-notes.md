@@ -968,3 +968,54 @@ Compared with Pass 3 on the same machine:
 1. Add `adjust_kv_mask`-style narrowing when custom masks exceed gathered `max_kv`.
 2. Port fuller eager `SingleCache` semantics for the remaining non-paged gap.
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 5: Paged Prefill Mask Alignment (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed
+
+Files:
+
+- `vasr_models/src/model/attention.rs` (`adjust_kv_mask`)
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/thinker_text.rs` (`paged_prefill_attention_mask`)
+
+Behavior:
+
+- Port mistral.rs `adjust_kv_mask` and apply it when paged prefill uses unpacked
+  gathered K/V with `max_kv` shorter than the padded prompt width.
+- Only mark `prefill_causal_only=true` when every sequence uses the full prompt
+  width (`query_len == seq_len` for all rows).
+- Narrow explicit causal masks to gathered `max_kv` before Metal SDPA.
+
+Why:
+
+- Padded ASR batches often have `seq_len` wider than effective `max_kv`. Mask/K/V
+  shape mismatch could disable Metal SDPA or attend over padded key slots.
+
+### Measured Results (this pass)
+
+Mixed-length batch (`asr_en_16k.wav` + `audio (12).wav`, batch=2):
+
+| Run | `prefill_ms` | `batch_decode_tokens_per_s` |
+| --- | ---: | ---: |
+| 1 | `367.6` | `218.4` |
+| 3 | `367.2` | `217.3` |
+
+Notes:
+
+- Throughput stayed in the Pass 4 band; output text remained stable.
+- Primary value: correctness + SDPA compatibility for padded batch prefill.
+
+### Next Steps (Metal-first)
+
+1. Port fuller eager `SingleCache` semantics to close the non-paged eager gap.
+2. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
