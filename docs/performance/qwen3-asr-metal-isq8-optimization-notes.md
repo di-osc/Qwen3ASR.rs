@@ -1281,3 +1281,66 @@ Takeaways:
 1. Evaluate Metal batch=1 routing to eager KV path for max single-stream throughput.
 2. Prototype paged decode gather+SDPA fallback (mistral.rs large-head path).
 3. Metal command-buffer pipelining to overlap forward + argmax sync.
+
+## 2026-06-04 Pass 9: Metal Batch=1 Eager Routing (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- Metal + `batch==1` + dense mask now defaults to **eager KV-cache decode**
+  (`forward_decode_one_without_padding` + Metal SDPA) instead of paged-attn.
+- CUDA batch=1 still uses paged-attn (unchanged).
+- `batch>1` on Metal/CUDA still uses paged batch path when runtime is available.
+- Opt-in overrides:
+  - `VASR_FORCE_PAGED_ATTN=1` — force paged single-sequence decode on Metal
+  - `VASR_DISABLE_PAGED_ATTN=1` — disable all paged paths (unchanged)
+
+Why:
+
+- Pass 8 showed paged single-stream decode is ~15–30% slower than eager on Metal
+  because `reshape_and_cache` + `paged_attention` loses to dense KV + SDPA at
+  batch=1. Paged-attn value is batch scheduling / memory pooling, not single-seq
+  throughput.
+
+### Measured Results (this pass)
+
+Single-sequence (`fixtures/audio/asr_en_16k.wav`, same session):
+
+| Mode | `decode_tokens_per_s` | Notes |
+| --- | ---: | --- |
+| **Default (Metal eager)** | `~195-198` | new production default |
+| `VASR_FORCE_PAGED_ATTN=1` | `~171-174` | prior paged single-seq path |
+| Improvement | **+~23 tok/s (~14%)** | same fixture, same session |
+
+Mixed batch=2 (still paged):
+
+| Run | `batch_decode_tokens_per_s` | Notes |
+| --- | ---: | --- |
+| 2 | `216.6` | unchanged paged batch path |
+
+Takeaways:
+
+- **`bench_transcribe` on Metal now reflects eager decode by default** — aligns
+  with mistral.rs default eager reference (~232 tok/s on hot sessions).
+- Use `VASR_FORCE_PAGED_ATTN=1` when benchmarking paged single-seq regressions.
+- Server `transcribe` with `max_batch_size=1` picks up the improvement automatically.
+
+### Next Steps (Metal-first)
+
+1. Prototype paged decode gather+SDPA fallback for batch>1 single-token steps.
+2. Metal command-buffer pipelining to overlap forward + argmax sync on paged batch.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

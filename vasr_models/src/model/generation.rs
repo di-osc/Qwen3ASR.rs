@@ -32,6 +32,17 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
     }
 }
 
+#[cfg(feature = "paged-attn")]
+fn use_paged_single_sequence_decode(device: &Device) -> bool {
+    if std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some() {
+        return false;
+    }
+    if device.is_metal() {
+        return std::env::var_os("VASR_FORCE_PAGED_ATTN").is_some();
+    }
+    device.is_cuda()
+}
+
 fn argmax_token_id(logits: &Tensor) -> Result<u32> {
     #[cfg(feature = "metal-paged-attn")]
     if logits.device().is_metal()
@@ -492,14 +503,10 @@ fn greedy_generate_cached_batch_impl(
     }
 
     #[cfg(feature = "paged-attn")]
-    let disable_paged_attn = std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some();
+    let use_paged_single = use_paged_single_sequence_decode(device);
 
     #[cfg(all(feature = "paged-attn", feature = "timing"))]
-    if batch == 1
-        && !disable_paged_attn
-        && (device.is_metal() || device.is_cuda())
-        && attention_masks_are_dense(attention_mask)
-    {
+    if batch == 1 && use_paged_single && attention_masks_are_dense(attention_mask) {
         let out = greedy_generate_paged(
             thinker,
             device,
@@ -514,7 +521,7 @@ fn greedy_generate_cached_batch_impl(
     }
     #[cfg(all(feature = "paged-attn", feature = "timing"))]
     if batch > 1
-        && !disable_paged_attn
+        && !std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some()
         && (device.is_metal() || device.is_cuda())
         && opts.paged_runtime.is_some()
     {
@@ -531,11 +538,7 @@ fn greedy_generate_cached_batch_impl(
         );
     }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
-    if batch == 1
-        && !disable_paged_attn
-        && (device.is_metal() || device.is_cuda())
-        && attention_masks_are_dense(attention_mask)
-    {
+    if batch == 1 && use_paged_single && attention_masks_are_dense(attention_mask) {
         let out = greedy_generate_paged(
             thinker,
             device,
@@ -550,7 +553,7 @@ fn greedy_generate_cached_batch_impl(
     }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
     if batch > 1
-        && !disable_paged_attn
+        && !std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some()
         && (device.is_metal() || device.is_cuda())
         && opts.paged_runtime.is_some()
     {
