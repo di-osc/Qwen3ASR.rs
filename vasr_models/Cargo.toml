@@ -14,8 +14,8 @@ candle-transformers = { git = "https://github.com/huggingface/candle.git", versi
 candle-flash-attn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
 candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
 objc2-metal = { version = "0.3.2", optional = true }
-mistralrs-paged-attn = { path = "/Users/wangmengdi/rust-projects/mistral.rs/mistralrs-paged-attn", optional = true }
-mistralrs-quant = { path = "/Users/wangmengdi/rust-projects/mistral.rs/mistralrs-quant", optional = true }
+mistralrs-paged-attn = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
+mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
 # Keep in sync with Candle/cudarc constraints (mirrors qwen3-tts-rs).
 float8 = "0.7"
 

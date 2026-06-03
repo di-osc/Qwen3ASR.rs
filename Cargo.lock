@@ -2563,6 +2563,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.8.3"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git?rev=0a14af4a43e6f61afbed71f72f22c162ab944c0d#0a14af4a43e6f61afbed71f72f22c162ab944c0d"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -2579,6 +2580,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.8.3"
+source = "git+https://github.com/EricLBuehler/mistral.rs.git?rev=0a14af4a43e6f61afbed71f72f22c162ab944c0d#0a14af4a43e6f61afbed71f72f22c162ab944c0d"
 dependencies = [
  "byteorder",
  "candle-core",
