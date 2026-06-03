@@ -722,5 +722,114 @@ For non-paged fallback testing:
 VASR_DISABLE_PAGED_ATTN=1 cargo run --release -p vasr-models \
   --example bench_transcribe \
   --features 'metal-paged-attn timing audio-loading' \
-  -- MODEL_DIR fixtures/audio/asr_en_16k.wav 5 64 bf16
+  -- MODEL_DIR fixtures/audio/asr_en_16k.wav 5 64 bf16 auto8
 ```
+
+## 2026-06-04 Pass 2: GQA Eager SDPA + Packed Varlen Prefill
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal (same machine as prior notes)
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+- Fixture: `fixtures/audio/asr_en_16k.wav`
+
+Reference mistral.rs numbers (unchanged baseline from earlier notes):
+
+| Runtime | Mode | Decode speed |
+| --- | --- | ---: |
+| mistral.rs | `--isq 8` default eager | `231.9 +/- 1.3 tok/s` |
+| mistral.rs | `--isq 8 --paged-attn on` | `175.6 +/- 3.6 tok/s` |
+
+### What Changed
+
+#### 1. GQA-aware eager attention (P0, all platforms)
+
+Files:
+
+- `vasr_models/src/model/attention.rs`
+- `vasr_models/src/model/thinker_text.rs`
+
+Behavior:
+
+- Removed unconditional `repeat_kv` before `run_attention` in eager prefill and
+  eager cached decode paths.
+- `run_attention` now tries Metal/CUDA `candle_nn::ops::sdpa` with native GQA
+  head counts first, matching mistral.rs `Sdpa.run_attention_noflash` ordering.
+- `repeat_kv` is deferred to the manual matmul fallback only when SDPA is
+  unavailable.
+
+Why:
+
+- mistral.rs avoids expanding K/V on the hot Metal SDPA path; our eager branches
+  were paying the repeat cost on every layer/step even when SDPA succeeded.
+
+#### 2. Packed varlen paged prefill (P0, CUDA/CPU flash only)
+
+Files:
+
+- `vasr_models/src/model/attention.rs` (`supports_packed_varlen_sdpa`)
+- `vasr_models/src/model/thinker_text.rs` (`forward_with_paged_cache` prefill)
+
+Behavior:
+
+- After `gather_kv_cache`, when `supports_packed_varlen_sdpa` is true, reshape
+  gathered K/V to `(1, kv_heads, total_kv, dim)` and call `run_attention` with
+  existing `PagedInputMetadata::flash_params` instead of
+  `unpack_gathered_kv_for_attention` + padded `Tensor::cat`.
+- Metal still uses the unpack path because mistral.rs only enables packed varlen
+  on CPU flash or CUDA flash-attn.
+
+Why:
+
+- Removes pad/cat overhead on mixed-length batch prefill for CUDA deployments.
+- Keeps Metal on the proven unpack path while eager GQA work closes the larger
+  local gap.
+
+### Measured Results (this pass)
+
+Command:
+
+```bash
+cargo run --release -p vasr-models \
+  --example bench_transcribe \
+  --features 'metal-paged-attn timing audio-loading' \
+  -- MODEL_DIR fixtures/audio/asr_en_16k.wav 3 64 bf16 auto8
+```
+
+Paged-attn (default production path on Metal):
+
+| Run | Mode | `decode_tokens_per_s` | Notes |
+| --- | --- | ---: | --- |
+| hot run 2 | paged-attn | `182.3` | `prompt_len=214`, `steps=44` |
+| hot run 3 | paged-attn | `184.2` | stable vs prior `170-176` band |
+
+Eager fallback (`VASR_DISABLE_PAGED_ATTN=1`):
+
+| Run | Mode | `decode_tokens_per_s` | Notes |
+| --- | --- | ---: | --- |
+| hot run 2 | eager KV cache | `197.6` | `steps=45` |
+| hot run 3 | eager KV cache | `196.1` | large improvement vs pre-pass eager gap |
+
+Takeaways:
+
+- **Eager decode improved materially** from the previously documented large
+  deficit vs mistral.rs default eager (`~232 tok/s`) to **`~196-198 tok/s`** on
+  the same fixture, while preserving output correctness on the benchmark clip.
+- **Paged-attn decode stayed in the same band** as the prior Metal session
+  (`~182-184 tok/s` hot), with no regression observed.
+- **CUDA mixed-length prefill** should benefit from packed varlen, but was not
+  re-benchmarked on this Metal-only machine in this pass.
+
+### Next Steps
+
+1. Re-run mixed-length batch prefill benchmarks (`bench_transcribe_batch`) on
+   Metal to quantify any prefill-side movement.
+2. Port batch decode metadata precomputation for `greedy_generate_paged_batch`.
+3. On CUDA, validate packed varlen prefill against mistral.rs forced paged-attn
+   prefill timings.
+4. Continue closing the remaining eager gap (`~35 tok/s` vs mistral.rs) via
+   fuller `SingleCache` semantics and SDPA softcap/sliding-window parity.

@@ -227,6 +227,11 @@ fn flash_attn_dispatch(
     Ok(None)
 }
 
+pub fn supports_packed_varlen_sdpa(query: &Tensor) -> bool {
+    query.device().is_cpu()
+        || (query.device().is_cuda() && cfg!(feature = "flash-attn") && query.dtype() != DType::F32)
+}
+
 pub fn run_attention(
     q: &Tensor,
     k: &Tensor,
@@ -235,6 +240,7 @@ pub fn run_attention(
     flash_params: Option<&FlashParams>,
     softmax_scale: f32,
     causal_default: bool,
+    n_kv_groups: usize,
 ) -> Result<Tensor> {
     let can_try_flash = !matches!(mask, AttentionMask::Custom(_))
         && (q.device().is_cuda() || q.device().is_cpu() && cfg!(feature = "flash-attn"));
@@ -268,6 +274,12 @@ pub fn run_attention(
     )? {
         return Ok(out);
     }
+
+    let (k, v) = if n_kv_groups > 1 {
+        (repeat_kv(k, n_kv_groups)?, repeat_kv(v, n_kv_groups)?)
+    } else {
+        (k.clone(), v.clone())
+    };
 
     let q = if q.device().is_metal() || q.device().is_cuda() {
         q.contiguous()?

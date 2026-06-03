@@ -545,14 +545,20 @@ impl ThinkerTextAttention {
             }
         }
 
-        let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
-        let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
         let mask = match attention_mask {
             Some(mask) => attention::AttentionMask::Custom(mask.clone()),
             None => attention::AttentionMask::None,
         };
-        let attn_output =
-            attention::run_attention(&q, &k, &v, &mask, None, self.scaling as f32, true)?;
+        let attn_output = attention::run_attention(
+            &q,
+            &k,
+            &v,
+            &mask,
+            None,
+            self.scaling as f32,
+            true,
+            self.num_key_value_groups,
+        )?;
         let attn_output = attn_output.transpose(1, 2)?; // (b, s, h, d)
         let attn_output =
             attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
@@ -776,14 +782,20 @@ impl ThinkerTextAttention {
             }
         }
 
-        let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
-        let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
         let mask = match attention_mask {
             Some(mask) => attention::AttentionMask::Custom(mask.clone()),
             None => attention::AttentionMask::None,
         };
-        let attn_output =
-            attention::run_attention(&q, &k, &v, &mask, None, self.scaling as f32, true)?;
+        let attn_output = attention::run_attention(
+            &q,
+            &k,
+            &v,
+            &mask,
+            None,
+            self.scaling as f32,
+            true,
+            self.num_key_value_groups,
+        )?;
         let attn_output = attn_output.transpose(1, 2)?; // (b, s, h, d)
         let attn_output =
             attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
@@ -911,22 +923,6 @@ impl ThinkerTextAttention {
                 &cu_kv,
                 hidden_states.dtype(),
             )?;
-            let k = unpack_gathered_kv_for_attention(
-                &k_gathered,
-                kv_lens.as_slice(),
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                self.head_dim,
-                hidden_states.device(),
-            )?;
-            let v = unpack_gathered_kv_for_attention(
-                &v_gathered,
-                kv_lens.as_slice(),
-                self.num_key_value_heads,
-                self.num_key_value_groups,
-                self.head_dim,
-                hidden_states.device(),
-            )?;
             let mask = if input_metadata.prefill_causal_only {
                 attention::AttentionMask::None
             } else if let Some(mask) = input_metadata.prefill_attention_mask.as_ref() {
@@ -941,15 +937,47 @@ impl ThinkerTextAttention {
                 )?)
             };
             let flash_params = input_metadata.flash_params(seq_len > 1);
-            let attn_output = attention::run_attention(
-                &q,
-                &k,
-                &v,
-                &mask,
-                flash_params.as_ref(),
-                self.scaling as f32,
-                true,
-            )?;
+            let attn_output = if attention::supports_packed_varlen_sdpa(&q) {
+                let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
+                let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
+                attention::run_attention(
+                    &q,
+                    &k_4d,
+                    &v_4d,
+                    &mask,
+                    flash_params.as_ref(),
+                    self.scaling as f32,
+                    true,
+                    self.num_key_value_groups,
+                )?
+            } else {
+                let k = unpack_gathered_kv_for_attention(
+                    &k_gathered,
+                    kv_lens.as_slice(),
+                    self.num_key_value_heads,
+                    self.num_key_value_groups,
+                    self.head_dim,
+                    hidden_states.device(),
+                )?;
+                let v = unpack_gathered_kv_for_attention(
+                    &v_gathered,
+                    kv_lens.as_slice(),
+                    self.num_key_value_heads,
+                    self.num_key_value_groups,
+                    self.head_dim,
+                    hidden_states.device(),
+                )?;
+                attention::run_attention(
+                    &q,
+                    &k,
+                    &v,
+                    &mask,
+                    flash_params.as_ref(),
+                    self.scaling as f32,
+                    true,
+                    self.num_key_value_groups,
+                )?
+            };
             attn_output.transpose(1, 2)?.reshape((
                 batch,
                 seq_len,
