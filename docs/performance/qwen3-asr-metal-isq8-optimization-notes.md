@@ -833,3 +833,79 @@ Takeaways:
    prefill timings.
 4. Continue closing the remaining eager gap (`~35 tok/s` vs mistral.rs) via
    fuller `SingleCache` semantics and SDPA softcap/sliding-window parity.
+
+## 2026-06-04 Pass 3: Batch Decode Metadata Precompute (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+Skipped in this pass:
+
+- CUDA packed-varlen validation (not available on the current Mac machine)
+
+### What Changed
+
+#### Batch decode metadata precompute (P1)
+
+Files:
+
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- Added `PagedKvCache::decode_metadata_for_batch_steps(...)` to precompute all
+  batch decode `PagedInputMetadata` entries once before the decode loop.
+- `greedy_generate_paged_batch` now indexes precomputed metadata per step,
+  instead of rebuilding tensors via `input_metadata_from_block_tables(...)`
+  on every decode step.
+- Added unit test
+  `test_decode_metadata_for_batch_steps_matches_per_step_builder` to ensure
+  parity with the old per-step builder.
+
+Why:
+
+- Single-sequence paged decode already used `decode_metadata_for_steps`; the
+  batch path was still paying repeated host/tensor construction each step.
+
+### Measured Results (this pass)
+
+Single-sequence paged decode (`fixtures/audio/asr_en_16k.wav`, 3 iters):
+
+| Run | `decode_tokens_per_s` |
+| --- | ---: |
+| hot run 2 | `174.5` |
+| hot run 3 | `174.1` |
+
+No regression observed versus Pass 2 hot band (`~182-184 tok/s` is within normal
+Metal run-to-run variance on this machine).
+
+Mixed-length batch decode (`asr_en_16k.wav` + `raw_audios/audio (12).wav`,
+`batch_size=2`, 3 iters):
+
+| Run | `prefill_ms` | `decode_ms` | `batch_decode_tokens_per_s` | `per_sequence_decode_tokens_per_s` |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | `383.5` | `279.9` | `217.9` | `109.0` |
+| 3 | `377.9` | `281.4` | `216.8` | `108.4` |
+
+Notes:
+
+- Output text for both sequences remained stable across runs.
+- This pass mainly removes repeated metadata construction overhead; mixed-length
+  batch throughput still depends on prefill unpack/pad work (Pass 2 item #2 on
+  Metal) and overall batch scheduling, so tok/s alone is not the primary success
+  signal here.
+- Correctness parity is covered by the new batch-metadata unit test.
+
+### Next Steps (Metal-first)
+
+1. Profile mixed-length **prefill** (`prefill_ms` above) for further unpack/pad
+   reductions on Metal.
+2. Port fuller eager `SingleCache` semantics to keep closing the non-paged gap.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

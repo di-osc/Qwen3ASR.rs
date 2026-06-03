@@ -1107,6 +1107,12 @@ fn greedy_generate_paged_batch(
     let eos_fill_id = *eos_token_ids
         .first()
         .ok_or_else(|| anyhow::anyhow!("eos_token_ids is empty"))?;
+    let decode_metadata = paged_cache.decode_metadata_for_batch_steps(
+        &block_tables,
+        prompt_lens_usize.as_slice(),
+        max_new_tokens,
+        device,
+    )?;
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); batch];
     let mut finished: Vec<bool> = next_ids
         .iter()
@@ -1175,18 +1181,9 @@ fn greedy_generate_paged_batch(
 
         #[cfg(feature = "timing")]
         let start_metadata = std::time::Instant::now();
-        let starts: Vec<usize> = prompt_lens_usize.iter().map(|&len| len + step).collect();
-        let context_lens: Vec<usize> = prompt_lens_usize
-            .iter()
-            .map(|&len| len + step + 1)
-            .collect();
-        let input_metadata = paged_cache.input_metadata_from_block_tables(
-            &block_tables,
-            &starts,
-            1,
-            &context_lens,
-            device,
-        )?;
+        let input_metadata = decode_metadata
+            .get(step)
+            .ok_or_else(|| anyhow::anyhow!("missing batch decode metadata for step {step}"))?;
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
             t.decode_metadata_us = t

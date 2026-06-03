@@ -66,6 +66,36 @@ fn cumulative_seqlens_from_lengths(lengths: &[usize], device: &Device) -> Result
     Tensor::from_vec(out, (lengths.len() + 1,), device)
 }
 
+fn slot_for_block_table_position(
+    block_tables: &[Vec<usize>],
+    block_size: usize,
+    num_blocks: usize,
+    seq: usize,
+    position: usize,
+) -> Result<i64> {
+    let table = block_tables.get(seq).ok_or_else(|| {
+        candle_core::Error::Msg(format!("missing block table for sequence {seq}"))
+    })?;
+    let block_idx = position / block_size;
+    let offset = position % block_size;
+    let block_id = *table.get(block_idx).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "missing block table entry: sequence={seq} block_idx={block_idx}"
+        ))
+    })?;
+    if block_id >= num_blocks {
+        candle_core::bail!(
+            "block id exceeds paged cache capacity: block_id={block_id} num_blocks={num_blocks}"
+        );
+    }
+    let slot = block_id
+        .checked_mul(block_size)
+        .and_then(|base| base.checked_add(offset))
+        .ok_or_else(|| candle_core::Error::Msg("paged slot mapping overflow".to_string()))?;
+    i64::try_from(slot)
+        .map_err(|_| candle_core::Error::Msg(format!("paged slot overflows i64: {slot}")))
+}
+
 fn build_varlen_metadata(
     query_lens: Option<Vec<usize>>,
     kv_lens: Option<Vec<usize>>,
@@ -768,6 +798,110 @@ impl PagedKvCache {
             .collect()
     }
 
+    pub fn decode_metadata_for_batch_steps(
+        &self,
+        block_tables: &[Vec<usize>],
+        prompt_lens: &[usize],
+        steps: usize,
+        device: &Device,
+    ) -> Result<Vec<PagedInputMetadata>> {
+        let batch = block_tables.len();
+        if batch == 0 {
+            candle_core::bail!("paged batch decode metadata requires at least one sequence");
+        }
+        if prompt_lens.len() != batch {
+            candle_core::bail!(
+                "paged batch decode metadata mismatch: block_tables={batch} prompt_lens={}",
+                prompt_lens.len()
+            );
+        }
+
+        let max_blocks = block_tables.iter().map(Vec::len).max().unwrap_or(0);
+        if max_blocks == 0 {
+            candle_core::bail!(
+                "paged batch decode metadata requires at least one block per sequence"
+            );
+        }
+
+        let mut block_table_host: Vec<u32> = Vec::with_capacity(batch * max_blocks);
+        for table in block_tables {
+            for &block_id in table {
+                block_table_host.push(u32::try_from(block_id).map_err(|_| {
+                    candle_core::Error::Msg(format!("block id overflows u32: {block_id}"))
+                })?);
+            }
+            for _ in table.len()..max_blocks {
+                block_table_host.push(0);
+            }
+        }
+        let block_tables_tensor = Tensor::from_vec(block_table_host, (batch, max_blocks), device)?;
+
+        let mut all_slots: Vec<i64> = Vec::with_capacity(steps.saturating_mul(batch));
+        let mut all_contexts: Vec<u32> = Vec::with_capacity(steps.saturating_mul(batch));
+        let mut max_context_lens = Vec::with_capacity(steps);
+
+        for step in 0..steps {
+            let mut step_max_context = 0usize;
+            for seq in 0..batch {
+                let position = prompt_lens[seq].checked_add(step).ok_or_else(|| {
+                    candle_core::Error::Msg("batch decode slot position overflow".to_string())
+                })?;
+                let context_len = position.checked_add(1).ok_or_else(|| {
+                    candle_core::Error::Msg("batch decode context length overflow".to_string())
+                })?;
+                if context_len > self.max_tokens_per_sequence {
+                    candle_core::bail!(
+                        "batch decode context length exceeds paged kv cache sequence capacity: context_len={context_len} max_tokens_per_sequence={}",
+                        self.max_tokens_per_sequence
+                    );
+                }
+                let slot = slot_for_block_table_position(
+                    block_tables,
+                    self.block_size,
+                    self.num_blocks,
+                    seq,
+                    position,
+                )?;
+                all_slots.push(slot);
+                all_contexts.push(u32::try_from(context_len).map_err(|_| {
+                    candle_core::Error::Msg(format!("context length overflows u32: {context_len}"))
+                })?);
+                step_max_context = step_max_context.max(context_len);
+            }
+            max_context_lens.push(step_max_context);
+        }
+
+        let all_slots = Tensor::from_vec(all_slots, (steps, batch), device)?;
+        let all_contexts = Tensor::from_vec(all_contexts, (steps, batch), device)?;
+        let query_lens = vec![1usize; batch];
+
+        (0..steps)
+            .map(|step| {
+                let kv_lens = prompt_lens
+                    .iter()
+                    .map(|&prompt_len| prompt_len + step + 1)
+                    .collect::<Vec<_>>();
+                let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
+                    build_varlen_metadata(Some(query_lens.clone()), Some(kv_lens.clone()), device)?;
+                Ok(PagedInputMetadata {
+                    slot_mapping: all_slots.narrow(0, step, 1)?.flatten_all()?,
+                    block_tables: block_tables_tensor.clone(),
+                    context_lens: all_contexts.narrow(0, step, 1)?.flatten_all()?,
+                    max_context_len: max_context_lens[step],
+                    token_attention_mask: None,
+                    prefill_attention_mask: None,
+                    prefill_causal_only: false,
+                    query_lens: Some(query_lens.clone()),
+                    kv_lens: Some(kv_lens),
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    max_query_len,
+                    max_kv_len,
+                })
+            })
+            .collect()
+    }
+
     pub fn key_value_cache(&self, layer_idx: usize) -> Result<(&Tensor, &Tensor)> {
         let key = self.key_cache.get(layer_idx).ok_or_else(|| {
             candle_core::Error::Msg(format!("paged kv cache layer out of range: {layer_idx}"))
@@ -960,6 +1094,50 @@ mod tests {
                 .to_vec1::<u32>()?,
             vec![0, 4, 9]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_metadata_for_batch_steps_matches_per_step_builder() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let cache = PagedKvCache::new_pool(1, 2, 8, 4, 16, candle_core::DType::F32, &device)?;
+        let block_tables = [vec![3usize, 4], vec![6usize, 7]];
+        let prompt_lens = [4usize, 5usize];
+        let steps = 3usize;
+
+        let precomputed =
+            cache.decode_metadata_for_batch_steps(&block_tables, &prompt_lens, steps, &device)?;
+
+        for step in 0..steps {
+            let starts: Vec<usize> = prompt_lens.iter().map(|&len| len + step).collect();
+            let context_lens: Vec<usize> = prompt_lens.iter().map(|&len| len + step + 1).collect();
+            let expected = cache.input_metadata_from_block_tables(
+                &block_tables,
+                &starts,
+                1,
+                &context_lens,
+                &device,
+            )?;
+            let actual = precomputed
+                .get(step)
+                .ok_or_else(|| anyhow::anyhow!("missing precomputed metadata for step {step}"))?;
+            assert_eq!(
+                actual.slot_mapping.to_vec1::<i64>()?,
+                expected.slot_mapping.to_vec1::<i64>()?
+            );
+            assert_eq!(
+                actual.block_tables.to_vec2::<u32>()?,
+                expected.block_tables.to_vec2::<u32>()?
+            );
+            assert_eq!(
+                actual.context_lens.to_vec1::<u32>()?,
+                expected.context_lens.to_vec1::<u32>()?
+            );
+            assert_eq!(actual.max_context_len, expected.max_context_len);
+            assert_eq!(actual.query_lens, expected.query_lens);
+            assert_eq!(actual.kv_lens, expected.kv_lens);
+        }
+
         Ok(())
     }
 }
