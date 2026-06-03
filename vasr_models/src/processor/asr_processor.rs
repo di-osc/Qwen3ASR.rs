@@ -107,7 +107,7 @@ impl AsrProcessor {
             input_ids.push(ids);
         }
 
-        // Left-pad input_ids to the longest sequence (Qwen3-ASR uses left padding).
+        // Right-pad batched prompts so paged prefill can consume them directly.
         let max_tokens = input_ids.iter().map(Vec::len).max().unwrap_or(0);
         let mut out: Vec<PreparedInputs> = Vec::with_capacity(items.len());
 
@@ -123,12 +123,12 @@ impl AsrProcessor {
             let pad = max_tokens - len;
 
             let mut padded_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-            padded_ids.extend(std::iter::repeat_n(pad_id, pad));
             padded_ids.extend(ids);
+            padded_ids.extend(std::iter::repeat_n(pad_id, pad));
 
             let mut attn: Vec<u32> = Vec::with_capacity(max_tokens);
-            attn.extend(std::iter::repeat_n(0u32, pad));
             attn.extend(std::iter::repeat_n(1u32, len));
+            attn.extend(std::iter::repeat_n(0u32, pad));
 
             out.push(PreparedInputs {
                 input_ids: padded_ids,

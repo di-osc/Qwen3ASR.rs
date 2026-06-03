@@ -23,27 +23,15 @@ pub fn get_rope_index(attention_mask: &Tensor) -> Result<(Tensor, Tensor)> {
         bail!("attention_mask seq_len must be > 0");
     }
 
-    // Qwen3-ASR uses left-padding for batched generation. This routine computes
-    // the same `position_ids` as the official implementation, but without
-    // materializing `attention_mask` back to the host.
-    //
-    // For each sample, valid tokens form a suffix of the sequence:
-    //   attention_mask = [0, ..., 0, 1, ..., 1]
-    // For valid tokens we set position_ids to 0..len-1, while padding tokens
-    // use position_id=1 (matching the Python code).
+    // Compute position ids directly from the token mask so both left-padded and
+    // right-padded prompt batches map valid tokens to 0..len-1. Padding tokens
+    // use position_id=1 to match the reference Python implementation.
     let device = attention_mask.device();
-    let seq_len_u32 =
-        u32::try_from(seq_len).map_err(|_| anyhow::anyhow!("seq_len overflows u32: {seq_len}"))?;
-
     let mask_u8 = attention_mask.ne(0u32)?;
     let mask_f32 = mask_u8.to_dtype(DType::F32)?;
     let sum_mask = mask_f32.sum(1)?; // (batch,)
-    let pad = (sum_mask.neg()? + seq_len as f64)?; // (batch,)
-
-    let pos = Tensor::arange(0u32, seq_len_u32, device)?.to_dtype(DType::F32)?; // (seq_len,)
-    let pos = pos.unsqueeze(0)?.broadcast_as((batch, seq_len))?;
-    let pad = pad.unsqueeze(1)?.broadcast_as((batch, seq_len))?;
-    let shifted = (&pos - &pad)?; // (batch, seq_len)
+    let cumsum = mask_f32.cumsum(1)?; // (batch, seq_len)
+    let shifted = (cumsum - 1f64)?;
 
     let ones = Tensor::ones((batch, seq_len), DType::F32, device)?;
     let base_pos = mask_u8.where_cond(&shifted, &ones)?; // (batch, seq_len)
@@ -537,6 +525,54 @@ mod tests {
 
         // Left padding: 0s then 1s.
         let attn: Vec<u32> = vec![0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1];
+        let attn_t = Tensor::from_vec(attn.clone(), (batch, seq_len), &device)?;
+
+        let (pos_ids, rope_deltas) = get_rope_index(&attn_t)?;
+
+        let got_pos = pos_ids.to_vec3::<i64>()?;
+        let got_delta = rope_deltas.to_vec2::<i64>()?;
+
+        let (want_base, want_deltas) = reference_rope(attn.as_slice(), batch, seq_len);
+
+        if got_pos.len() != 3 {
+            anyhow::bail!("expected 3 modalities, got {}", got_pos.len());
+        }
+        for (m, modality) in got_pos.iter().enumerate() {
+            for b in 0..batch {
+                let got_row = modality.get(b).cloned().unwrap_or_default();
+                let want_row = want_base.get(b).cloned().unwrap_or_default();
+                if got_row != want_row {
+                    anyhow::bail!(
+                        "position_ids mismatch modality={m} batch={b}: got={got_row:?} want={want_row:?}"
+                    );
+                }
+            }
+        }
+
+        if got_delta.len() != batch {
+            anyhow::bail!(
+                "rope_deltas batch mismatch: expected={batch}, got={}",
+                got_delta.len()
+            );
+        }
+        for b in 0..batch {
+            let got = got_delta.get(b).and_then(|r| r.first()).copied();
+            let want = want_deltas.get(b).copied();
+            if got != want {
+                anyhow::bail!("rope_deltas mismatch batch={b}: got={got:?} want={want:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_rope_index_matches_reference_for_right_padded_masks() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let batch = 2usize;
+        let seq_len = 6usize;
+
+        // Right padding: valid tokens first, then 0s.
+        let attn: Vec<u32> = vec![1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0];
         let attn_t = Tensor::from_vec(attn.clone(), (batch, seq_len), &device)?;
 
         let (pos_ids, rope_deltas) = get_rope_index(&attn_t)?;

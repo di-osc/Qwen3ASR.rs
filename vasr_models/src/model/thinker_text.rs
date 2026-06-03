@@ -35,6 +35,7 @@ use candle_core::{DType, Device};
 #[cfg(feature = "flash-attn")]
 use candle_flash_attn::{flash_attn, flash_attn_varlen};
 
+#[cfg(feature = "paged-attn")]
 fn maybe_contiguous_for_accelerator(x: Tensor) -> Result<Tensor> {
     if x.device().is_metal() || x.device().is_cuda() {
         x.contiguous()
@@ -54,8 +55,47 @@ fn initial_hidden_states_for_paged_decode(inputs_embeds: &Tensor) -> Result<Tens
     Ok(inputs_embeds.clone())
 }
 
+#[cfg(feature = "paged-attn")]
+fn unpack_gathered_kv_for_attention(
+    packed: &Tensor,
+    kv_lens: &[usize],
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+    head_size: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+    let mut start = 0usize;
+    let mut unpacked: Vec<Tensor> = Vec::with_capacity(kv_lens.len());
+    let attn_heads = num_kv_heads.saturating_mul(num_kv_groups);
+
+    for &kv_len in kv_lens {
+        let seq = packed
+            .narrow(0, start, kv_len)?
+            .transpose(0, 1)?
+            .unsqueeze(0)?;
+        let seq = if num_kv_groups > 1 {
+            seq.unsqueeze(2)?
+                .broadcast_as((1usize, num_kv_heads, num_kv_groups, kv_len, head_size))?
+                .reshape((1usize, attn_heads, kv_len, head_size))?
+        } else {
+            seq
+        };
+        let row = Tensor::zeros(
+            (1usize, attn_heads, max_kv, head_size),
+            packed.dtype(),
+            device,
+        )?;
+        row.slice_set(&seq, 2, 0)?;
+        unpacked.push(row);
+        start = start.saturating_add(kv_len);
+    }
+
+    Tensor::cat(&unpacked, 0)
+}
+
 #[cfg(feature = "flash-attn")]
-fn seqlens_from_left_padded_attention_mask(mask: &Tensor, seq_len: usize) -> Result<Vec<usize>> {
+fn seqlens_from_attention_mask(mask: &Tensor, seq_len: usize) -> Result<Vec<usize>> {
     let (batch, t2) = mask.dims2()?;
     if t2 != seq_len {
         candle_core::bail!("attention_mask seq_len mismatch: expected={seq_len}, got={t2}");
@@ -117,30 +157,37 @@ fn cu_seqlens_u32(lengths: &[usize], device: &Device) -> Result<(Tensor, usize, 
 }
 
 #[cfg(feature = "flash-attn")]
-fn left_pad_indices_u32(seq_len: usize, lengths: &[usize]) -> Result<Vec<u32>> {
-    let batch = lengths.len();
-
-    let mut total: usize = 0;
-    for &len in lengths {
-        total = total
-            .checked_add(len)
-            .ok_or_else(|| candle_core::Error::Msg("index capacity overflow".to_string()))?;
+fn mask_nonzero_indices_u32(mask: &Tensor, seq_len: usize) -> Result<Vec<u32>> {
+    let (batch, t2) = mask.dims2()?;
+    if t2 != seq_len {
+        candle_core::bail!("attention_mask seq_len mismatch: expected={seq_len}, got={t2}");
     }
 
-    let mut idxs: Vec<u32> = Vec::with_capacity(total);
-    for (b, &len) in lengths.iter().enumerate() {
-        if len > seq_len {
+    let rows = mask.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+    if rows.len() != batch {
+        candle_core::bail!(
+            "internal error: attention_mask row mismatch: expected={batch}, got={}",
+            rows.len()
+        );
+    }
+
+    let mut idxs = Vec::new();
+    for (b, row) in rows.iter().enumerate() {
+        if row.len() != seq_len {
             candle_core::bail!(
-                "sequence length exceeds seq_len for batch index {b}: len={len} seq_len={seq_len}"
+                "attention_mask row len mismatch at batch index {b}: expected={seq_len}, got={}",
+                row.len()
             );
         }
-        let pad = seq_len.saturating_sub(len);
         let base = b
             .checked_mul(seq_len)
             .ok_or_else(|| candle_core::Error::Msg("index overflow".to_string()))?;
-        for j in 0..len {
+        for (j, &value) in row.iter().enumerate() {
+            if value == 0 {
+                continue;
+            }
             let pos = base
-                .checked_add(pad.saturating_add(j))
+                .checked_add(j)
                 .ok_or_else(|| candle_core::Error::Msg("index overflow".to_string()))?;
             idxs.push(
                 u32::try_from(pos).map_err(|_| {
@@ -430,7 +477,7 @@ impl ThinkerTextAttention {
                     return self.o_proj.forward(&attn);
                 };
 
-                let seqlens = seqlens_from_left_padded_attention_mask(tok_mask, seq_len)?;
+                let seqlens = seqlens_from_attention_mask(tok_mask, seq_len)?;
                 let (cu, max_len, total_u32) =
                     cu_seqlens_u32(seqlens.as_slice(), hidden_states.device())?;
                 let total = usize::try_from(total_u32).map_err(|_| {
@@ -452,7 +499,7 @@ impl ThinkerTextAttention {
                     return self.o_proj.forward(&attn);
                 }
 
-                let idxs = left_pad_indices_u32(seq_len, seqlens.as_slice())?;
+                let idxs = mask_nonzero_indices_u32(tok_mask, seq_len)?;
                 if idxs.len() != total {
                     candle_core::bail!(
                         "internal error: index len mismatch: idxs={} total={total}",
@@ -500,27 +547,12 @@ impl ThinkerTextAttention {
 
         let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
         let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
-
-        if let Some(attn_output) =
-            attention::accelerated_sdpa(&q, &k, &v, attention_mask, self.scaling as f32, true)?
-        {
-            let attn_output = attn_output.transpose(1, 2)?;
-            let attn_output =
-                attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
-            return self.o_proj.forward(&attn_output);
-        }
-
-        let q = maybe_contiguous_for_accelerator(q)?;
-        let v = maybe_contiguous_for_accelerator(v)?;
-        let k_t = maybe_contiguous_for_accelerator(k.transpose(2, 3)?)?; // (b, h, d, s)
-        let mut attn_weights = q.matmul(&k_t)?.affine(self.scaling, 0.0)?;
-
-        if let Some(mask) = attention_mask {
-            attn_weights = attn_weights.broadcast_add(mask)?;
-        }
-
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?; // (b, h, s, d)
+        let mask = match attention_mask {
+            Some(mask) => attention::AttentionMask::Custom(mask.clone()),
+            None => attention::AttentionMask::None,
+        };
+        let attn_output =
+            attention::run_attention(&q, &k, &v, &mask, None, self.scaling as f32, true)?;
         let attn_output = attn_output.transpose(1, 2)?; // (b, s, h, d)
         let attn_output =
             attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
@@ -603,8 +635,7 @@ impl ThinkerTextAttention {
                 let v4 = v.transpose(1, 2)?.contiguous()?; // (b, s_k, kv, d)
 
                 if cache_len == 0 {
-                    let seqlens =
-                        seqlens_from_left_padded_attention_mask(token_attention_mask, seq_len)?;
+                    let seqlens = seqlens_from_attention_mask(token_attention_mask, seq_len)?;
                     let (cu, max_len, total_u32) =
                         cu_seqlens_u32(seqlens.as_slice(), hidden_states.device())?;
                     let total = usize::try_from(total_u32).map_err(|_| {
@@ -629,7 +660,7 @@ impl ThinkerTextAttention {
                         return self.o_proj.forward(&attn);
                     }
 
-                    let idxs = left_pad_indices_u32(seq_len, seqlens.as_slice())?;
+                    let idxs = mask_nonzero_indices_u32(token_attention_mask, seq_len)?;
                     if idxs.len() != total {
                         candle_core::bail!(
                             "internal error: index len mismatch: idxs={} total={total}",
@@ -686,8 +717,7 @@ impl ThinkerTextAttention {
 
                 let q3 = q4.reshape((q_total, self.num_attention_heads, self.head_dim))?;
 
-                let seqlens_k =
-                    seqlens_from_left_padded_attention_mask(token_attention_mask, total_len)?;
+                let seqlens_k = seqlens_from_attention_mask(token_attention_mask, total_len)?;
                 let (cu_k, max_k, total_k_u32) =
                     cu_seqlens_u32(seqlens_k.as_slice(), hidden_states.device())?;
                 let total_k = usize::try_from(total_k_u32).map_err(|_| {
@@ -711,7 +741,7 @@ impl ThinkerTextAttention {
                     );
                 }
 
-                let idxs_k = left_pad_indices_u32(total_len, seqlens_k.as_slice())?;
+                let idxs_k = mask_nonzero_indices_u32(token_attention_mask, total_len)?;
                 if idxs_k.len() != total_k {
                     candle_core::bail!(
                         "internal error: k index len mismatch: idxs={} total_k={total_k}",
@@ -748,27 +778,12 @@ impl ThinkerTextAttention {
 
         let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
         let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
-
-        if let Some(attn_output) =
-            attention::accelerated_sdpa(&q, &k, &v, attention_mask, self.scaling as f32, true)?
-        {
-            let attn_output = attn_output.transpose(1, 2)?;
-            let attn_output =
-                attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
-            return self.o_proj.forward(&attn_output);
-        }
-
-        let q = maybe_contiguous_for_accelerator(q)?;
-        let v = maybe_contiguous_for_accelerator(v)?;
-        let k_t = maybe_contiguous_for_accelerator(k.transpose(2, 3)?)?; // (b, h, d, s)
-        let mut attn_weights = q.matmul(&k_t)?.affine(self.scaling, 0.0)?;
-
-        if let Some(mask) = attention_mask {
-            attn_weights = attn_weights.broadcast_add(mask)?;
-        }
-
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?; // (b, h, s, d)
+        let mask = match attention_mask {
+            Some(mask) => attention::AttentionMask::Custom(mask.clone()),
+            None => attention::AttentionMask::None,
+        };
+        let attn_output =
+            attention::run_attention(&q, &k, &v, &mask, None, self.scaling as f32, true)?;
         let attn_output = attn_output.transpose(1, 2)?; // (b, s, h, d)
         let attn_output =
             attn_output.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
@@ -820,28 +835,31 @@ impl ThinkerTextAttention {
             rope_scaling.interleaved,
         )?;
 
+        let flat_tokens = batch.checked_mul(seq_len).ok_or_else(|| {
+            candle_core::Error::Msg("paged attention token count overflow".into())
+        })?;
         let k_flat = if seq_len == 1 {
             maybe_contiguous_for_accelerator(k.reshape((
-                seq_len,
+                flat_tokens,
                 self.num_key_value_heads,
                 self.head_dim,
             ))?)?
         } else {
             maybe_contiguous_for_accelerator(k.transpose(1, 2)?.reshape((
-                seq_len,
+                flat_tokens,
                 self.num_key_value_heads,
                 self.head_dim,
             ))?)?
         };
         let v_flat = if seq_len == 1 {
             maybe_contiguous_for_accelerator(v.reshape((
-                seq_len,
+                flat_tokens,
                 self.num_key_value_heads,
                 self.head_dim,
             ))?)?
         } else {
             maybe_contiguous_for_accelerator(v.transpose(1, 2)?.reshape((
-                seq_len,
+                flat_tokens,
                 self.num_key_value_heads,
                 self.head_dim,
             ))?)?
@@ -858,7 +876,7 @@ impl ThinkerTextAttention {
 
         let attn = if seq_len == 1 {
             let q_flat = maybe_contiguous_for_accelerator(q.reshape((
-                1usize,
+                batch,
                 self.num_attention_heads,
                 self.head_dim,
             ))?)?;
@@ -877,22 +895,62 @@ impl ThinkerTextAttention {
                 None,
             )?
         } else {
-            let k = attention::repeat_kv(&k, self.num_key_value_groups)?;
-            let v = attention::repeat_kv(&v, self.num_key_value_groups)?;
-            let q = maybe_contiguous_for_accelerator(q)?;
-            let v = maybe_contiguous_for_accelerator(v)?;
-            let k_t = maybe_contiguous_for_accelerator(k.transpose(2, 3)?)?;
-            let mut attn_weights = q.matmul(&k_t)?.affine(self.scaling, 0.0)?;
-            let mask = attention::make_causal_mask(
-                None,
-                batch,
-                seq_len,
-                attn_weights.dtype(),
-                attn_weights.device(),
+            let kv_lens = input_metadata
+                .kv_lens
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("paged metadata missing kv_lens".into()))?;
+            let cu_kv = input_metadata.cu_seqlens_kv.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("paged metadata missing cu_seqlens_kv".into())
+            })?;
+            let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+                key_cache,
+                value_cache,
+                Some(&paged_attn.k_scale),
+                Some(&paged_attn.v_scale),
+                &input_metadata.block_tables,
+                &cu_kv,
+                hidden_states.dtype(),
             )?;
-            attn_weights = attn_weights.broadcast_add(&mask)?;
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&v)?.transpose(1, 2)?.reshape((
+            let k = unpack_gathered_kv_for_attention(
+                &k_gathered,
+                kv_lens.as_slice(),
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+                hidden_states.device(),
+            )?;
+            let v = unpack_gathered_kv_for_attention(
+                &v_gathered,
+                kv_lens.as_slice(),
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+                hidden_states.device(),
+            )?;
+            let mask = if input_metadata.prefill_causal_only {
+                attention::AttentionMask::None
+            } else if let Some(mask) = input_metadata.prefill_attention_mask.as_ref() {
+                attention::AttentionMask::Custom(mask.clone())
+            } else {
+                attention::AttentionMask::Custom(attention::make_causal_mask(
+                    input_metadata.token_attention_mask.as_ref(),
+                    batch,
+                    seq_len,
+                    q.dtype(),
+                    q.device(),
+                )?)
+            };
+            let flash_params = input_metadata.flash_params(seq_len > 1);
+            let attn_output = attention::run_attention(
+                &q,
+                &k,
+                &v,
+                &mask,
+                flash_params.as_ref(),
+                self.scaling as f32,
+                true,
+            )?;
+            attn_output.transpose(1, 2)?.reshape((
                 batch,
                 seq_len,
                 self.num_attention_heads * self.head_dim,
@@ -1210,15 +1268,12 @@ impl ThinkerTextModel {
         paged_cache: &PagedKvCache,
         input_metadata: &PagedInputMetadata,
     ) -> Result<Tensor> {
-        let (batch, _seq_len, hidden) = inputs_embeds.dims3()?;
+        let (_batch, _seq_len, hidden) = inputs_embeds.dims3()?;
         if hidden != self.hidden_size {
             candle_core::bail!(
                 "inputs_embeds hidden mismatch: expected={}, got={hidden}",
                 self.hidden_size
             );
-        }
-        if batch != 1 {
-            candle_core::bail!("paged attention phase 1 expects batch=1, got={batch}");
         }
 
         let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
@@ -1298,12 +1353,34 @@ fn _require_mrope_enabled(cfg: &TextConfig) -> Result<&RopeScaling> {
 #[cfg(test)]
 mod tests {
     use super::ThinkerTextRotaryEmbedding;
+    #[cfg(feature = "paged-attn")]
+    use super::unpack_gathered_kv_for_attention;
 
     #[test]
     fn test_rotary_embedding_loads_without_rope_scaling() -> anyhow::Result<()> {
         let device = candle_core::Device::Cpu;
         let cfg = crate::config::TextConfig::default();
         let _ = ThinkerTextRotaryEmbedding::load(&cfg, &device)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-attn")]
+    #[test]
+    fn test_unpack_gathered_kv_for_attention_repeats_groups() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let packed = candle_core::Tensor::from_vec(
+            vec![1f32, 10.0, 2.0, 20.0, 3.0, 30.0],
+            (3usize, 2usize, 1usize),
+            &device,
+        )?;
+        let out = unpack_gathered_kv_for_attention(&packed, &[2, 1], 2, 2, 1, &device)?;
+        let got = out.flatten_all()?.to_vec1::<f32>()?;
+        let expected = vec![
+            1.0, 2.0, 1.0, 2.0, 10.0, 20.0, 10.0, 20.0, 3.0, 0.0, 3.0, 0.0, 30.0, 0.0, 30.0, 0.0,
+        ];
+        if got != expected {
+            anyhow::bail!("unexpected unpacked kv: expected={expected:?} got={got:?}");
+        }
         Ok(())
     }
 }

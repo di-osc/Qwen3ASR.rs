@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt", "time"] }
 vasr-audio = { path = "../vasr_audio" }
+vasr-data = { path = "../vasr_data" }
 vasr-runtime = { path = "../vasr_runtime" }
 vasr-server = { path = "../vasr_server" }
 

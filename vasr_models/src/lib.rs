@@ -19,6 +19,8 @@ pub use inference::streaming::AsrStream;
 #[cfg(feature = "timing")]
 pub use inference::transcribe::TranscribeTimings;
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
+#[cfg(feature = "paged-attn")]
+pub use model::paged_cache_runtime::{PagedCacheConfig, PagedCacheStats};
 pub use model::weights::LoadOptions;
 pub use processor::AsrProcessor;
 
@@ -37,6 +39,8 @@ pub mod qwen3_asr {
         AsrProcessor, AsrStream, AsrTranscription, AudioInput, Batch, LoadOptions, Qwen3Asr,
         StreamOptions, TranscribeOptions,
     };
+    #[cfg(feature = "paged-attn")]
+    pub use crate::{PagedCacheConfig, PagedCacheStats};
 }
 
 #[derive(Debug)]
@@ -45,6 +49,8 @@ pub struct Qwen3Asr {
     config: config::AsrConfig,
     processor: Arc<AsrProcessor>,
     _model: Arc<model::AsrModel>,
+    #[cfg(feature = "paged-attn")]
+    paged_cache: Option<model::paged_cache_runtime::SharedPagedCacheRuntime>,
 }
 
 impl Qwen3Asr {
@@ -72,11 +78,29 @@ impl Qwen3Asr {
         }
         let tokenizer = processor::tokenizer::Tokenizer::from_pretrained(model_id_or_path)?;
         let processor = AsrProcessor::new(tokenizer);
+        #[cfg(feature = "paged-attn")]
+        let paged_cache = if device.is_metal() || device.is_cuda() {
+            let (num_layers, num_kv_heads, head_dim) = model.thinker.paged_cache_config();
+            Some(Arc::new(std::sync::Mutex::new(
+                model::paged_cache_runtime::PagedCacheRuntime::new(
+                    num_layers,
+                    num_kv_heads,
+                    head_dim,
+                    opts.dtype,
+                    device,
+                    opts.paged_cache.unwrap_or_default(),
+                )?,
+            )))
+        } else {
+            None
+        };
         Ok(Self {
             device: Arc::new(device.clone()),
             config,
             processor: Arc::new(processor),
             _model: Arc::new(model),
+            #[cfg(feature = "paged-attn")]
+            paged_cache,
         })
     }
 
@@ -92,6 +116,13 @@ impl Qwen3Asr {
         self.processor.as_ref()
     }
 
+    #[cfg(feature = "paged-attn")]
+    pub fn paged_cache_stats(&self) -> Option<PagedCacheStats> {
+        self.paged_cache
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok().map(|runtime| runtime.stats()))
+    }
+
     pub fn transcribe(
         &self,
         audio: Vec<AudioInput<'_>>,
@@ -101,6 +132,8 @@ impl Qwen3Asr {
             self._model.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
+            #[cfg(feature = "paged-attn")]
+            self.paged_cache.as_ref(),
             &audio,
             &opts,
         )
@@ -116,6 +149,8 @@ impl Qwen3Asr {
             self._model.as_ref(),
             self.processor.as_ref(),
             self.device.as_ref(),
+            #[cfg(feature = "paged-attn")]
+            self.paged_cache.as_ref(),
             &audio,
             &opts,
         )

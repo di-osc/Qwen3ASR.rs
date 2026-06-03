@@ -6,6 +6,13 @@ This document records the recent Metal decode optimization work against
 `mistral.rs`, with separate notes for changes that helped, changes that did not
 help, and the remaining performance gap.
 
+Update: 2026-06-04
+
+The notes below were extended with the mixed-length paged-prefill work that
+followed the initial single-sequence decode optimization pass. The 2026-06-04
+changes are more about bringing the ASR batch path closer to `mistral.rs`
+metadata/layout behavior while also recovering real `transcribe` throughput.
+
 ## Benchmark Scope
 
 Primary target:
@@ -241,6 +248,181 @@ Why it helps:
 - Avoids copying the entire historical K/V cache on every generated token.
 - This moves our fallback cache design closer to mistral.rs `SingleCache`.
 
+### 8. Mixed-Length Paged Prefill Correctness Fixes
+
+Files:
+
+- `vasr_models/src/model/thinker.rs`
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/src/model/thinker_text.rs`
+
+Change:
+
+- Fixed paged prefill for mixed-length ASR batches.
+- `get_rope_index` now works for generic `0/1` masks instead of assuming only
+  left padding.
+- Paged metadata now carries pad-aware `slot_mapping`,
+  `token_attention_mask`, and per-request `query_lens`.
+- Batched paged prefill normalizes variable-length prompts into a single
+  right-padded paged-prefill layout.
+
+Observed effect:
+
+- Removed the earlier mixed-batch decode corruption where outputs degraded into
+  repeated garbage such as `퓮`.
+- Mixed-length release repro stabilized at roughly `350 tok/s` batch decode in
+  the good runs while keeping correct text output.
+
+Why it helps:
+
+- Before this, the main batch path was fast only for dense/equal-length inputs
+  and broke on realistic VAD-segment batches.
+- This was the correctness prerequisite for all later ASR batch throughput work.
+
+### 9. Gather-Backed Paged Prefill Attention
+
+Files:
+
+- `vasr_models/src/model/thinker_text.rs`
+
+Change:
+
+- For `seq_len > 1` paged prefill, attention no longer uses only the local
+  forward K/V tensors after cache write.
+- It now writes paged K/V first, then gathers them back with
+  `mistralrs_paged_attn::gather_kv_cache(...)` and runs attention on the
+  gathered cache view.
+
+Observed effect:
+
+- Brought the implementation shape much closer to `mistral.rs`.
+- Correct mixed-length batched prefill became stable on the single production
+  path.
+
+Why it helps:
+
+- The attention source now matches the actual paged cache layout rather than a
+  temporary local K/V view.
+- This removed a major source of divergence between our ASR batch path and the
+  `mistral.rs` paged-attention design.
+
+### 10. Right-Padded Prompt Batching and Paged Prefill Fast Path
+
+Files:
+
+- `vasr_models/src/processor/asr_processor.rs`
+- `vasr_models/src/forced_aligner/model.rs`
+- `vasr_models/src/model/generation.rs`
+
+Change:
+
+- Batch prompt construction now uses right padding.
+- Paged prefill detects already-right-padded batches and skips the extra
+  normalization/repack step.
+
+Observed effect:
+
+- Small but repeatable throughput improvement on real `transcribe` runs.
+- Helped keep the paged prefill path closer to the layout assumptions used by
+  `mistral.rs`.
+
+Why it helps:
+
+- Removes a redundant host-side batch rewrite before paged prefill.
+- Lets the production ASR path feed the paged decoder in a more direct layout.
+
+### 11. Varlen Metadata Hoisting into PagedInputMetadata
+
+Files:
+
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/thinker_text.rs`
+
+Change:
+
+- `PagedInputMetadata` now carries:
+  - `kv_lens`
+  - `cu_seqlens_q`
+  - `cu_seqlens_kv`
+  - `max_query_len`
+  - `max_kv_len`
+- Paged prefill now consumes these values directly instead of rebuilding them
+  inside each layer.
+
+Observed effect:
+
+- Modest improvement in host-side overhead.
+- More importantly, this aligned our paged metadata flow with the way
+  `mistral.rs` prepares varlen information.
+
+Why it helps:
+
+- Avoids repeated per-layer length bookkeeping.
+- Makes later packed/varlen attention work easier because the right metadata is
+  already attached to the request.
+
+### 12. Prefill Mask Hoisting
+
+Files:
+
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/src/model/thinker_text.rs`
+
+Change:
+
+- Added `prefill_attention_mask` and `prefill_causal_only` to paged metadata.
+- Paged prefill can now reuse a single precomputed mask across decoder layers
+  instead of rebuilding the same additive mask repeatedly.
+
+Observed effect:
+
+- Helped reduce per-layer setup overhead, though the gain was smaller than the
+  later tensor-layout cleanup.
+
+Why it helps:
+
+- The prefill attention mask is request-global, not layer-specific.
+- Hoisting it into metadata removes repeated Tensor construction work.
+
+### 13. Fused Unpack+Group Expansion and Deferred Fallback Transpose
+
+Files:
+
+- `vasr_models/src/model/thinker_text.rs`
+
+Change:
+
+- Replaced `unpack_gathered_kv(...)` followed by `repeat_kv(...)` with
+  `unpack_gathered_kv_for_attention(...)`, which directly materializes the head
+  shape needed by attention.
+- In the paged prefill path, `k.transpose(...).contiguous()` is no longer done
+  before the accelerator attempt. It is now only built if attention falls back
+  to the manual matmul path.
+
+Observed effect:
+
+- Mixed-length prefill time dropped from roughly `390-406 ms` to roughly
+  `349-358 ms` in the small release repro.
+- Real `transcribe` benchmark over 5 raw audio files improved from roughly:
+  - `wall_seconds=5.110`
+  - `speedup=61.723x`
+  - `rtf=0.0162`
+  to:
+  - `wall_seconds=4.644`
+  - `speedup=67.908x`
+  - `rtf=0.0147`
+- This was about a `9%` end-to-end improvement on that batch.
+
+Why it helps:
+
+- Removes one large intermediate grouped-K/V expansion.
+- Avoids paying for fallback-only `transpose+contiguous` work when Metal SDPA
+  succeeds.
+- This is the first mixed-length paged-prefill optimization in this phase that
+  clearly moved the real batch `transcribe` numbers.
+
 ## Ineffective or Negative Optimizations
 
 ### 1. Replacing Argmax with mistral.rs TopK Kernel
@@ -353,6 +535,31 @@ Conclusion:
 - Run Metal benchmarks sequentially.
 - Re-run mistral.rs in the same session when absolute numbers look suspicious.
 
+### 6. Causal-Only Paged Prefill Shortcut
+
+Files:
+
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/src/model/thinker_text.rs`
+
+Change:
+
+- Tried to treat the right-padded paged prefill case as a pure causal-attention
+  problem and skip the custom padding mask on the accelerator path.
+
+Observed effect:
+
+- Correct output was preserved.
+- Throughput gain was inconsistent and usually negligible on Metal.
+- In some runs prefill even became noisier/slower.
+
+Conclusion:
+
+- The idea is logically valid, but in the current Candle/Metal stack it is not
+  a reliable primary optimization lever.
+- Keep the supporting metadata, but do not treat this shortcut as a major win.
+
 ## Current Gap Analysis
 
 ### ISQ8 Paged-Attn
@@ -396,6 +603,97 @@ Next useful work:
 3. Avoid explicit `repeat_kv` in eager decode.
 4. Add a dedicated text-only Qwen3 decoder benchmark that removes audio encoder
    and ASR prompt noise, so eager-path regressions are easier to isolate.
+
+### Mixed-Length ASR Batch Path
+
+Status:
+
+- Correctness is now stable on the single production paged path.
+- Real ASR `transcribe` batch throughput improved meaningfully after the recent
+  paged-prefill cleanup.
+
+Current reference points from the 2026-06-04 pass:
+
+- Mixed-length batch repro:
+  - batch decode roughly `338-360 tok/s`
+  - per-sequence decode roughly `169-180 tok/s`
+- `bench_transcribe_dir` over 5 `raw_audios`:
+  - `audio_seconds=315.389`
+  - `wall_seconds=4.644`
+  - `speedup=67.908x`
+  - `rtf=0.0147`
+
+Remaining gap:
+
+- Still not fully at the `mistral.rs` style packed-varlen attention path.
+- We still unpack gathered K/V into padded batch tensors on Metal instead of
+  using a true packed varlen attention backend.
+
+Next useful work:
+
+1. Reduce `unpack_gathered_kv_for_attention(...)` padding/cat overhead further.
+2. Port a closer packed-varlen attention path where Metal backend support allows it.
+3. Keep separating correctness-fix work from real throughput wins in the notes,
+   because several alignment steps are necessary but not themselves speedups.
+
+### 2026-06-04 Follow-up: Shared Attention Dispatch
+
+Goal:
+
+- Start moving more attention paths, not only paged prefill, onto the local
+  `mistral.rs`-style dispatch abstraction without giving back the Metal gains
+  from the previous mixed-length work.
+
+Retained changes:
+
+- Kept `PagedInputMetadata::flash_params(...)` as the metadata-side bridge from
+  paged batch inputs to `FlashParams`.
+- Extended `thinker_text.rs` so the normal eager attention paths also route
+  through `attention::run_attention(...)`, instead of each branch open-coding
+  its own `accelerated_sdpa` / manual fallback split.
+- Tightened `run_attention(...)` so it only considers the flash-attn path when
+  it is actually viable:
+  - CUDA, or
+  - CPU with the `flash-attn` feature enabled.
+- This avoids the earlier wasteful "prepare for flash anyway" behavior on Metal.
+
+Why this one stayed:
+
+- Mixed-length batch correctness stayed stable.
+- The small mixed-length repro returned to the pre-regression range after the
+  flash-attempt gate was tightened.
+- End-to-end `transcribe` throughput also held or improved slightly, so this is
+  now a structural cleanup that does not cost us runtime.
+
+Reference measurements:
+
+- Mixed-length batch repro (`fixtures/audio/asr_en_16k.wav` +
+  `raw_audios/audio (12).wav`):
+  - run 1:
+    - `audio_encoder_ms=155.303`
+    - `prefill_ms=352.976`
+    - `decode_ms=44.701`
+    - `batch_decode_tokens_per_s=357.934`
+    - `per_sequence_decode_tokens_per_s=178.967`
+  - run 2:
+    - `audio_encoder_ms=130.893`
+    - `prefill_ms=348.174`
+    - `decode_ms=43.775`
+    - `batch_decode_tokens_per_s=365.505`
+    - `per_sequence_decode_tokens_per_s=182.753`
+- `bench_transcribe_dir` over 5 `raw_audios`:
+  - `audio_seconds=315.389`
+  - `wall_seconds=4.600`
+  - `speedup=68.570x`
+  - `rtf=0.0146`
+
+Takeaway:
+
+- This did not unlock a new dramatic decode-speed jump by itself.
+- It did get more of the codebase onto a single attention-dispatch shape that
+  is much closer to `mistral.rs`, while preserving the current Metal numbers.
+- That should make the next step, pushing paged prefill closer to a true
+  packed-varlen flow, less brittle.
 
 ## Verification Commands
 

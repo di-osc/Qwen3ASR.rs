@@ -10,9 +10,18 @@ use crate::inference::utils::{
     MAX_ASR_INPUT_SECONDS, merge_languages, normalize_language_name, parse_asr_output,
     validate_language,
 };
-use crate::model::generation::greedy_generate_cached_batch;
 #[cfg(feature = "timing")]
-use crate::model::generation::{GenerationTimings, greedy_generate_cached_batch_timed};
+use crate::model::generation::GenerationTimings;
+#[cfg(not(feature = "paged-attn"))]
+use crate::model::generation::greedy_generate_cached_batch;
+#[cfg(all(feature = "timing", not(feature = "paged-attn")))]
+use crate::model::generation::greedy_generate_cached_batch_timed;
+#[cfg(all(feature = "timing", feature = "paged-attn"))]
+use crate::model::generation::greedy_generate_cached_batch_timed_with_paged_runtime;
+#[cfg(feature = "paged-attn")]
+use crate::model::generation::greedy_generate_cached_batch_with_paged_runtime;
+#[cfg(feature = "paged-attn")]
+use crate::model::paged_cache_runtime::SharedPagedCacheRuntime;
 use crate::model::{AsrModel, thinker::ThinkerForConditionalGeneration};
 use crate::processor::chat_template;
 use crate::processor::{AsrProcessor, asr_processor::PreparedInputs};
@@ -112,6 +121,7 @@ pub(crate) fn generate_raw_prepared_batch(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     prepared: &[PreparedInputs],
     max_new_tokens: usize,
     eos_token_ids: &[u32],
@@ -136,6 +146,18 @@ pub(crate) fn generate_raw_prepared_batch(
 
     let audio_features =
         thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+    #[cfg(feature = "paged-attn")]
+    let gen_ids = greedy_generate_cached_batch_with_paged_runtime(
+        thinker,
+        device,
+        ids_rows.as_slice(),
+        attn_rows.as_slice(),
+        Some(&audio_features),
+        max_new_tokens,
+        eos_token_ids,
+        paged_runtime,
+    )?;
+    #[cfg(not(feature = "paged-attn"))]
     let gen_ids = greedy_generate_cached_batch(
         thinker,
         device,
@@ -186,6 +208,8 @@ struct ChunkAsrBatch<'a> {
     thinker: &'a ThinkerForConditionalGeneration,
     processor: &'a AsrProcessor,
     device: &'a Device,
+    #[cfg(feature = "paged-attn")]
+    paged_runtime: Option<&'a SharedPagedCacheRuntime>,
     chunks: &'a [ChunkItem],
     prompts: &'a [String],
     forced_langs_norm: &'a [Option<String>],
@@ -239,6 +263,8 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
                 batch.thinker,
                 batch.processor,
                 batch.device,
+                #[cfg(feature = "paged-attn")]
+                batch.paged_runtime,
                 prepared.as_slice(),
                 batch.max_new_tokens,
                 batch.eos_token_ids,
@@ -266,15 +292,15 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
         return Ok((per_chunk_lang, per_chunk_text));
     }
 
+    let mut per_chunk_lang: Vec<Option<String>> = vec![None; batch.chunks.len()];
+    let mut per_chunk_text: Vec<Option<String>> = vec![None; batch.chunks.len()];
+
     let mut indices: Vec<usize> = (0..batch.chunks.len()).collect();
     indices.sort_by(|&a, &b| {
         let la = batch.chunks[a].wav.len();
         let lb = batch.chunks[b].wav.len();
         lb.cmp(&la).then_with(|| a.cmp(&b))
     });
-
-    let mut per_chunk_lang: Vec<Option<String>> = vec![None; batch.chunks.len()];
-    let mut per_chunk_text: Vec<Option<String>> = vec![None; batch.chunks.len()];
 
     for idx_batch in indices.chunks(batch_size) {
         let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(idx_batch.len());
@@ -317,6 +343,8 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
             batch.thinker,
             batch.processor,
             batch.device,
+            #[cfg(feature = "paged-attn")]
+            batch.paged_runtime,
             prepared.as_slice(),
             batch.max_new_tokens,
             batch.eos_token_ids,
@@ -378,6 +406,7 @@ fn generate_raw_prepared_batch_timed(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
     device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     prepared: &[PreparedInputs],
     max_new_tokens: usize,
     eos_token_ids: &[u32],
@@ -412,6 +441,18 @@ fn generate_raw_prepared_batch_timed(
         .audio_encoder_us
         .saturating_add(duration_to_us(start_audio.elapsed()));
 
+    #[cfg(feature = "paged-attn")]
+    let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
+        thinker,
+        device,
+        ids_rows.as_slice(),
+        attn_rows.as_slice(),
+        Some(&audio_features),
+        max_new_tokens,
+        eos_token_ids,
+        paged_runtime,
+    )?;
+    #[cfg(not(feature = "paged-attn"))]
     let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed(
         thinker,
         device,
@@ -538,6 +579,8 @@ fn run_asr_on_chunks_batched_timed(
                 batch.thinker,
                 batch.processor,
                 batch.device,
+                #[cfg(feature = "paged-attn")]
+                batch.paged_runtime,
                 prepared.as_slice(),
                 batch.max_new_tokens,
                 batch.eos_token_ids,
@@ -623,6 +666,8 @@ fn run_asr_on_chunks_batched_timed(
             batch.thinker,
             batch.processor,
             batch.device,
+            #[cfg(feature = "paged-attn")]
+            batch.paged_runtime,
             prepared.as_slice(),
             batch.max_new_tokens,
             batch.eos_token_ids,
@@ -684,6 +729,7 @@ pub fn transcribe(
     model: &AsrModel,
     processor: &AsrProcessor,
     device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     audio: &[AudioInput<'_>],
     opts: &TranscribeOptions,
 ) -> Result<Vec<AsrTranscription>> {
@@ -736,6 +782,8 @@ pub fn transcribe(
         thinker: &model.thinker,
         processor,
         device,
+        #[cfg(feature = "paged-attn")]
+        paged_runtime,
         chunks: chunks.as_slice(),
         prompts: prompts.as_slice(),
         forced_langs_norm: forced_langs_norm.as_slice(),
@@ -797,6 +845,7 @@ pub fn transcribe_timed(
     model: &AsrModel,
     processor: &AsrProcessor,
     device: &Device,
+    #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     audio: &[AudioInput<'_>],
     opts: &TranscribeOptions,
 ) -> Result<(Vec<AsrTranscription>, TranscribeTimings)> {
@@ -861,6 +910,8 @@ pub fn transcribe_timed(
         thinker: &model.thinker,
         processor,
         device,
+        #[cfg(feature = "paged-attn")]
+        paged_runtime,
         chunks: chunks.as_slice(),
         prompts: prompts.as_slice(),
         forced_langs_norm: forced_langs_norm.as_slice(),
@@ -1175,6 +1226,8 @@ pub fn transcribe_with_forced_aligner_timed(
             &model.thinker,
             processor,
             device,
+            #[cfg(feature = "paged-attn")]
+            None,
             prepared.as_slice(),
             opts.max_new_tokens,
             eos_token_ids.as_slice(),
@@ -1485,6 +1538,8 @@ pub fn transcribe_with_forced_aligner(
             &model.thinker,
             processor,
             device,
+            #[cfg(feature = "paged-attn")]
+            None,
             prepared.as_slice(),
             opts.max_new_tokens,
             eos_token_ids.as_slice(),

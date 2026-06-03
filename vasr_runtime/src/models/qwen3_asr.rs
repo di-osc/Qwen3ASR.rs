@@ -49,7 +49,7 @@ impl AsrModel for Qwen3AsrModel {
             language: Batch::one(options.language.clone()),
             return_timestamps: false,
             max_new_tokens: options.max_new_tokens,
-            max_batch_size: 32,
+            max_batch_size: RuntimeTranscribeOptions::default().max_batch_size,
             chunk_max_sec: None,
             bucket_by_length: false,
         };

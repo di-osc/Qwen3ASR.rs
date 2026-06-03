@@ -2,6 +2,9 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
+#[cfg(feature = "flash-attn")]
+use candle_flash_attn::{flash_attn, flash_attn_varlen};
+
 /// Repeat key/value heads to match the query head count (GQA/MQA).
 ///
 /// This is equivalent to PyTorch's `repeat_interleave` over the head dimension
@@ -143,6 +146,153 @@ pub fn make_causal_mask_cached(
     } else {
         mask.to_dtype(dtype)
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum AttentionMask {
+    None,
+    Custom(Tensor),
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashKMeta {
+    pub max: u32,
+    pub cumulative_seqlens: Option<Tensor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlashParams {
+    pub max_q: u32,
+    pub cumulative_seqlens_q: Option<Tensor>,
+    pub logical_k: FlashKMeta,
+    pub causal: bool,
+}
+
+#[cfg(feature = "flash-attn")]
+fn flash_attn_dispatch(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    flash_params: Option<&FlashParams>,
+    softmax_scale: f32,
+    causal_default: bool,
+) -> Result<Option<Tensor>> {
+    if !q.device().is_cuda() || q.dtype() == DType::F32 {
+        return Ok(None);
+    }
+
+    let (batch, q_len, _heads, _dim) = q.dims4()?;
+    let k_len = k.dim(1)?;
+    let use_varlen = batch > 1 || q_len != k_len;
+
+    if use_varlen {
+        if let Some(params) = flash_params {
+            if let (Some(cu_q), Some(cu_k)) = (
+                params.cumulative_seqlens_q.as_ref(),
+                params.logical_k.cumulative_seqlens.as_ref(),
+            ) {
+                let q_shape = q.shape();
+                let q = q.flatten_to(1)?;
+                let k = k.flatten_to(1)?;
+                let v = v.flatten_to(1)?;
+                let out = flash_attn_varlen(
+                    &q,
+                    &k,
+                    &v,
+                    cu_q,
+                    cu_k,
+                    params.max_q as usize,
+                    params.logical_k.max as usize,
+                    softmax_scale,
+                    params.causal,
+                )?;
+                return Ok(Some(out.reshape(q_shape)?));
+            }
+        }
+    }
+
+    let causal = flash_params.map_or(causal_default, |p| p.causal);
+    Ok(Some(flash_attn(q, k, v, softmax_scale, causal)?))
+}
+
+#[cfg(not(feature = "flash-attn"))]
+fn flash_attn_dispatch(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _flash_params: Option<&FlashParams>,
+    _softmax_scale: f32,
+    _causal_default: bool,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+
+pub fn run_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &AttentionMask,
+    flash_params: Option<&FlashParams>,
+    softmax_scale: f32,
+    causal_default: bool,
+) -> Result<Tensor> {
+    let can_try_flash = !matches!(mask, AttentionMask::Custom(_))
+        && (q.device().is_cuda() || q.device().is_cpu() && cfg!(feature = "flash-attn"));
+    if can_try_flash {
+        let q_t = q.transpose(1, 2)?;
+        let k_t = k.transpose(1, 2)?;
+        let v_t = v.transpose(1, 2)?;
+        if let Some(out) = flash_attn_dispatch(
+            &q_t,
+            &k_t,
+            &v_t,
+            flash_params,
+            softmax_scale,
+            causal_default,
+        )? {
+            return out.transpose(1, 2);
+        }
+    }
+
+    let mask_tensor = match mask {
+        AttentionMask::None => None,
+        AttentionMask::Custom(mask) => Some(mask),
+    };
+    if let Some(out) = accelerated_sdpa(
+        q,
+        k,
+        v,
+        mask_tensor,
+        softmax_scale,
+        flash_params.map_or(causal_default, |p| p.causal),
+    )? {
+        return Ok(out);
+    }
+
+    let q = if q.device().is_metal() || q.device().is_cuda() {
+        q.contiguous()?
+    } else {
+        q.clone()
+    };
+    let v = if v.device().is_metal() || v.device().is_cuda() {
+        v.contiguous()?
+    } else {
+        v.clone()
+    };
+    let k_t = if k.device().is_metal() || k.device().is_cuda() {
+        k.transpose(2, 3)?.contiguous()?
+    } else {
+        k.transpose(2, 3)?
+    };
+    let mut attn_weights = q.matmul(&k_t)?.affine(softmax_scale.into(), 0.0)?;
+    if let Some(mask) = mask_tensor {
+        attn_weights = attn_weights.broadcast_add(mask)?;
+    } else if flash_params.map_or(causal_default, |p| p.causal) && q.dim(2)? > 1 {
+        let causal_mask = make_causal_mask(None, q.dim(0)?, q.dim(2)?, q.dtype(), q.device())?;
+        attn_weights = attn_weights.broadcast_add(&causal_mask)?;
+    }
+    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+    attn_weights.matmul(&v)
 }
 
 /// Try Candle's accelerator SDPA path before falling back to the manual

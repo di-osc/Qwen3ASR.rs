@@ -1,6 +1,7 @@
 //! vASR data model types shared by offline and realtime inference.
 
 mod media;
+mod record;
 mod segment;
 mod stream;
 mod time;
@@ -9,6 +10,10 @@ mod token;
 mod waveform;
 
 pub use media::{AudioChannel, AudioFormat, AudioSource, MediaId};
+pub use record::{
+    AudioAsset, AudioEncoding, PersistedAudioFormat, RecordError, VasrRecord, VasrRecordList,
+    WaveformCache,
+};
 pub use segment::{TextSegment, Transcript};
 pub use stream::{AudioBytesStream, AudioChunk, AudioChunkList};
 pub use time::{DurationMs, SampleIndex, TimeRange};

@@ -9,6 +9,8 @@ use clap::{Args, Subcommand};
 use vasr_audio::AudioLoader;
 use vasr_models::qwen3_asr::LoadOptions;
 use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
+#[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
+use vasr_models::qwen3_asr::model::paged_cache_runtime::{PagedCacheConfig, PagedCacheMemory};
 use vasr_runtime::{
     AsrModel, AsrOptions, OfflinePipeline, Qwen3AsrModel, RealtimePipeline, SileroVadModel,
     VadModel, VadOptions,
@@ -64,6 +66,22 @@ pub struct CommonServeArgs {
     /// Maximum decode tokens per request.
     #[arg(long, default_value_t = 256, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
+
+    /// PagedAttention KV cache context length to preallocate.
+    #[arg(
+        long = "pa-context-len",
+        default_value_t = 4096,
+        env = "VASR_PA_CONTEXT_LEN"
+    )]
+    pub pa_context_len: usize,
+
+    /// PagedAttention block size. Supported values: 8, 16, 32.
+    #[arg(
+        long = "pa-block-size",
+        default_value_t = 32,
+        env = "VASR_PA_BLOCK_SIZE"
+    )]
+    pub pa_block_size: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -186,6 +204,11 @@ fn load_asr_model(args: &CommonServeArgs) -> Result<Arc<dyn AsrModel>> {
         dtype,
         use_flash_attn: args.flash_attn,
         isq: args.isq.clone(),
+        #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
+        paged_cache: Some(PagedCacheConfig {
+            block_size: args.pa_block_size,
+            memory: PagedCacheMemory::ContextSize(args.pa_context_len),
+        }),
     };
 
     tracing::info!(
@@ -225,6 +248,18 @@ fn load_asr_model(args: &CommonServeArgs) -> Result<Arc<dyn AsrModel>> {
     let model_load_start = Instant::now();
     let qwen3_asr = Qwen3AsrModel::from_pretrained(&args.model, &device, &load_options)?;
     log_model_config(&qwen3_asr);
+    #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
+    if let Some(stats) = qwen3_asr.inner().paged_cache_stats() {
+        tracing::info!(
+            target: "vasr_cli::serve",
+            "PagedAttention KV cache: block_size={}, blocks={}, free_blocks={}, context_tokens={}, bytes={:.2} MiB.",
+            stats.block_size,
+            stats.num_blocks,
+            stats.free_blocks,
+            stats.max_context_tokens,
+            stats.bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
     tracing::info!(
         target: "vasr_cli::serve",
         "Model loaded in {:.3}s.",

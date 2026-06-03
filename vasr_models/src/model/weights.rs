@@ -16,6 +16,8 @@ pub struct LoadOptions {
     pub dtype: candle_core::DType,
     pub use_flash_attn: bool,
     pub isq: Option<String>,
+    #[cfg(feature = "paged-attn")]
+    pub paged_cache: Option<crate::model::paged_cache_runtime::PagedCacheConfig>,
 }
 
 impl Default for LoadOptions {
@@ -24,6 +26,8 @@ impl Default for LoadOptions {
             dtype: candle_core::DType::F32,
             use_flash_attn: false,
             isq: None,
+            #[cfg(feature = "paged-attn")]
+            paged_cache: None,
         }
     }
 }

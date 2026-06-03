@@ -6,10 +6,14 @@
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
 
+#[cfg(feature = "paged-attn")]
+use crate::model::attention;
 #[cfg(feature = "cuda-graph")]
 use crate::model::cuda_graph::DecodeCudaGraph;
 use crate::model::isq_linear::set_linear_is_prefill;
 use crate::model::kv_cache::KVCache;
+#[cfg(feature = "paged-attn")]
+use crate::model::paged_cache_runtime::SharedPagedCacheRuntime;
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_kv_cache::PagedKvCache;
 use crate::model::thinker::ThinkerForConditionalGeneration;
@@ -30,7 +34,9 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
 
 fn argmax_token_id(logits: &Tensor) -> Result<u32> {
     #[cfg(feature = "metal-paged-attn")]
-    if logits.device().is_metal() && matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16)
+    if logits.device().is_metal()
+        && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none()
+        && matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
         return Ok(crate::model::metal_argmax::argmax_token_id(logits)?);
     }
@@ -270,6 +276,29 @@ pub fn greedy_generate_cached_batch(
         audio_features,
         max_new_tokens,
         eos_token_ids,
+        #[cfg(feature = "paged-attn")]
+        paged_runtime: None,
+    };
+    greedy_generate_cached_batch_impl(thinker, device, input_ids, attention_mask, opts, None)
+}
+
+#[cfg(feature = "paged-attn")]
+pub fn greedy_generate_cached_batch_with_paged_runtime(
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    input_ids: &[&[u32]],
+    attention_mask: &[&[u32]],
+    audio_features: Option<&Tensor>,
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    paged_runtime: Option<&SharedPagedCacheRuntime>,
+) -> Result<Vec<Vec<u32>>> {
+    let opts = GreedyGenerateBatchOpts {
+        audio_features,
+        max_new_tokens,
+        eos_token_ids,
+        #[cfg(feature = "paged-attn")]
+        paged_runtime,
     };
     greedy_generate_cached_batch_impl(thinker, device, input_ids, attention_mask, opts, None)
 }
@@ -289,6 +318,38 @@ pub fn greedy_generate_cached_batch_timed(
         audio_features,
         max_new_tokens,
         eos_token_ids,
+        #[cfg(feature = "paged-attn")]
+        paged_runtime: None,
+    };
+    let out = greedy_generate_cached_batch_impl(
+        thinker,
+        device,
+        input_ids,
+        attention_mask,
+        opts,
+        Some(&mut timings),
+    )?;
+    timings.tokens_generated = out.iter().map(Vec::len).sum();
+    Ok((out, timings))
+}
+
+#[cfg(all(feature = "timing", feature = "paged-attn"))]
+pub fn greedy_generate_cached_batch_timed_with_paged_runtime(
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    input_ids: &[&[u32]],
+    attention_mask: &[&[u32]],
+    audio_features: Option<&Tensor>,
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    paged_runtime: Option<&SharedPagedCacheRuntime>,
+) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
+    let mut timings = GenerationTimings::default();
+    let opts = GreedyGenerateBatchOpts {
+        audio_features,
+        max_new_tokens,
+        eos_token_ids,
+        paged_runtime,
     };
     let out = greedy_generate_cached_batch_impl(
         thinker,
@@ -306,6 +367,8 @@ struct GreedyGenerateBatchOpts<'a> {
     audio_features: Option<&'a Tensor>,
     max_new_tokens: usize,
     eos_token_ids: &'a [u32],
+    #[cfg(feature = "paged-attn")]
+    paged_runtime: Option<&'a SharedPagedCacheRuntime>,
 }
 
 fn greedy_generate_cached_batch_impl(
@@ -382,6 +445,24 @@ fn greedy_generate_cached_batch_impl(
         )?;
         return Ok(vec![out]);
     }
+    #[cfg(all(feature = "paged-attn", feature = "timing"))]
+    if batch > 1
+        && !disable_paged_attn
+        && (device.is_metal() || device.is_cuda())
+        && opts.paged_runtime.is_some()
+    {
+        return greedy_generate_paged_batch(
+            thinker,
+            device,
+            input_ids,
+            attention_mask,
+            opts.audio_features,
+            opts.max_new_tokens,
+            opts.eos_token_ids,
+            opts.paged_runtime,
+            timings.as_deref_mut(),
+        );
+    }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
     if batch == 1
         && !disable_paged_attn
@@ -399,6 +480,24 @@ fn greedy_generate_cached_batch_impl(
             None,
         )?;
         return Ok(vec![out]);
+    }
+    #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
+    if batch > 1
+        && !disable_paged_attn
+        && (device.is_metal() || device.is_cuda())
+        && opts.paged_runtime.is_some()
+    {
+        return greedy_generate_paged_batch(
+            thinker,
+            device,
+            input_ids,
+            attention_mask,
+            opts.audio_features,
+            opts.max_new_tokens,
+            opts.eos_token_ids,
+            opts.paged_runtime,
+            None,
+        );
     }
 
     let eos_fill_id = *opts
@@ -478,7 +577,6 @@ fn greedy_generate_cached_batch_impl(
         .iter()
         .map(|id| opts.eos_token_ids.contains(id))
         .collect();
-
     let dense_attention = attention_masks_are_dense(attention_mask);
     let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
     let ones_col = if dense_attention {
@@ -834,6 +932,299 @@ fn greedy_generate_paged(
 }
 
 #[cfg(feature = "paged-attn")]
+fn greedy_generate_paged_batch(
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    input_ids: &[&[u32]],
+    attention_mask: &[&[u32]],
+    audio_features: Option<&Tensor>,
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    paged_runtime: Option<&SharedPagedCacheRuntime>,
+    #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    #[cfg(not(feature = "timing"))] _timings: Option<&mut GenerationTimings>,
+) -> Result<Vec<Vec<u32>>> {
+    let batch = input_ids.len();
+    if batch == 0 {
+        return Ok(vec![]);
+    }
+    let seq_len = input_ids
+        .first()
+        .map(|row| row.len())
+        .ok_or_else(|| anyhow::anyhow!("missing first input row"))?;
+    if seq_len == 0 {
+        bail!("input_ids rows are empty");
+    }
+    for (i, row) in input_ids.iter().enumerate() {
+        if row.len() != seq_len {
+            bail!(
+                "paged batch input_ids[{i}] length mismatch: expected={seq_len}, got={}",
+                row.len()
+            );
+        }
+    }
+    for (i, row) in attention_mask.iter().enumerate() {
+        if row.len() != seq_len {
+            bail!(
+                "paged batch attention_mask[{i}] length mismatch: expected={seq_len}, got={}",
+                row.len()
+            );
+        }
+    }
+    if max_new_tokens == 0 {
+        return Ok(vec![vec![]; batch]);
+    }
+
+    let normalized_batch = if attention_masks_are_right_padded(attention_mask) {
+        None
+    } else {
+        Some(normalize_batch_for_paged_prefill(
+            input_ids,
+            attention_mask,
+        )?)
+    };
+    let (paged_id_rows, paged_mask_rows, prompt_lens_usize): (
+        Vec<&[u32]>,
+        Vec<&[u32]>,
+        Vec<usize>,
+    ) = if let Some((ids, masks, lens)) = normalized_batch.as_ref() {
+        (
+            ids.iter().map(Vec::as_slice).collect(),
+            masks.iter().map(Vec::as_slice).collect(),
+            lens.clone(),
+        )
+    } else {
+        (
+            input_ids.to_vec(),
+            attention_mask.to_vec(),
+            attention_mask
+                .iter()
+                .map(|row| row.iter().filter(|&&v| v != 0).count())
+                .collect(),
+        )
+    };
+
+    #[cfg(feature = "timing")]
+    let start_tensors = std::time::Instant::now();
+
+    let mut ids_flat: Vec<u32> = Vec::with_capacity(batch.saturating_mul(seq_len));
+    let mut attn_flat: Vec<u32> = Vec::with_capacity(batch.saturating_mul(seq_len));
+    for i in 0..batch {
+        ids_flat.extend_from_slice(paged_id_rows[i]);
+        attn_flat.extend_from_slice(paged_mask_rows[i]);
+    }
+    let input_ids_t = Tensor::from_vec(ids_flat, (batch, seq_len), device)?;
+    let attention_mask_t = Tensor::from_vec(attn_flat, (batch, seq_len), device)?;
+
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.prompt_len = seq_len;
+        t.prompt_tensors_us = t
+            .prompt_tensors_us
+            .saturating_add(duration_to_us(start_tensors.elapsed()));
+    }
+
+    #[cfg(feature = "timing")]
+    let start_prefill = std::time::Instant::now();
+
+    let audio_placeholder_count = if audio_features.is_some() {
+        count_audio_placeholders_batch(paged_id_rows.as_slice(), thinker.audio_token_id())?
+    } else {
+        0
+    };
+    let inputs_embeds = thinker.inputs_embeds_with_audio_features(
+        &input_ids_t,
+        audio_features,
+        audio_placeholder_count,
+    )?;
+    let max_tokens = seq_len
+        .checked_add(max_new_tokens)
+        .ok_or_else(|| anyhow::anyhow!("paged batch cache max token capacity overflow"))?;
+    let mut runtime_guard = paged_runtime
+        .ok_or_else(|| anyhow::anyhow!("paged batch generation requires a shared paged runtime"))?
+        .lock()
+        .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+    let request_ids: Vec<usize> = (0..batch).collect();
+    for &request_id in &request_ids {
+        runtime_guard
+            .manager_mut()
+            .allocate_slots(request_id, max_tokens)?;
+    }
+    let block_tables = request_ids
+        .iter()
+        .map(|&request_id| Ok(runtime_guard.manager().block_ids(request_id)?.to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    let paged_cache = runtime_guard.cache();
+    let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
+    let mut input_metadata = paged_cache.input_metadata_from_attention_masks(
+        &block_tables,
+        paged_mask_rows.as_slice(),
+        device,
+    )?;
+    if !input_metadata.prefill_causal_only {
+        input_metadata.prefill_attention_mask = Some(attention::make_causal_mask(
+            input_metadata.token_attention_mask.as_ref(),
+            batch,
+            seq_len,
+            inputs_embeds.dtype(),
+            device,
+        )?);
+    }
+    let logits = {
+        let _linear_prefill_guard = set_linear_is_prefill(true);
+        thinker.forward_embeds_with_paged_cache(
+            &position_ids,
+            &inputs_embeds,
+            &paged_cache,
+            &input_metadata,
+        )?
+    };
+    let prompt_lens = input_metadata
+        .query_lens
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing query_lens"))?
+        .iter()
+        .map(|&len| {
+            i64::try_from(len).map_err(|_| anyhow::anyhow!("query_len overflows i64: {len}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let last_logits = gather_last_logits_for_prompt_lens(&logits, prompt_lens.as_slice())?;
+    let mut next_ids = last_logits.argmax(1usize)?.to_vec1::<u32>()?;
+    if next_ids.len() != batch {
+        bail!(
+            "internal error: paged batch argmax mismatch: expected={batch}, got={}",
+            next_ids.len()
+        );
+    }
+
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.prefill_us = t
+            .prefill_us
+            .saturating_add(duration_to_us(start_prefill.elapsed()));
+    }
+
+    let eos_fill_id = *eos_token_ids
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("eos_token_ids is empty"))?;
+    let mut generated: Vec<Vec<u32>> = vec![Vec::new(); batch];
+    let mut finished: Vec<bool> = next_ids
+        .iter()
+        .map(|id| eos_token_ids.contains(id))
+        .collect();
+
+    #[cfg(feature = "timing")]
+    let start_decode = std::time::Instant::now();
+    for step in 0..max_new_tokens {
+        if finished.iter().all(|&x| x) {
+            break;
+        }
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.steps = t.steps.saturating_add(1);
+        }
+
+        let mut tokens_in: Vec<u32> = Vec::with_capacity(batch);
+        for i in 0..batch {
+            if finished[i] {
+                tokens_in.push(eos_fill_id);
+                continue;
+            }
+            let tok = next_ids
+                .get(i)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing next_id for paged batch index {i}"))?;
+            if eos_token_ids.contains(&tok) {
+                finished[i] = true;
+                tokens_in.push(eos_fill_id);
+            } else {
+                generated[i].push(tok);
+                tokens_in.push(tok);
+            }
+        }
+
+        #[cfg(feature = "timing")]
+        let start_token_tensor = std::time::Instant::now();
+        let input_ids_new = Tensor::from_vec(tokens_in, (batch, 1usize), device)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_token_tensor_us = t
+                .decode_token_tensor_us
+                .saturating_add(duration_to_us(start_token_tensor.elapsed()));
+        }
+
+        #[cfg(feature = "timing")]
+        let start_embed = std::time::Instant::now();
+        let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_embed_us = t
+                .decode_embed_us
+                .saturating_add(duration_to_us(start_embed.elapsed()));
+        }
+
+        #[cfg(feature = "timing")]
+        let start_position = std::time::Instant::now();
+        let position_ids_new = position_ids_for_step(prompt_lens.as_slice(), step, device)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_position_us = t
+                .decode_position_us
+                .saturating_add(duration_to_us(start_position.elapsed()));
+        }
+
+        #[cfg(feature = "timing")]
+        let start_metadata = std::time::Instant::now();
+        let starts: Vec<usize> = prompt_lens_usize.iter().map(|&len| len + step).collect();
+        let context_lens: Vec<usize> = prompt_lens_usize
+            .iter()
+            .map(|&len| len + step + 1)
+            .collect();
+        let input_metadata = paged_cache.input_metadata_from_block_tables(
+            &block_tables,
+            &starts,
+            1,
+            &context_lens,
+            device,
+        )?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.decode_metadata_us = t
+                .decode_metadata_us
+                .saturating_add(duration_to_us(start_metadata.elapsed()));
+        }
+
+        let logits_new = {
+            let _linear_decode_guard = set_linear_is_prefill(false);
+            thinker.forward_embeds_with_paged_cache(
+                &position_ids_new,
+                &inputs_embeds_new,
+                &paged_cache,
+                &input_metadata,
+            )?
+        };
+        let next = logits_new.squeeze(1)?.argmax(1usize)?.to_vec1::<u32>()?;
+        if next.len() != batch {
+            bail!(
+                "internal error: paged batch argmax mismatch: expected={batch}, got={}",
+                next.len()
+            );
+        }
+        next_ids = next;
+    }
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.decode_us = t
+            .decode_us
+            .saturating_add(duration_to_us(start_decode.elapsed()));
+    }
+
+    runtime_guard.manager_mut().free_many(&request_ids);
+
+    Ok(generated)
+}
+
+#[cfg(feature = "paged-attn")]
 fn paged_prefill_metadata(
     cache: &PagedKvCache,
     seq_len: usize,
@@ -868,6 +1259,67 @@ fn count_audio_placeholders_batch(input_ids: &[&[u32]], audio_token_id: u32) -> 
     Ok(total)
 }
 
+#[cfg(feature = "paged-attn")]
+fn normalize_batch_for_paged_prefill(
+    input_ids: &[&[u32]],
+    attention_mask: &[&[u32]],
+) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<usize>)> {
+    let batch = input_ids.len();
+    if batch != attention_mask.len() {
+        bail!(
+            "input_ids/attention_mask batch mismatch: input_ids={} attention_mask={}",
+            batch,
+            attention_mask.len()
+        );
+    }
+    if batch == 0 {
+        return Ok((vec![], vec![], vec![]));
+    }
+    let seq_len = input_ids[0].len();
+    let mut ids_out = Vec::with_capacity(batch);
+    let mut masks_out = Vec::with_capacity(batch);
+    let mut lens_out = Vec::with_capacity(batch);
+
+    for (i, (ids, mask)) in input_ids.iter().zip(attention_mask.iter()).enumerate() {
+        if ids.len() != seq_len || mask.len() != seq_len {
+            bail!(
+                "batch row len mismatch at {i}: ids={} mask={} expected={seq_len}",
+                ids.len(),
+                mask.len()
+            );
+        }
+        let len = mask.iter().filter(|&&v| v != 0).count();
+        if len == 0 || len > seq_len {
+            bail!("invalid prompt length at batch index {i}: len={len} seq_len={seq_len}");
+        }
+        let pad_id = ids
+            .iter()
+            .zip(mask.iter())
+            .find_map(|(&id, &m)| if m == 0 { Some(id) } else { None })
+            .unwrap_or(ids[0]);
+        let mut row_ids = vec![pad_id; seq_len];
+        let mut row_mask = vec![0u32; seq_len];
+        let mut write_idx = 0usize;
+        for (&id, &m) in ids.iter().zip(mask.iter()) {
+            if m != 0 {
+                row_ids[write_idx] = id;
+                row_mask[write_idx] = 1;
+                write_idx += 1;
+            }
+        }
+        if write_idx != len {
+            bail!(
+                "failed to normalize prompt row {i}: expected {len} valid tokens, copied {write_idx}"
+            );
+        }
+        ids_out.push(row_ids);
+        masks_out.push(row_mask);
+        lens_out.push(len);
+    }
+
+    Ok((ids_out, masks_out, lens_out))
+}
+
 fn attention_mask_is_dense(attention_mask: &[u32]) -> bool {
     attention_mask.iter().all(|&v| v != 0)
 }
@@ -876,6 +1328,26 @@ fn attention_masks_are_dense(attention_mask: &[&[u32]]) -> bool {
     attention_mask
         .iter()
         .all(|row| attention_mask_is_dense(row))
+}
+
+#[cfg(feature = "paged-attn")]
+fn attention_mask_is_right_padded(attention_mask: &[u32]) -> bool {
+    let mut seen_pad = false;
+    for &v in attention_mask {
+        if v == 0 {
+            seen_pad = true;
+        } else if seen_pad {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "paged-attn")]
+fn attention_masks_are_right_padded(attention_mask: &[&[u32]]) -> bool {
+    attention_mask
+        .iter()
+        .all(|row| attention_mask_is_right_padded(row))
 }
 
 fn prompt_len_from_left_padded_mask(attention_mask: &[u32], seq_len: usize) -> Result<i64> {
@@ -911,6 +1383,38 @@ fn prompt_lens_from_attention_masks(attention_mask: &[&[u32]], seq_len: usize) -
     Ok(out)
 }
 
+#[cfg(feature = "paged-attn")]
+fn gather_last_logits_for_prompt_lens(logits: &Tensor, prompt_lens: &[i64]) -> Result<Tensor> {
+    let (batch, seq_len, vocab) = logits.dims3()?;
+    if prompt_lens.len() != batch {
+        bail!(
+            "prompt_lens batch mismatch: expected={batch}, got={}",
+            prompt_lens.len()
+        );
+    }
+    let mut gather_idx = Vec::with_capacity(batch);
+    for (i, &len_i64) in prompt_lens.iter().enumerate() {
+        if len_i64 <= 0 {
+            bail!("prompt length must be > 0 at batch index {i}: {len_i64}");
+        }
+        let len = usize::try_from(len_i64)
+            .map_err(|_| anyhow::anyhow!("prompt length overflows usize at {i}: {len_i64}"))?;
+        if len > seq_len {
+            bail!("prompt length exceeds seq_len at batch index {i}: len={len} seq_len={seq_len}");
+        }
+        let flat = i
+            .checked_mul(seq_len)
+            .and_then(|base| base.checked_add(len - 1))
+            .ok_or_else(|| anyhow::anyhow!("gather index overflow for batch index {i}"))?;
+        gather_idx.push(u32::try_from(flat).map_err(|_| {
+            anyhow::anyhow!("gather index overflows u32 at batch index {i}: {flat}")
+        })?);
+    }
+    let flat_logits = logits.reshape((batch * seq_len, vocab))?;
+    let idx = Tensor::from_vec(gather_idx, (batch,), logits.device())?;
+    Ok(flat_logits.index_select(&idx, 0)?)
+}
+
 fn position_ids_for_step(prompt_lens: &[i64], step: usize, device: &Device) -> Result<Tensor> {
     if prompt_lens.is_empty() {
         bail!("prompt_lens is empty");
@@ -933,10 +1437,14 @@ fn position_ids_for_step(prompt_lens: &[i64], step: usize, device: &Device) -> R
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "paged-attn")]
+    use super::normalize_batch_for_paged_prefill;
     use super::{
         attention_mask_is_dense, attention_masks_are_dense, decode_slot_and_context_len,
         position_ids_for_step, prompt_lens_from_attention_masks,
     };
+    #[cfg(feature = "paged-attn")]
+    use super::{attention_mask_is_right_padded, attention_masks_are_right_padded};
 
     #[test]
     fn test_position_ids_for_step_matches_get_rope_index_last_col() -> anyhow::Result<()> {
@@ -994,10 +1502,50 @@ mod tests {
         assert!(!attention_masks_are_dense(padded_rows.as_slice()));
     }
 
+    #[cfg(feature = "paged-attn")]
+    #[test]
+    fn test_attention_mask_right_padding_detection() {
+        assert!(attention_mask_is_right_padded(&[1, 1, 1, 0, 0]));
+        assert!(attention_mask_is_right_padded(&[1, 1, 1]));
+        assert!(attention_mask_is_right_padded(&[0, 0, 0]));
+        assert!(!attention_mask_is_right_padded(&[0, 1, 1]));
+        assert!(!attention_mask_is_right_padded(&[1, 0, 1]));
+
+        let right_rows: Vec<&[u32]> = vec![&[1, 1, 0], &[1, 1, 1]];
+        assert!(attention_masks_are_right_padded(right_rows.as_slice()));
+
+        let mixed_rows: Vec<&[u32]> = vec![&[1, 1, 0], &[0, 1, 1]];
+        assert!(!attention_masks_are_right_padded(mixed_rows.as_slice()));
+    }
+
     #[test]
     fn test_decode_slot_and_context_len_matches_paged_decode_steps() -> anyhow::Result<()> {
         assert_eq!(decode_slot_and_context_len(42, 0)?, (42, 43));
         assert_eq!(decode_slot_and_context_len(42, 7)?, (49, 50));
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-attn")]
+    #[test]
+    fn test_normalize_batch_for_paged_prefill_handles_left_and_right_padding() -> anyhow::Result<()>
+    {
+        let input_ids: Vec<&[u32]> = vec![
+            &[9, 9, 11, 12, 13],
+            &[21, 22, 23, 0, 0],
+            &[31, 32, 33, 34, 35],
+        ];
+        let attention_mask: Vec<&[u32]> =
+            vec![&[0, 0, 1, 1, 1], &[1, 1, 1, 0, 0], &[1, 1, 1, 1, 1]];
+
+        let (ids, masks, lens) =
+            normalize_batch_for_paged_prefill(input_ids.as_slice(), attention_mask.as_slice())?;
+        assert_eq!(lens, vec![3, 3, 5]);
+        assert_eq!(ids[0], vec![11, 12, 13, 9, 9]);
+        assert_eq!(ids[1], vec![21, 22, 23, 0, 0]);
+        assert_eq!(ids[2], vec![31, 32, 33, 34, 35]);
+        assert_eq!(masks[0], vec![1, 1, 1, 0, 0]);
+        assert_eq!(masks[1], vec![1, 1, 1, 0, 0]);
+        assert_eq!(masks[2], vec![1, 1, 1, 1, 1]);
         Ok(())
     }
 }

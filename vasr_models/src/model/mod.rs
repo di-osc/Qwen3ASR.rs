@@ -13,6 +13,8 @@ pub mod kv_cache;
 mod metal_argmax;
 pub mod name_map;
 #[cfg(feature = "paged-attn")]
+pub mod paged_cache_runtime;
+#[cfg(feature = "paged-attn")]
 pub mod paged_kv_cache;
 #[cfg(feature = "cuda")]
 mod q8_mmvq;

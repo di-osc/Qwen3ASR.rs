@@ -43,6 +43,8 @@ fn main() -> Result<()> {
             dtype,
             use_flash_attn,
             isq,
+            #[cfg(feature = "paged-attn")]
+            paged_cache: None,
         },
     )
     .context("failed to load model")?;

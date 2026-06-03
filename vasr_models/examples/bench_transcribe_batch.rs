@@ -14,6 +14,12 @@ fn main() -> Result<()> {
     let audio = args
         .next()
         .unwrap_or_else(|| "fixtures/audio/asr_en_16k.wav".to_string());
+    let batch_size = args
+        .next()
+        .as_deref()
+        .unwrap_or("1")
+        .parse::<usize>()
+        .context("failed to parse batch_size")?;
     let repeats = args
         .next()
         .as_deref()
@@ -33,6 +39,19 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or(DType::BF16);
     let isq = args.next();
+
+    if batch_size == 0 {
+        anyhow::bail!("batch_size must be greater than zero");
+    }
+    let audio_list: Vec<String> = audio
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if audio_list.is_empty() {
+        anyhow::bail!("audio list is empty");
+    }
 
     let device = default_gpu_device()?;
     let use_flash_attn = cfg!(feature = "flash-attn") && device.is_cuda();
@@ -59,51 +78,60 @@ fn main() -> Result<()> {
         language: Batch::one(Some("English".to_string())),
         return_timestamps: false,
         max_new_tokens,
-        max_batch_size: 1,
+        max_batch_size: batch_size,
         chunk_max_sec: None,
         bucket_by_length: false,
     };
 
     let audio_path = Path::new(&audio);
-    let mut totals = Vec::with_capacity(repeats);
     for run in 0..repeats {
+        let inputs: Vec<AudioInput<'_>> = if audio_list.len() == 1 {
+            (0..batch_size)
+                .map(|_| AudioInput::Path(audio_path))
+                .collect()
+        } else {
+            if audio_list.len() != batch_size {
+                anyhow::bail!(
+                    "audio list length {} must match batch_size {} when using multiple files",
+                    audio_list.len(),
+                    batch_size
+                );
+            }
+            audio_list
+                .iter()
+                .map(|path| AudioInput::Path(Path::new(path.as_str())))
+                .collect()
+        };
         let start = Instant::now();
-        let (out, timings) =
-            model.transcribe_timed(vec![AudioInput::Path(audio_path)], opts.clone())?;
-        let total = start.elapsed();
-        let text = out.first().map(|o| o.text.as_str()).unwrap_or("");
-        let decode_ms = timings.generation.decode_us as f64 / 1000.0;
-        let decode_tokens_per_s = if timings.generation.decode_us == 0 {
+        let (out, timings) = model.transcribe_timed(inputs, opts.clone())?;
+        let wall = start.elapsed();
+        let decode_s = timings.generation.decode_us as f64 / 1_000_000.0;
+        let batch_tokens_per_s = if decode_s == 0.0 {
             0.0
         } else {
-            timings.generation.tokens_generated as f64
-                / (timings.generation.decode_us as f64 / 1_000_000.0)
+            timings.generation.tokens_generated as f64 / decode_s
         };
+        let per_sequence_tokens_per_s = batch_tokens_per_s / batch_size as f64;
+        let first_text = out.first().map(|o| o.text.as_str()).unwrap_or("");
+        let texts: Vec<&str> = out.iter().map(|o| o.text.as_str()).collect();
         println!(
-            "run={} wall_ms={} timed_total_ms={} audio_encoder_ms={} prefill_ms={} decode_ms={} decode_token_tensor_ms={:.3} decode_embed_ms={:.3} decode_position_ms={:.3} decode_metadata_ms={:.3} decode_graph_replay_ms={:.3} decode_argmax_ms={:.3} prompt_len={} steps={} tokens={} decode_tokens_per_s={:.3} text={:?}",
+            "run={} batch_size={} wall_ms={:.3} timed_total_ms={:.3} audio_encoder_ms={:.3} prefill_ms={:.3} decode_ms={:.3} steps={} tokens={} batch_decode_tokens_per_s={:.3} per_sequence_decode_tokens_per_s={:.3} first_text={:?} texts={:?}",
             run + 1,
-            total.as_millis(),
-            timings.total_us / 1000,
-            timings.audio_encoder_us / 1000,
-            timings.generation.prefill_us / 1000,
-            decode_ms.round() as u64,
-            timings.generation.decode_token_tensor_us as f64 / 1000.0,
-            timings.generation.decode_embed_us as f64 / 1000.0,
-            timings.generation.decode_position_us as f64 / 1000.0,
-            timings.generation.decode_metadata_us as f64 / 1000.0,
-            timings.generation.decode_graph_replay_us as f64 / 1000.0,
-            timings.generation.decode_argmax_us as f64 / 1000.0,
-            timings.generation.prompt_len,
+            batch_size,
+            wall.as_secs_f64() * 1000.0,
+            timings.total_us as f64 / 1000.0,
+            timings.audio_encoder_us as f64 / 1000.0,
+            timings.generation.prefill_us as f64 / 1000.0,
+            timings.generation.decode_us as f64 / 1000.0,
             timings.generation.steps,
             timings.generation.tokens_generated,
-            decode_tokens_per_s,
-            text
+            batch_tokens_per_s,
+            per_sequence_tokens_per_s,
+            first_text,
+            texts
         );
-        totals.push(total.as_secs_f64());
     }
 
-    let avg = totals.iter().sum::<f64>() / totals.len().max(1) as f64;
-    println!("avg_wall_ms={:.3}", avg * 1000.0);
     Ok(())
 }
 
@@ -129,6 +157,6 @@ fn default_gpu_device() -> Result<Device> {
 
     #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     {
-        anyhow::bail!("bench_transcribe requires a GPU build; enable `cuda` or `metal`");
+        anyhow::bail!("bench_transcribe_batch requires a GPU build; enable `cuda` or `metal`");
     }
 }

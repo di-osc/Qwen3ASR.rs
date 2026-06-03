@@ -337,7 +337,7 @@ impl Qwen3ForcedAligner {
             bail!("tokenization produced empty input_ids");
         }
 
-        // Left-pad input_ids to the longest sequence (Qwen3-ASR uses left padding).
+        // Right-pad input_ids to match the shared ASR prompt batching path.
         let pad_id = self.processor.tokenizer.token_to_id("<|endoftext|>")?;
         let mut padded_ids: Vec<Vec<u32>> = Vec::with_capacity(audio.len());
         let mut attention_mask: Vec<Vec<u32>> = Vec::with_capacity(audio.len());
@@ -353,13 +353,13 @@ impl Qwen3ForcedAligner {
             let pad = max_tokens - len;
 
             let mut row: Vec<u32> = Vec::with_capacity(max_tokens);
-            row.extend(std::iter::repeat_n(pad_id, pad));
             row.extend(ids);
+            row.extend(std::iter::repeat_n(pad_id, pad));
             padded_ids.push(row);
 
             let mut attn: Vec<u32> = Vec::with_capacity(max_tokens);
-            attn.extend(std::iter::repeat_n(0u32, pad));
             attn.extend(std::iter::repeat_n(1u32, len));
+            attn.extend(std::iter::repeat_n(0u32, pad));
             attention_mask.push(attn);
         }
 
@@ -516,7 +516,7 @@ impl Qwen3ForcedAligner {
             bail!("tokenization produced empty input_ids");
         }
 
-        // Left-pad input_ids to the longest sequence (Qwen3-ASR uses left padding).
+        // Right-pad input_ids to match the shared ASR prompt batching path.
         let pad_id = self.processor.tokenizer.token_to_id("<|endoftext|>")?;
         let mut padded_ids: Vec<Vec<u32>> = Vec::with_capacity(audio.len());
         let mut attention_mask: Vec<Vec<u32>> = Vec::with_capacity(audio.len());
@@ -532,13 +532,13 @@ impl Qwen3ForcedAligner {
             let pad = max_tokens - len;
 
             let mut row: Vec<u32> = Vec::with_capacity(max_tokens);
-            row.extend(std::iter::repeat_n(pad_id, pad));
             row.extend(ids);
+            row.extend(std::iter::repeat_n(pad_id, pad));
             padded_ids.push(row);
 
             let mut attn: Vec<u32> = Vec::with_capacity(max_tokens);
-            attn.extend(std::iter::repeat_n(0u32, pad));
             attn.extend(std::iter::repeat_n(1u32, len));
+            attn.extend(std::iter::repeat_n(0u32, pad));
             attention_mask.push(attn);
         }
 
