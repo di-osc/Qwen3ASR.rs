@@ -1211,6 +1211,8 @@ fn greedy_generate_paged_batch(
         max_new_tokens,
         device,
     )?;
+    let decode_position_ids =
+        position_ids_for_decode_steps_batch(prompt_lens.as_slice(), max_new_tokens, device)?;
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); batch];
     let mut finished: Vec<bool> = next_ids
         .iter()
@@ -1269,7 +1271,10 @@ fn greedy_generate_paged_batch(
 
         #[cfg(feature = "timing")]
         let start_position = std::time::Instant::now();
-        let position_ids_new = position_ids_for_step(prompt_lens.as_slice(), step, device)?;
+        let position_ids_new = decode_position_ids
+            .get(step)
+            .ok_or_else(|| anyhow::anyhow!("missing batch decode position ids for step {step}"))?
+            .clone();
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
             t.decode_position_us = t
@@ -1537,6 +1542,16 @@ fn position_ids_for_decode_steps(
 ) -> Result<Vec<Tensor>> {
     (0..max_steps)
         .map(|step| position_ids_for_step(&[prompt_len], step, device))
+        .collect()
+}
+
+fn position_ids_for_decode_steps_batch(
+    prompt_lens: &[i64],
+    max_steps: usize,
+    device: &Device,
+) -> Result<Vec<Tensor>> {
+    (0..max_steps)
+        .map(|step| position_ids_for_step(prompt_lens, step, device))
         .collect()
 }
 

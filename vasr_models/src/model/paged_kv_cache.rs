@@ -864,16 +864,9 @@ impl PagedKvCache {
 
         let all_slots = Tensor::from_vec(all_slots, (steps, batch), device)?;
         let all_contexts = Tensor::from_vec(all_contexts, (steps, batch), device)?;
-        let query_lens = vec![1usize; batch];
 
         (0..steps)
             .map(|step| {
-                let kv_lens = prompt_lens
-                    .iter()
-                    .map(|&prompt_len| prompt_len + step + 1)
-                    .collect::<Vec<_>>();
-                let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
-                    build_varlen_metadata(Some(query_lens.clone()), Some(kv_lens.clone()), device)?;
                 Ok(PagedInputMetadata {
                     slot_mapping: all_slots.narrow(0, step, 1)?.flatten_all()?,
                     block_tables: block_tables_tensor.clone(),
@@ -882,12 +875,12 @@ impl PagedKvCache {
                     token_attention_mask: None,
                     prefill_attention_mask: None,
                     prefill_causal_only: false,
-                    query_lens: Some(query_lens.clone()),
-                    kv_lens: Some(kv_lens),
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    max_query_len,
-                    max_kv_len,
+                    query_lens: None,
+                    kv_lens: None,
+                    cu_seqlens_q: None,
+                    cu_seqlens_kv: None,
+                    max_query_len: None,
+                    max_kv_len: None,
                 })
             })
             .collect()
@@ -1159,8 +1152,8 @@ mod tests {
                 expected.context_lens.to_vec1::<u32>()?
             );
             assert_eq!(actual.max_context_len, expected.max_context_len);
-            assert_eq!(actual.query_lens, expected.query_lens);
-            assert_eq!(actual.kv_lens, expected.kv_lens);
+            assert!(actual.cu_seqlens_q.is_none());
+            assert!(actual.cu_seqlens_kv.is_none());
         }
 
         Ok(())

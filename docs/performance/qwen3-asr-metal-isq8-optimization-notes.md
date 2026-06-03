@@ -1344,3 +1344,85 @@ Takeaways:
 1. Prototype paged decode gather+SDPA fallback for batch>1 single-token steps.
 2. Metal command-buffer pipelining to overlap forward + argmax sync on paged batch.
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 10: Paged Batch Decode Hygiene + Gather SDPA Trial (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed (shipped)
+
+#### 1. Slim batch decode metadata
+
+Files:
+
+- `vasr_models/src/model/paged_kv_cache.rs`
+
+Behavior:
+
+- `decode_metadata_for_batch_steps` no longer builds per-step `cu_seqlens_*`,
+  `query_lens`, or `kv_lens` for single-token decode steps.
+- Updated batch metadata unit test accordingly.
+
+Why:
+
+- Same rationale as Pass 8 single-seq slim metadata: decode uses
+  `paged_attention`, not varlen flash helpers.
+
+#### 2. Precomputed batch decode position ids
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- `greedy_generate_paged_batch` precomputes all mRoPE `position_ids` before the
+  decode loop via `position_ids_for_decode_steps_batch`.
+
+Why:
+
+- Removes per-step position tensor rebuild on the batch paged path.
+
+### What Was Tried and Rejected
+
+#### Metal batch gather+SDPA decode (not shipped)
+
+Prototype replaced `paged_attention` with per-layer `gather_kv_cache` +
+`unpack_gathered_kv_for_attention` + Metal SDPA for `batch>1, seq_len==1`.
+
+Observed effect on batch=2 mixed fixture:
+
+| Path | `batch_decode_tokens_per_s` |
+| --- | ---: |
+| gather+SDPA (prototype) | `~35` |
+| `paged_attention` (kept) | `~218` |
+
+Conclusion:
+
+- Per-layer full KV gather on every decode step is far more expensive than the
+  block-table `paged_attention` kernel at head_dim=128. mistral.rs uses gather
+  decode mainly for oversized heads, not Qwen3-ASR 0.6B on Metal.
+
+### Measured Results (shipped changes)
+
+Mixed batch=2 (`asr_en_16k.wav` + `audio (12).wav`, 3 runs):
+
+| Run | `batch_decode_tokens_per_s` | Notes |
+| --- | ---: | --- |
+| 1 | `220.3` | no regression vs Pass 9 (~216) |
+| 2 | `219.1` | stable transcription |
+
+Single-seq default (Pass 9 eager routing): `~200 tok/s` unchanged.
+
+### Next Steps (Metal-first)
+
+1. Metal command-buffer pipelining on paged batch decode (overlap sync).
+2. Investigate paged batch decode forward vs 2× single eager on mixed workloads.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
