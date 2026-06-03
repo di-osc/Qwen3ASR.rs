@@ -1426,3 +1426,75 @@ Single-seq default (Pass 9 eager routing): `~200 tok/s` unchanged.
 1. Metal command-buffer pipelining on paged batch decode (overlap sync).
 2. Investigate paged batch decode forward vs 2× single eager on mixed workloads.
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 11: Metal Batch Eager Routing + Padded Prefill Fix (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+### What Changed
+
+#### 1. Extend Metal eager routing to batch>1
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- Renamed routing helper to `use_paged_attn_on_device`; on Metal, paged-attn
+  (single or batch) is opt-in via `VASR_FORCE_PAGED_ATTN=1` only.
+- CUDA keeps paged-attn as default when runtime is available.
+
+Why:
+
+- Pass 8–10 showed paged single-token decode loses to eager dense KV + Metal SDPA;
+  batch=2 paged decode was ~109 tok/s per sequence vs ~200 for batch=1 eager.
+
+#### 2. Fix eager batch prefill on left-padded mixed batches
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- Eager batch prefill now uses `gather_last_logits_for_prompt_lens` instead of
+  always indexing `seq_len - 1` (which broke the first sequence on padded batch).
+
+Why:
+
+- Mixed-length ASR batches are left-padded; the last valid prompt token is per-row,
+  not at the padded width.
+
+#### 3. Precompute eager batch decode position ids
+
+Behavior:
+
+- Eager batch decode loop reuses precomputed mRoPE `position_ids` (same pattern as
+  Pass 10 paged batch).
+
+### Measured Results (this pass)
+
+Mixed batch=2 (`asr_en_16k.wav` + `audio (12).wav`):
+
+| Mode | `batch_decode_tokens_per_s` | `per_sequence_decode_tokens_per_s` | Notes |
+| --- | ---: | ---: | --- |
+| **Default (Metal eager batch)** | `~248` | `~124` | correct text both sequences |
+| `VASR_FORCE_PAGED_ATTN=1` | `~219` | `~110` | prior paged batch path |
+
+Improvement: **+~29 batch tok/s (~13%)**, **+~15 tok/s per sequence (~14%)**.
+
+End-to-end wall on batch=2: **~762 ms** (eager) vs **~857 ms** (paged).
+
+### Next Steps (Metal-first)
+
+1. Profile eager batch prefill vs paged prefill on longer mixed batches.
+2. Metal command-buffer pipelining where paged-attn remains required (CUDA / forced).
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

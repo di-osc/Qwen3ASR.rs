@@ -33,7 +33,7 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
 }
 
 #[cfg(feature = "paged-attn")]
-fn use_paged_single_sequence_decode(device: &Device) -> bool {
+fn use_paged_attn_on_device(device: &Device) -> bool {
     if std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some() {
         return false;
     }
@@ -503,10 +503,10 @@ fn greedy_generate_cached_batch_impl(
     }
 
     #[cfg(feature = "paged-attn")]
-    let use_paged_single = use_paged_single_sequence_decode(device);
+    let use_paged_attn = use_paged_attn_on_device(device);
 
     #[cfg(all(feature = "paged-attn", feature = "timing"))]
-    if batch == 1 && use_paged_single && attention_masks_are_dense(attention_mask) {
+    if batch == 1 && use_paged_attn && attention_masks_are_dense(attention_mask) {
         let out = greedy_generate_paged(
             thinker,
             device,
@@ -520,11 +520,7 @@ fn greedy_generate_cached_batch_impl(
         return Ok(vec![out]);
     }
     #[cfg(all(feature = "paged-attn", feature = "timing"))]
-    if batch > 1
-        && !std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some()
-        && (device.is_metal() || device.is_cuda())
-        && opts.paged_runtime.is_some()
-    {
+    if batch > 1 && use_paged_attn && opts.paged_runtime.is_some() {
         return greedy_generate_paged_batch(
             thinker,
             device,
@@ -538,7 +534,7 @@ fn greedy_generate_cached_batch_impl(
         );
     }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
-    if batch == 1 && use_paged_single && attention_masks_are_dense(attention_mask) {
+    if batch == 1 && use_paged_attn && attention_masks_are_dense(attention_mask) {
         let out = greedy_generate_paged(
             thinker,
             device,
@@ -552,11 +548,7 @@ fn greedy_generate_cached_batch_impl(
         return Ok(vec![out]);
     }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
-    if batch > 1
-        && !std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some()
-        && (device.is_metal() || device.is_cuda())
-        && opts.paged_runtime.is_some()
-    {
+    if batch > 1 && use_paged_attn && opts.paged_runtime.is_some() {
         return greedy_generate_paged_batch(
             thinker,
             device,
@@ -632,7 +624,8 @@ fn greedy_generate_cached_batch_impl(
         )?
     };
 
-    let last_logits = logits.narrow(1, seq_len.saturating_sub(1), 1)?.squeeze(1)?;
+    let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
+    let last_logits = gather_last_logits_for_prompt_lens(&logits, prompt_lens.as_slice())?;
     let mut next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
@@ -647,7 +640,8 @@ fn greedy_generate_cached_batch_impl(
         .map(|id| opts.eos_token_ids.contains(id))
         .collect();
     let dense_attention = attention_masks_are_dense(attention_mask);
-    let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
+    let decode_position_ids =
+        position_ids_for_decode_steps_batch(prompt_lens.as_slice(), opts.max_new_tokens, device)?;
     let ones_col = if dense_attention {
         None
     } else {
@@ -689,7 +683,12 @@ fn greedy_generate_cached_batch_impl(
         let input_ids_new = Tensor::from_vec(tokens_in, (batch, 1usize), device)?;
         let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
 
-        let position_ids_new = position_ids_for_step(prompt_lens.as_slice(), step, device)?;
+        let position_ids_new = decode_position_ids
+            .get(step)
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing eager batch decode position ids for step {step}")
+            })?
+            .clone();
 
         let logits_new = {
             let _linear_decode_guard = set_linear_is_prefill(false);
@@ -1483,7 +1482,6 @@ fn prompt_lens_from_attention_masks(attention_mask: &[&[u32]], seq_len: usize) -
     Ok(out)
 }
 
-#[cfg(feature = "paged-attn")]
 fn gather_last_logits_for_prompt_lens(logits: &Tensor, prompt_lens: &[i64]) -> Result<Tensor> {
     let (batch, seq_len, vocab) = logits.dims3()?;
     if prompt_lens.len() != batch {
