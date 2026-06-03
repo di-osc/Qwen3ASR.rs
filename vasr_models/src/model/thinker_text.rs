@@ -36,19 +36,36 @@ use candle_core::{DType, Device};
 use candle_flash_attn::{flash_attn, flash_attn_varlen};
 
 #[cfg(feature = "paged-attn")]
+fn cache_input_is_packed(tensor: &Tensor) -> Result<bool> {
+    if tensor.dims().len() != 3 {
+        return Ok(false);
+    }
+    let (_, heads, head_size) = tensor.dims3()?;
+    let stride = tensor.stride();
+    Ok(stride[2] == 1 && stride[1] == head_size && stride[0] == heads * head_size)
+}
+
+#[cfg(feature = "paged-attn")]
 fn maybe_contiguous_for_accelerator(x: Tensor) -> Result<Tensor> {
     if x.device().is_metal() || x.device().is_cuda() {
-        x.contiguous()
+        if cache_input_is_packed(&x)? {
+            Ok(x)
+        } else {
+            x.contiguous()
+        }
     } else {
         Ok(x)
     }
 }
 
 fn initial_hidden_states_for_paged_decode(inputs_embeds: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda-graph")]
-    {
-        let seq_len = inputs_embeds.dim(1)?;
-        if inputs_embeds.device().is_cuda() && seq_len == 1 {
+    let seq_len = inputs_embeds.dim(1)?;
+    if seq_len == 1 {
+        if inputs_embeds.device().is_metal() {
+            return inputs_embeds.affine(1.0, 0.0);
+        }
+        #[cfg(feature = "cuda-graph")]
+        if inputs_embeds.device().is_cuda() {
             return inputs_embeds.affine(1.0, 0.0);
         }
     }
@@ -1347,7 +1364,7 @@ impl ThinkerTextModel {
         let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
         let position_embeddings = (&cos, &sin);
 
-        let mut hidden_states = inputs_embeds.clone();
+        let mut hidden_states = initial_hidden_states_for_paged_decode(inputs_embeds)?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let (key_cache, value_cache) = paged_cache.key_value_cache(layer_idx)?;
             hidden_states = layer.forward_with_paged_cache(
@@ -1450,6 +1467,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "paged-attn")]
     #[test]
     fn test_unpack_gathered_kv_for_attention_equal_length_fast_path() -> anyhow::Result<()> {
         let device = candle_core::Device::Cpu;

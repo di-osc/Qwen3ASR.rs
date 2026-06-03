@@ -1191,7 +1191,7 @@ Takeaways:
 2. Explore Metal command-buffer batching / fewer sync points across decode steps.
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
 
-## 2026-06-04 Pass 7: Metal Argmax Scratch + Decode Timing Split (Metal)
+## 2026-06-04 Pass 8: Paged Decode Forward Hygiene (Metal)
 
 Date: 2026-06-04
 
@@ -1204,67 +1204,80 @@ Platform:
 
 ### What Changed
 
-#### 1. Reusable Metal argmax workspace
+#### 1. mistral-style packed-layout contiguous skip
 
 Files:
 
-- `vasr_models/src/model/metal_argmax.rs`
-- `vasr_models/src/model/generation.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Behavior:
 
-- Added `MetalArgmaxScratch` to reuse topk stage1/stage2 Metal buffers across decode
-  steps instead of allocating five buffers on every argmax call.
-- `greedy_generate_paged` keeps one scratch for prefill + all decode steps.
-- Skip redundant `contiguous()` when logits are already contiguous.
+- Port `cache_input_is_packed` from mistral.rs; only call `contiguous()` on
+  paged K/V/Q tensors when strides are not already head-major packed.
 
 Why:
 
-- Each decode step previously allocated ~75-block topk workspace from scratch.
-- Confirms prior note: argmax kernel choice matters less than sync behavior.
+- Decode path was unconditionally contiguous-ing up to 96 tensors/request
+  (32 layers × 3).
 
-#### 2. Split paged decode timing (`decode_forward_us`)
+#### 2. Slim single-sequence decode metadata
+
+Files:
+
+- `vasr_models/src/model/paged_kv_cache.rs`
+
+Behavior:
+
+- `decode_metadata_for_steps` no longer builds per-step `cu_seqlens_*`,
+  `query_lens`, or `kv_lens` (unused on `seq_len==1` paged-attention path).
+- Added `test_decode_metadata_for_steps_matches_per_step_builder`.
+
+Why:
+
+- Removed ~2 device tensor allocations per decode step that only served prefill
+  varlen helpers.
+
+#### 3. Precomputed decode position ids + Metal hidden-state view
 
 Files:
 
 - `vasr_models/src/model/generation.rs`
-- `vasr_models/examples/bench_transcribe.rs`
-- `vasr_models/src/inference/transcribe.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Behavior:
 
-- Time paged decode forward separately from argmax readback.
-- Bench output adds `decode_forward_ms` alongside `decode_argmax_ms`.
+- Precompute all mRoPE `position_ids` before the paged decode loop.
+- Use `inputs_embeds.affine(1,0)` view on Metal decode (`seq_len==1`) instead
+  of cloning hidden states into the layer stack.
 
 Why:
 
-- Makes it explicit that most `decode_argmax_ms` is GPU pipeline drain at the
-  first host readback, not topk compute or buffer allocation.
+- Removes per-step position tensor rebuild; avoids an extra hidden-state buffer
+  copy on Metal decode.
 
 ### Measured Results (this pass)
 
-Single-sequence paged-attn (`fixtures/audio/asr_en_16k.wav`, 3 hot runs):
+Single-sequence paged-attn (`fixtures/audio/asr_en_16k.wav`, 5 runs):
 
 | Run | `decode_tokens_per_s` | `decode_forward_ms` | `decode_argmax_ms` | Notes |
 | --- | ---: | ---: | ---: | --- |
-| 2 | `172.3` | `169.4` | `84.2` | `prompt_len=214`, `steps=44` |
-| 3 | `169.1` | `173.0` | `85.2` | stable transcription |
+| 2 | `169.7` | `181.8` | `76.1` | `decode_position_ms=0` (precomputed) |
+| 4 | `169.9` | `180.2` | `77.5` | stable transcription |
 
-Reference (Pass 6 hot band on a faster session): `~202-204 tok/s`.
-
-Control (`VASR_DISABLE_METAL_ARGMAX=1`, candle argmax): `~170 tok/s` — custom
-Metal topk remains faster than candle fallback.
+Same session eager fallback: `~198-200 tok/s` (down from Pass 6 hot `~232`;
+Metal run-to-run variance).
 
 Takeaways:
 
-- **`decode_forward_ms + decode_argmax_ms ≈ decode_ms`** on paged path
-  (~171 ms + ~85 ms ≈ 256 ms for 44 tokens).
-- **`decode_argmax_ms` is dominated by GPU synchronization**, not buffer alloc;
-  scratch reuse is hygiene but does not materially move tok/s alone.
-- Session-to-session Metal variance remains large (`~170-204 tok/s` observed).
+- **Paged decode per-step host overhead reduced** (position rebuild + redundant
+  metadata tensors + unconditional contiguous).
+- **Paged vs eager gap on Metal batch=1 remains ~15-30%** — root cause is
+  `reshape_and_cache` + `paged_attention` vs eager dense KV + Metal SDPA, not
+  metadata/position overhead alone.
+- **`decode_argmax_ms` still ~76-79 ms/44 steps** — sync-dominated (Pass 7).
 
 ### Next Steps (Metal-first)
 
-1. Reduce paged decode forward cost (true gap vs eager ~232 tok/s on same fixture).
-2. Explore Metal command-buffer batching / fewer sync points across decode steps.
-3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+1. Evaluate Metal batch=1 routing to eager KV path for max single-stream throughput.
+2. Prototype paged decode gather+SDPA fallback (mistral.rs large-head path).
+3. Metal command-buffer pipelining to overlap forward + argmax sync.

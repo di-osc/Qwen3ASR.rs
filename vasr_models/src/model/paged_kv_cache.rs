@@ -778,24 +778,12 @@ impl PagedKvCache {
                     token_attention_mask: None,
                     prefill_attention_mask: None,
                     prefill_causal_only: false,
-                    query_lens: Some(vec![1]),
-                    kv_lens: Some(vec![prompt_len + step + 1]),
-                    cu_seqlens_q: Some(Tensor::from_vec(vec![0u32, 1u32], (2,), device)?),
-                    cu_seqlens_kv: Some(Tensor::from_vec(
-                        vec![
-                            0u32,
-                            u32::try_from(prompt_len + step + 1).map_err(|_| {
-                                candle_core::Error::Msg(format!(
-                                    "context length overflows u32: {}",
-                                    prompt_len + step + 1
-                                ))
-                            })?,
-                        ],
-                        (2,),
-                        device,
-                    )?),
-                    max_query_len: Some(1),
-                    max_kv_len: Some(prompt_len + step + 1),
+                    query_lens: None,
+                    kv_lens: None,
+                    cu_seqlens_q: None,
+                    cu_seqlens_kv: None,
+                    max_query_len: None,
+                    max_kv_len: None,
                 })
             })
             .collect()
@@ -1100,6 +1088,37 @@ mod tests {
                 .to_vec1::<u32>()?,
             vec![0, 4, 9]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_metadata_for_steps_matches_per_step_builder() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let cache = PagedKvCache::new_pool(1, 2, 8, 4, 64, candle_core::DType::F32, &device)?;
+        let prompt_len = 10usize;
+        let steps = 4usize;
+
+        let precomputed = cache.decode_metadata_for_steps(prompt_len, steps, &device)?;
+        for step in 0..steps {
+            let start = prompt_len + step;
+            let context_len = prompt_len + step + 1;
+            let expected = cache.input_metadata_for_range(start, 1, context_len, &device)?;
+            let actual = precomputed
+                .get(step)
+                .ok_or_else(|| anyhow::anyhow!("missing precomputed metadata for step {step}"))?;
+            assert_eq!(
+                actual.slot_mapping.to_vec1::<i64>()?,
+                expected.slot_mapping.to_vec1::<i64>()?
+            );
+            assert_eq!(
+                actual.context_lens.to_vec1::<u32>()?,
+                expected.context_lens.to_vec1::<u32>()?
+            );
+            assert_eq!(actual.max_context_len, expected.max_context_len);
+            assert!(actual.cu_seqlens_q.is_none());
+            assert!(actual.cu_seqlens_kv.is_none());
+        }
+
         Ok(())
     }
 

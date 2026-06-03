@@ -838,6 +838,7 @@ fn greedy_generate_paged(
     let prompt_len = i64::try_from(seq_len)
         .map_err(|_| anyhow::anyhow!("prompt length overflows i64: {seq_len}"))?;
     let decode_metadata = paged_cache.decode_metadata_for_steps(seq_len, max_new_tokens, device)?;
+    let decode_position_ids = position_ids_for_decode_steps(prompt_len, max_new_tokens, device)?;
     let mut generated = Vec::new();
 
     #[cfg(feature = "timing")]
@@ -896,7 +897,10 @@ fn greedy_generate_paged(
 
         #[cfg(feature = "timing")]
         let start_position = std::time::Instant::now();
-        let position_ids_new = position_ids_for_step(&[prompt_len], step, device)?;
+        let position_ids_new = decode_position_ids
+            .get(step)
+            .ok_or_else(|| anyhow::anyhow!("missing decode position ids for step {step}"))?
+            .clone();
         #[cfg(feature = "timing")]
         if let Some(t) = timings.as_mut() {
             t.decode_position_us = t
@@ -1521,6 +1525,16 @@ fn position_ids_for_step(prompt_lens: &[i64], step: usize, device: &Device) -> R
 
     let pos_t = Tensor::from_vec(pos, (batch, 1usize), device)?;
     Ok(pos_t.unsqueeze(0)?.broadcast_as((3usize, batch, 1usize))?)
+}
+
+fn position_ids_for_decode_steps(
+    prompt_len: i64,
+    max_steps: usize,
+    device: &Device,
+) -> Result<Vec<Tensor>> {
+    (0..max_steps)
+        .map(|step| position_ids_for_step(&[prompt_len], step, device))
+        .collect()
 }
 
 #[cfg(test)]
