@@ -22,6 +22,23 @@ pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOpt
 pub use model::weights::LoadOptions;
 pub use processor::AsrProcessor;
 
+pub mod qwen3_asr {
+    #[cfg(feature = "timing")]
+    pub use crate::TranscribeTimings;
+    pub use crate::audio;
+    pub use crate::config;
+    pub use crate::error;
+    #[cfg(feature = "forced-aligner")]
+    pub use crate::forced_aligner;
+    pub use crate::inference;
+    pub use crate::model;
+    pub use crate::processor;
+    pub use crate::{
+        AsrProcessor, AsrStream, AsrTranscription, AudioInput, Batch, LoadOptions, Qwen3Asr,
+        StreamOptions, TranscribeOptions,
+    };
+}
+
 #[derive(Debug)]
 pub struct Qwen3Asr {
     device: Arc<Device>,

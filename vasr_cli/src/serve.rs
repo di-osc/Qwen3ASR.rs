@@ -7,8 +7,8 @@ use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
 use clap::Args;
 use vasr_audio::AudioLoader;
-use vasr_models_qwen3_asr::LoadOptions;
-use vasr_models_qwen3_asr::model::isq_linear::resolve_isq_display;
+use vasr_models::qwen3_asr::LoadOptions;
+use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
 use vasr_runtime::{
     AsrModel, AsrOptions, OfflinePipeline, Qwen3AsrModel, RealtimePipeline, SileroVadModel,
     VadModel, VadOptions,

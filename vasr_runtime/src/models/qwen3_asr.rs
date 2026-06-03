@@ -4,7 +4,7 @@ use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSegment, TimeRange,
     Timeline, Token, Waveform,
 };
-use vasr_models_qwen3_asr::{
+use vasr_models::qwen3_asr::{
     AudioInput, Batch, LoadOptions, Qwen3Asr, StreamOptions as RuntimeStreamOptions,
     TranscribeOptions as RuntimeTranscribeOptions,
 };
@@ -93,7 +93,7 @@ impl AsrModel for Qwen3AsrModel {
 }
 
 struct Qwen3AsrStreamModel {
-    inner: Option<vasr_models_qwen3_asr::AsrStream>,
+    inner: Option<vasr_models::qwen3_asr::AsrStream>,
 }
 
 impl StreamingAsrModel for Qwen3AsrStreamModel {

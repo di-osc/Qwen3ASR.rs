@@ -90,7 +90,7 @@ Required tests:
 The phase is complete when:
 
 - `cargo test --workspace` passes.
-- `cargo test -p vasr-models-qwen3-asr --features metal-paged-attn` passes on Metal.
+- `cargo test -p vasr-models --features metal-paged-attn` passes on Metal.
 - `maturin develop --features metal,metal-paged-attn` builds.
 - The fixture `fixtures/audio/asr_en_16k.wav` transcribes successfully with the same text as the fallback path.
 - Warm Metal inference is measurably faster than the fallback on the same fixture.

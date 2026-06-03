@@ -13,7 +13,7 @@ protocol DTOs, and HTTP/WebSocket service entry points.
 - `vasr-runtime`: model capability traits, Qwen3-ASR ASR model wrapper, Silero ONNX VAD, offline/realtime pipelines.
 - `vasr-protocol`: fasr-compatible transcribe and realtime DTOs.
 - `vasr-server`: axum routes for `/transcribe`, `/inference`, `/v1/realtime`, and `/api-ws/v1/realtime`.
-- `vasr-models-qwen3-asr`: Candle Qwen3-ASR model implementation.
+- `vasr-models`: Candle Qwen3-ASR model implementation.
 
 ## Development
 

@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device};
-use vasr_models_qwen3_asr::model::isq_linear::{isq_quantize_time_us, reset_isq_quantize_time};
-use vasr_models_qwen3_asr::{AudioInput, Batch, LoadOptions, Qwen3Asr, TranscribeOptions};
+use vasr_models::qwen3_asr::model::isq_linear::{isq_quantize_time_us, reset_isq_quantize_time};
+use vasr_models::qwen3_asr::{AudioInput, Batch, LoadOptions, Qwen3Asr, TranscribeOptions};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

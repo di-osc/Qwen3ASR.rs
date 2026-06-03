@@ -19,7 +19,7 @@ Primary target:
 - vASR command:
 
 ```bash
-cargo run --release -p vasr-models-qwen3-asr \
+cargo run --release -p vasr-models \
   --example bench_transcribe \
   --features 'metal-paged-attn timing audio-loading' \
   -- /Users/wangmengdi/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-0.6B/snapshots/5eb144179a02acc5e5ba31e748d22b0cf3e303b0 \
@@ -87,7 +87,7 @@ Interpretation:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/thinker_text.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Change:
 
@@ -111,8 +111,8 @@ Why it helps:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/rope/mrope.rs`
-- `vasr_models_qwen3_asr/src/model/thinker_text.rs`
+- `vasr_models/src/model/rope/mrope.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Change:
 
@@ -138,8 +138,8 @@ Why it helps:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/paged_kv_cache.rs`
-- `vasr_models_qwen3_asr/src/model/generation.rs`
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/generation.rs`
 
 Change:
 
@@ -161,8 +161,8 @@ Why it helps:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/isq_linear.rs`
-- `vasr_models_qwen3_asr/src/model/thinker_text.rs`
+- `vasr_models/src/model/isq_linear.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Change:
 
@@ -183,7 +183,7 @@ Why it helps:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/isq_linear.rs`
+- `vasr_models/src/model/isq_linear.rs`
 
 Change:
 
@@ -200,9 +200,9 @@ Observed effect:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/generation.rs`
-- `vasr_models_qwen3_asr/src/model/paged_kv_cache.rs`
-- `vasr_models_qwen3_asr/src/model/thinker_text.rs`
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/src/model/paged_kv_cache.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Change:
 
@@ -223,7 +223,7 @@ Why it helps:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/kv_cache.rs`
+- `vasr_models/src/model/kv_cache.rs`
 
 Change:
 
@@ -247,7 +247,7 @@ Why it helps:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/metal_argmax.rs`
+- `vasr_models/src/model/metal_argmax.rs`
 
 Change:
 
@@ -269,7 +269,7 @@ Conclusion:
 Command:
 
 ```bash
-VASR_DISABLE_PAGED_ATTN=1 cargo run --release -p vasr-models-qwen3-asr \
+VASR_DISABLE_PAGED_ATTN=1 cargo run --release -p vasr-models \
   --example bench_transcribe \
   --features 'metal-paged-attn timing audio-loading' \
   -- MODEL_DIR fixtures/audio/asr_en_16k.wav 5 64 bf16 auto8
@@ -291,8 +291,8 @@ Conclusion:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/attention.rs`
-- `vasr_models_qwen3_asr/src/model/thinker_text.rs`
+- `vasr_models/src/model/attention.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Change:
 
@@ -317,8 +317,8 @@ Conclusion:
 
 Files:
 
-- `vasr_models_qwen3_asr/src/model/attention.rs`
-- `vasr_models_qwen3_asr/src/model/thinker_text.rs`
+- `vasr_models/src/model/attention.rs`
+- `vasr_models/src/model/thinker_text.rs`
 
 Change:
 
@@ -403,16 +403,16 @@ Commands used during this optimization pass:
 
 ```bash
 cargo fmt --all -- --check
-cargo check -p vasr-models-qwen3-asr --features metal-paged-attn
-cargo test -p vasr-models-qwen3-asr kv_cache --features metal-paged-attn
-cargo test -p vasr-models-qwen3-asr isq_linear --features metal-paged-attn
+cargo check -p vasr-models --features metal-paged-attn
+cargo test -p vasr-models kv_cache --features metal-paged-attn
+cargo test -p vasr-models isq_linear --features metal-paged-attn
 git diff --check
 ```
 
 For release decode speed:
 
 ```bash
-cargo run --release -p vasr-models-qwen3-asr \
+cargo run --release -p vasr-models \
   --example bench_transcribe \
   --features 'metal-paged-attn timing audio-loading' \
   -- MODEL_DIR fixtures/audio/asr_en_16k.wav 5 64 bf16 auto8
@@ -421,7 +421,7 @@ cargo run --release -p vasr-models-qwen3-asr \
 For non-paged fallback testing:
 
 ```bash
-VASR_DISABLE_PAGED_ATTN=1 cargo run --release -p vasr-models-qwen3-asr \
+VASR_DISABLE_PAGED_ATTN=1 cargo run --release -p vasr-models \
   --example bench_transcribe \
   --features 'metal-paged-attn timing audio-loading' \
   -- MODEL_DIR fixtures/audio/asr_en_16k.wav 5 64 bf16

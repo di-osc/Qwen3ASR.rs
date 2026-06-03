@@ -5087,7 +5087,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "vasr-data",
- "vasr-models-qwen3-asr",
+ "vasr-models",
 ]
 
 [[package]]
@@ -5103,7 +5103,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vasr-audio",
- "vasr-models-qwen3-asr",
+ "vasr-models",
  "vasr-runtime",
  "vasr-server",
 ]
@@ -5118,7 +5118,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vasr-models-qwen3-asr"
+name = "vasr-models"
 version = "0.1.0"
 dependencies = [
  "accelerate-src",
@@ -5173,7 +5173,7 @@ dependencies = [
  "ndarray",
  "ort",
  "vasr-data",
- "vasr-models-qwen3-asr",
+ "vasr-models",
 ]
 
 [[package]]

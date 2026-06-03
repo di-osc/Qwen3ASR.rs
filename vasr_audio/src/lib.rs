@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::path::Path;
 use vasr_data::{AudioSource, Waveform};
-use vasr_models_qwen3_asr::AudioInput as RuntimeAudioInput;
+use vasr_models::qwen3_asr::AudioInput as RuntimeAudioInput;
 
 #[derive(Debug, Clone)]
 pub struct AudioLoadOptions {
@@ -29,23 +29,23 @@ impl AudioLoader {
     pub fn load(&self, source: &AudioSource, _options: &AudioLoadOptions) -> Result<Waveform> {
         let samples = match source {
             AudioSource::Path(path) => {
-                vasr_models_qwen3_asr::audio::normalize::normalize_audio_input(
+                vasr_models::qwen3_asr::audio::normalize::normalize_audio_input(
                     &RuntimeAudioInput::Path(path),
                 )?
             }
             AudioSource::Url(url) => {
                 if let Some(path) = local_path_from_urlish(url) {
-                    vasr_models_qwen3_asr::audio::normalize::normalize_audio_input(
+                    vasr_models::qwen3_asr::audio::normalize::normalize_audio_input(
                         &RuntimeAudioInput::Path(path),
                     )?
                 } else {
-                    vasr_models_qwen3_asr::audio::normalize::normalize_audio_input(
+                    vasr_models::qwen3_asr::audio::normalize::normalize_audio_input(
                         &RuntimeAudioInput::Url(url),
                     )?
                 }
             }
             AudioSource::Base64(b64) => {
-                vasr_models_qwen3_asr::audio::normalize::normalize_audio_input(
+                vasr_models::qwen3_asr::audio::normalize::normalize_audio_input(
                     &RuntimeAudioInput::Base64(b64),
                 )?
             }

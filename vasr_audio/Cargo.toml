@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 vasr-data = { path = "../vasr_data" }
-vasr-models-qwen3-asr = { path = "../vasr_models_qwen3_asr", features = ["audio-loading"] }
+vasr-models = { path = "../vasr_models", features = ["audio-loading"] }
 
 [lints]
 workspace = true

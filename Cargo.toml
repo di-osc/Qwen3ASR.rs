@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "vasr_models_qwen3_asr",
+  "vasr_models",
   "vasr_audio",
   "vasr_cli",
   "vasr_data",
