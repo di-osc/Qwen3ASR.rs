@@ -111,6 +111,35 @@ fn unpack_gathered_kv_for_attention(
     Tensor::cat(&unpacked, 0)
 }
 
+#[cfg(feature = "paged-attn")]
+fn paged_prefill_attention_mask(
+    input_metadata: &PagedInputMetadata,
+    kv_lens: &[usize],
+    batch: usize,
+    seq_len: usize,
+    dtype: candle_core::DType,
+    device: &candle_core::Device,
+) -> Result<attention::AttentionMask> {
+    let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+    if input_metadata.prefill_causal_only {
+        return Ok(attention::AttentionMask::None);
+    }
+    let mask = if let Some(mask) = input_metadata.prefill_attention_mask.as_ref() {
+        mask.clone()
+    } else {
+        attention::make_causal_mask(
+            input_metadata.token_attention_mask.as_ref(),
+            batch,
+            seq_len,
+            dtype,
+            device,
+        )?
+    };
+    Ok(attention::AttentionMask::Custom(attention::adjust_kv_mask(
+        &mask, max_kv,
+    )?))
+}
+
 #[cfg(feature = "flash-attn")]
 fn seqlens_from_attention_mask(mask: &Tensor, seq_len: usize) -> Result<Vec<usize>> {
     let (batch, t2) = mask.dims2()?;
@@ -940,19 +969,14 @@ impl ThinkerTextAttention {
                 &cu_kv,
                 hidden_states.dtype(),
             )?;
-            let mask = if input_metadata.prefill_causal_only {
-                attention::AttentionMask::None
-            } else if let Some(mask) = input_metadata.prefill_attention_mask.as_ref() {
-                attention::AttentionMask::Custom(mask.clone())
-            } else {
-                attention::AttentionMask::Custom(attention::make_causal_mask(
-                    input_metadata.token_attention_mask.as_ref(),
-                    batch,
-                    seq_len,
-                    q.dtype(),
-                    q.device(),
-                )?)
-            };
+            let mask = paged_prefill_attention_mask(
+                input_metadata,
+                kv_lens.as_slice(),
+                batch,
+                seq_len,
+                q.dtype(),
+                q.device(),
+            )?;
             let flash_params = input_metadata.flash_params(seq_len > 1);
             let attn_output = if attention::supports_packed_varlen_sdpa(&q) {
                 let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;

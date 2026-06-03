@@ -716,6 +716,9 @@ impl PagedKvCache {
         let query_lens = Some(query_lens);
         let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
             build_varlen_metadata(query_lens.clone(), kv_lens.clone(), device)?;
+        let prefill_causal_only = query_lens
+            .as_ref()
+            .is_some_and(|lens| lens.iter().all(|&len| len == seq_len));
 
         Ok(PagedInputMetadata {
             slot_mapping: Tensor::from_vec(slots, (batch * seq_len,), device)?,
@@ -724,7 +727,7 @@ impl PagedKvCache {
             max_context_len,
             token_attention_mask: Some(Tensor::from_vec(attn_host, (batch, seq_len), device)?),
             prefill_attention_mask: None,
-            prefill_causal_only: true,
+            prefill_causal_only,
             query_lens,
             kv_lens,
             cu_seqlens_q,
@@ -1071,6 +1074,9 @@ mod tests {
         assert_eq!(meta.max_query_len, Some(5));
         assert_eq!(meta.max_kv_len, Some(5));
         assert_eq!(meta.max_context_len, 5);
+        if meta.prefill_causal_only {
+            anyhow::bail!("expected prefill_causal_only=false for padded attention masks");
+        }
         let flash = meta
             .flash_params(true)
             .ok_or_else(|| anyhow::anyhow!("missing flash params"))?;

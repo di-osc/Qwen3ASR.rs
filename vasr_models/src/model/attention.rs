@@ -307,6 +307,20 @@ pub fn run_attention(
     attn_weights.matmul(&v)
 }
 
+/// Narrow an attention mask to the trailing `kv_seq_len` key positions.
+///
+/// Mirrors mistral.rs `adjust_kv_mask` for gathered/unpacked paged prefill where
+/// K/V are padded to `max_kv` rather than the full prompt tensor width.
+pub fn adjust_kv_mask(mask: &Tensor, kv_seq_len: usize) -> Result<Tensor> {
+    let mask_dims = mask.dims();
+    match mask.rank() {
+        2 if mask_dims[1] > kv_seq_len => mask.narrow(1, mask_dims[1] - kv_seq_len, kv_seq_len),
+        3 if mask_dims[2] > kv_seq_len => mask.narrow(2, mask_dims[2] - kv_seq_len, kv_seq_len),
+        4 if mask_dims[3] > kv_seq_len => mask.narrow(3, mask_dims[3] - kv_seq_len, kv_seq_len),
+        _ => Ok(mask.clone()),
+    }
+}
+
 /// Try Candle's accelerator SDPA path before falling back to the manual
 /// repeat-kv + matmul implementation. This mirrors the default eager path used
 /// by mistral.rs on Metal for Qwen-family head dimensions.
@@ -459,6 +473,17 @@ mod tests {
             anyhow::bail!("decode-one no-padding mask should be all zeros: {values:?}");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_adjust_kv_mask_narrows_trailing_kv_dimension() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let mask = candle_core::Tensor::zeros((1usize, 1, 4, 6), candle_core::DType::F32, &device)?;
+        let adjusted = super::adjust_kv_mask(&mask, 4)?;
+        if adjusted.dims() != [1, 1, 4, 4] {
+            anyhow::bail!("unexpected adjusted mask dims: {:?}", adjusted.dims());
+        }
         Ok(())
     }
 }
