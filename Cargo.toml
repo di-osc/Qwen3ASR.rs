@@ -1,5 +1,13 @@
 [workspace]
-members = ["qwen3_asr_core", "qwen3_asr_py", "qwen3_asr_runtime"]
+members = [
+  "vasr_models_qwen3_asr",
+  "vasr_audio",
+  "vasr_cli",
+  "vasr_data",
+  "vasr_protocol",
+  "vasr_runtime",
+  "vasr_server",
+]
 resolver = "3"
 
 [workspace.package]

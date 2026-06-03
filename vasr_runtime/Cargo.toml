@@ -1,0 +1,28 @@
+[package]
+name = "vasr-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+ndarray = "0.17"
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
+vasr-models-qwen3-asr = { path = "../vasr_models_qwen3_asr" }
+vasr-data = { path = "../vasr_data" }
+
+[features]
+default = []
+accelerate = ["vasr-models-qwen3-asr/accelerate"]
+cuda = ["vasr-models-qwen3-asr/cuda"]
+cuda-graph = ["vasr-models-qwen3-asr/cuda-graph"]
+metal = ["vasr-models-qwen3-asr/metal"]
+metal-paged-attn = ["vasr-models-qwen3-asr/metal-paged-attn"]
+cuda-paged-attn = ["vasr-models-qwen3-asr/cuda-paged-attn"]
+audio-loading = ["vasr-models-qwen3-asr/audio-loading"]
+timing = ["vasr-models-qwen3-asr/timing"]
+
+[lints]
+workspace = true

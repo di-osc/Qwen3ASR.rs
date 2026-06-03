@@ -1,0 +1,116 @@
+[package]
+name = "vasr-models-qwen3-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3-ASR speech recognition model implementation for Candle"
+categories = ["science"]
+keywords = ["asr", "speech-recognition", "machine-learning", "qwen"]
+
+[dependencies]
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-flash-attn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
+mistralrs-paged-attn = { path = "/Users/wangmengdi/rust-projects/mistral.rs/mistralrs-paged-attn", optional = true }
+mistralrs-quant = { path = "/Users/wangmengdi/rust-projects/mistral.rs/mistralrs-quant", optional = true }
+# Keep in sync with Candle/cudarc constraints (mirrors qwen3-tts-rs).
+float8 = "0.7"
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+tokenizers = "0.21"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+safetensors = "0.7"
+bytemuck = { version = "1", features = ["derive"] }
+rustfft = "6"
+
+accelerate-src = { version = "0.3.2", optional = true }
+bindgen_cuda = { version = "0.1.5", optional = true }
+cudarc = { version = "0.19.0", optional = true }
+half = { version = "2.5.0", optional = true }
+intel-mkl-src = { version = "0.8.1", optional = true }
+
+# Audio loading and processing (feature-gated)
+symphonia = { version = "0.5", features = ["all-codecs", "all-formats"], optional = true }
+rubato = { version = "0.16", optional = true }
+base64 = { version = "0.22", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+lindera = { version = "2.2.0", optional = true }
+lindera-ipadic = { version = "2.2.0", optional = true }
+unicode-general-category = "1.1.0"
+unicode-normalization = "0.1"
+
+[features]
+default = []
+
+accelerate = [
+  "dep:accelerate-src",
+  "candle-core/accelerate",
+  "candle-nn/accelerate",
+  "candle-transformers/accelerate",
+]
+cuda = [
+  "candle-core/cuda",
+  "candle-nn/cuda",
+  "candle-transformers/cuda",
+  "dep:bindgen_cuda",
+  "dep:half",
+]
+cuda-graph = ["cuda-paged-attn"]
+cudnn = ["cuda", "candle-core/cudnn"]
+flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
+mkl = [
+  "dep:intel-mkl-src",
+  "candle-core/mkl",
+  "candle-nn/mkl",
+  "candle-transformers/mkl",
+]
+nccl = ["cuda", "cudarc/nccl", "dep:half"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+paged-attn = ["dep:mistralrs-paged-attn"]
+metal-paged-attn = ["metal", "paged-attn", "dep:candle-metal-kernels", "dep:objc2-metal", "dep:mistralrs-quant", "mistralrs-paged-attn/metal", "mistralrs-quant/metal"]
+cuda-paged-attn = ["cuda", "paged-attn", "dep:mistralrs-quant", "mistralrs-paged-attn/cuda", "mistralrs-quant/cuda"]
+cudarc = ["dep:cudarc"]
+
+audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64", "dep:reqwest"]
+
+# Force aligner (model + language-specific tokenization) lives behind a feature.
+forced-aligner = [
+  "dep:lindera",
+  "dep:lindera-ipadic",
+  "lindera/embed-ipadic",
+  "lindera-ipadic/embed-ipadic",
+]
+
+# Testing feature - enables integration tests that download models from HuggingFace.
+integration-tests = []
+
+# Performance timing instrumentation.
+timing = []
+
+# Run all platform-independent tests.
+test-all = ["integration-tests"]
+
+# Platform-specific test features (use these explicitly when on that platform).
+test-all-macos = ["test-all", "metal", "audio-loading"]
+test-all-cuda = ["test-all", "cuda", "audio-loading"]
+
+[dev-dependencies]
+fs2 = "0.4"
+
+[build-dependencies]
+bindgen_cuda = { version = "0.1.5", optional = true }
+
+[[example]]
+name = "bench_transcribe"
+required-features = ["audio-loading", "timing"]
+
+[[example]]
+name = "bench_transcribe_wall"
+required-features = ["audio-loading"]
