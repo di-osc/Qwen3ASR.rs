@@ -6,12 +6,13 @@ This document records the recent Metal decode optimization work against
 `mistral.rs`, with separate notes for changes that helped, changes that did not
 help, and the remaining performance gap.
 
-Update: 2026-06-04
+Update: 2026-06-04 (Pass 12)
 
-The notes below were extended with the mixed-length paged-prefill work that
-followed the initial single-sequence decode optimization pass. The 2026-06-04
-changes are more about bringing the ASR batch path closer to `mistral.rs`
-metadata/layout behavior while also recovering real `transcribe` throughput.
+Metal production default is now **eager KV decode** (single + batch) with **ISQ8
+(`auto8`)** weights. End-to-end `raw_audios` (20 files, VAD+ASR) reaches **64.8×
+speedup / RTF 0.0154** after Pass 12 length bucketing (was 62.5× / 0.0160 pre-bucket).
+Use `VASR_FORCE_PAGED_ATTN=1` only for paged regression tests; forced paged can exhaust
+the KV block pool on long multi-segment clips.
 
 ## Benchmark Scope
 
@@ -1497,4 +1498,155 @@ End-to-end wall on batch=2: **~762 ms** (eager) vs **~857 ms** (paged).
 
 1. Profile eager batch prefill vs paged prefill on longer mixed batches.
 2. Metal command-buffer pipelining where paged-attn remains required (CUDA / forced).
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 12: raw_audios E2E Validation + Length Bucketing (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8` → AFQ8 on Metal)
+- Workload: full offline pipeline (Silero VAD + batched ASR), not decode-only bench
+- Corpus: `raw_audios/` (20 customer-service WAV files, ~27.5 min total)
+
+### Production defaults after Pass 9–11
+
+| Setting | Metal default | Override |
+| --- | --- | --- |
+| KV decode path | **eager** (single + batch) | `VASR_FORCE_PAGED_ATTN=1` |
+| Disable paged entirely | — | `VASR_DISABLE_PAGED_ATTN=1` |
+| Quantization | `auto8` (8-bit ISQ) | `8`, `auto`, `auto6`, … |
+| Runtime dtype | BF16 | — |
+
+### E2E command
+
+```bash
+MODEL="/Users/wangmengdi/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-0.6B/snapshots/5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+
+# Current default (Metal eager, ISQ8)
+cargo run --release -p vasr-cli --example bench_transcribe_dir \
+  --features metal-paged-attn -- \
+  "$MODEL" raw_audios 64 bf16 auto8
+
+# Compare forced paged (legacy path)
+VASR_FORCE_PAGED_ATTN=1 cargo run --release -p vasr-cli --example bench_transcribe_dir \
+  --features metal-paged-attn -- \
+  "$MODEL" raw_audios 64 bf16 auto8
+```
+
+Stage breakdown helper:
+
+```bash
+cargo run --release -p vasr-cli --example bench_transcribe_stages \
+  --features metal-paged-attn -- \
+  "$MODEL" raw_audios 64 bf16 auto8 5 all
+```
+
+### Measured Results: full 20 files (default eager)
+
+| Metric | Value |
+| --- | ---: |
+| Total audio | **1652.1 s** (~27.5 min) |
+| Wall time (excl. first compile) | **26.42 s** |
+| Speedup | **62.5×** |
+| RTF | **0.0160** |
+| VAD+ASR annotations | 933 |
+| Stability | **20/20** completed |
+
+Long-file examples (default eager):
+
+| File | Audio (s) | Wall (s) | Speedup | Annotations |
+| --- | ---: | ---: | ---: | ---: |
+| audio (2).wav | 193.6 | 4.64 | 41.7× | 119 |
+| audio (7).wav | 193.6 | 4.65 | 41.7× | 119 |
+| audio (18).wav | 171.6 | 4.21 | 40.8× | 151 |
+
+### Measured Results: first 5 files (same scale as Pass 4 doc)
+
+| Mode | Wall (s) | Speedup | RTF | Notes |
+| --- | ---: | ---: | ---: | --- |
+| **Default (Metal eager)** | **4.59** | **68.8×** | **0.0145** | 189 annotations |
+| `VASR_FORCE_PAGED_ATTN=1` | 5.07 | 62.2× | 0.0161 | 208 annotations |
+| Pass 4 doc (paged era) | 4.64 | 67.9× | 0.0147 | — |
+
+Relative forced paged on 5 files: **wall −10.6%** (5.07 → 4.59 s).  
+Relative Pass 4 doc: **wall −1.2%** (4.64 → 4.59 s).
+
+Stage split on 5 files (default eager, pre–Pass 12 bucketing):
+
+| Stage | Time (s) | Share of wall |
+| --- | ---: | ---: |
+| VAD | 0.80 | ~17% |
+| ASR | 3.77 | ~82% |
+| Load + other | 0.02 | ~1% |
+| **Total** | **4.58** | — |
+
+ASR throughput on detected speech: **~15.7× realtime** (`asr_speech_speedup`).
+
+### Forced paged: stability failure on long corpus
+
+Full 20-file run with `VASR_FORCE_PAGED_ATTN=1` failed on `audio (18).wav`:
+
+```text
+Error: paged KV cache exhausted: request_id=25 needed_blocks=5 free_blocks=3
+```
+
+Cause: many short VAD segments on a 171 s clip exhaust the shared paged block pool
+(default `PagedCacheMemory::ContextSize(4096)`). **Default Metal eager path does not
+hit this limit**; 20/20 files complete.
+
+Transcription text is broadly consistent between modes; segment counts can differ
+slightly (e.g. audio (1): 66 vs 73 annotations eager vs paged).
+
+### What Changed (Pass 12 optimization)
+
+File:
+
+- `vasr_runtime/src/models/qwen3_asr.rs`
+- `vasr_models/src/inference/types.rs`
+
+Behavior:
+
+- Enable **`bucket_by_length: true`** by default for runtime `transcribe` / VAD-batched
+  paths. Chunks are sorted by descending waveform length before batching so left-padded
+  mixed batches carry less audio/prompt padding into eager batch prefill.
+
+Why:
+
+- E2E stage profiling showed **ASR ≈ 82% of wall** on `raw_audios`; VAD segments within
+  one file vary widely in duration. Bucketing reduces wasted prefill compute without
+  changing decode routing (still Metal eager by default).
+
+### Measured Results after length bucketing
+
+Same commands as above, post-change:
+
+| Scope | Wall (s) | Speedup | RTF | Notes |
+| --- | ---: | ---: | ---: | --- |
+| 5 files | **4.57** | **69.0×** | **0.0145** | vs pre-bucket **4.59 s** (~flat) |
+| **20 files** | **25.50** | **64.8×** | **0.0154** | vs pre-bucket **26.42 s** (**−3.5%**) |
+
+Long file `audio (18).wav` (stages):
+
+| Metric | Pre-bucket | Post-bucket | Delta |
+| --- | ---: | ---: | ---: |
+| ASR stage | 3.81 s | **3.38 s** | **−11%** |
+| Total wall | 4.24 s | **3.81 s** | **−10%** |
+| Speech speedup | 16.6× | **18.7×** | +2.1× |
+
+Transcription text on spot-checked files (e.g. audio (1), (12)) remained stable; total
+annotation count on 20 files moved slightly (933 → 949), within normal VAD/ASR variance.
+
+Takeaway: length bucketing is a low-risk E2E win on **multi-segment long clips**; short
+5-file smoke tests under-report the benefit because each file has fewer segments to reorder.
+
+### Next Steps (Metal-first)
+
+1. Metal command-buffer pipelining where paged-attn remains required (CUDA / forced).
+2. Increase paged block pool or per-request lifecycle for `VASR_FORCE_PAGED_ATTN=1` long
+   VAD runs (correctness/stability, not default-path perf).
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

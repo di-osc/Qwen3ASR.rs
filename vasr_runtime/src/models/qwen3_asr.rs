@@ -51,7 +51,7 @@ impl AsrModel for Qwen3AsrModel {
             max_new_tokens: options.max_new_tokens,
             max_batch_size: RuntimeTranscribeOptions::default().max_batch_size,
             chunk_max_sec: None,
-            bucket_by_length: false,
+            bucket_by_length: true,
         };
         let audio = waveforms
             .iter()

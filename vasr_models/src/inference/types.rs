@@ -70,7 +70,7 @@ impl Default for TranscribeOptions {
             max_new_tokens: 0,
             max_batch_size: 32,
             chunk_max_sec: None,
-            bucket_by_length: false,
+            bucket_by_length: true,
         }
     }
 }
