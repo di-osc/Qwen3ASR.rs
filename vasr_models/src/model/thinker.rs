@@ -134,6 +134,10 @@ impl ThinkerForConditionalGeneration {
         self.audio_tower.uses_flash_attn()
     }
 
+    pub fn num_text_layers(&self) -> usize {
+        self.text_model.num_layers()
+    }
+
     pub fn load(
         cfg: &ThinkerConfig,
         vb: VarBuilder,

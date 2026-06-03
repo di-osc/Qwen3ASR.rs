@@ -1019,3 +1019,96 @@ Notes:
 
 1. Port fuller eager `SingleCache` semantics to close the non-paged eager gap.
 2. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 6: Eager KV Prealloc + Metal Argmax Fix (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8`)
+
+Skipped in this pass:
+
+- CUDA validation (not available on the current Mac machine)
+
+### What Changed
+
+#### 1. mistral-style eager KV cache preallocation
+
+Files:
+
+- `vasr_models/src/model/kv_cache.rs`
+- `vasr_models/src/model/generation.rs`
+- `vasr_models/src/model/thinker.rs` (`num_text_layers`)
+
+Behavior:
+
+- Added `KVCache::with_max_seq_len(num_layers, prompt_len + max_new_tokens)` so
+  decode avoids repeated grow/realloc on every token.
+- `KVCacheEntry::new` reserves full capacity up front when `max_seq_len` is
+  known; append only copies backing storage when capacity is insufficient.
+- Skip redundant `contiguous()` when tensors are already contiguous.
+- Generation paths call `kv_cache_for_generation(...)` instead of bare
+  `KVCache::new()`.
+
+Why:
+
+- mistral.rs `SingleCache` pre-reserves prompt + generation length; our dynamic
+  grow-by-256 path added allocator churn on every decode step.
+
+#### 2. Metal argmax on eager batch decode (batch=1)
+
+Files:
+
+- `vasr_models/src/model/generation.rs` (`argmax_token_ids_from_logits`)
+
+Behavior:
+
+- Route batch=1 logits through `metal_argmax` (same as single-sequence path).
+- Fix indexing: use row `logits.i((0,))` (or 1-D logits) instead of scalar
+  `logits.i((0, 0))`, which previously picked vocab index 0 and broke eager
+  output when `VASR_DISABLE_PAGED_ATTN=1`.
+
+Why:
+
+- `transcribe` always uses the batch generation helper even for batch=1; the
+  broken argmax caused garbage output (`"!"`) and inflated token counts.
+
+### Measured Results (this pass)
+
+Single-sequence fixture (`fixtures/audio/asr_en_16k.wav`, 3 runs):
+
+Paged-attn (default):
+
+| Run | `decode_tokens_per_s` | `decode_argmax_ms` | Notes |
+| --- | ---: | ---: | --- |
+| 1 | `204.3` | `62.4` | `prompt_len=214`, `steps=44` |
+| 2 | `203.7` | `61.8` | stable transcription |
+| 3 | `202.2` | `62.6` | vs Pass 2 hot band `~182-184` |
+
+Eager fallback (`VASR_DISABLE_PAGED_ATTN=1`):
+
+| Run | `decode_tokens_per_s` | Notes |
+| --- | ---: | --- |
+| 1 | `232.0` | matches mistral.rs default eager reference |
+| 2 | `234.0` | `prompt_len=214`, correct ASR text |
+| 3 | `233.0` | vs Pass 2 `~196-198` (+~35 tok/s) |
+
+Takeaways:
+
+- **Eager decode now matches mistral.rs default eager** (~232 tok/s) on the same
+  fixture, closing the largest remaining non-paged gap.
+- **Paged-attn decode improved** to ~202-204 tok/s hot on this session (up from
+  ~171-175 earlier in the day; some run-to-run Metal variance remains).
+- **`decode_argmax_ms` still ~62 ms/run** on paged path (~29% of decode); next
+  optimization target for paged parity.
+
+### Next Steps (Metal-first)
+
+1. Reduce paged decode argmax overhead (currently ~60 ms / 44 steps).
+2. Port snapshot/rollback `SingleCache` semantics if needed for speculative paths.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.

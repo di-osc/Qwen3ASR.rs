@@ -147,6 +147,39 @@ pub fn greedy_generate(
 ///
 /// This is the practical default for transcription: without caching, decoding
 /// is prohibitively slow because each step would re-run the full prompt.
+fn kv_cache_for_generation(
+    thinker: &ThinkerForConditionalGeneration,
+    seq_len: usize,
+    max_new_tokens: usize,
+) -> Result<KVCache> {
+    let max_seq_len = seq_len
+        .checked_add(max_new_tokens)
+        .ok_or_else(|| anyhow::anyhow!("kv cache capacity overflow"))?;
+    Ok(KVCache::with_max_seq_len(
+        thinker.num_text_layers(),
+        max_seq_len,
+    ))
+}
+
+fn argmax_token_ids_from_logits(logits: &Tensor, batch: usize) -> Result<Vec<u32>> {
+    if batch == 1 {
+        let row = if logits.rank() == 1 {
+            logits.clone()
+        } else {
+            logits.i((0,))?
+        };
+        return Ok(vec![argmax_token_id(&row)?]);
+    }
+    let next = logits.argmax(1usize)?.to_vec1::<u32>()?;
+    if next.len() != batch {
+        bail!(
+            "internal error: batch argmax mismatch: expected={batch}, got={}",
+            next.len()
+        );
+    }
+    Ok(next)
+}
+
 pub fn greedy_generate_cached(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -176,10 +209,10 @@ pub fn greedy_generate_cached(
     let mut ids: Vec<u32> = input_ids.to_vec();
     let mut generated: Vec<u32> = Vec::new();
 
-    let mut kv_cache = KVCache::new();
+    let seq_len = ids.len();
+    let mut kv_cache = kv_cache_for_generation(thinker, seq_len, max_new_tokens)?;
 
     // Prefill the cache with the full prompt (including audio features).
-    let seq_len = ids.len();
     let input_ids_t = Tensor::from_vec(ids.clone(), (1usize, seq_len), device)?;
     let attention_mask_t = Tensor::from_vec(attention_mask.to_vec(), (1usize, seq_len), device)?;
     let audio_placeholder_count = if audio_features.is_some() {
@@ -531,7 +564,12 @@ fn greedy_generate_cached_batch_impl(
             .saturating_add(duration_to_us(start_tensors.elapsed()));
     }
 
-    let mut kv_cache = KVCache::new();
+    let mut kv_cache = kv_cache_for_generation(thinker, seq_len, opts.max_new_tokens)?;
+
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.prompt_len = seq_len;
+    }
 
     // Prefill the cache with the full prompt (including audio features).
     #[cfg(feature = "timing")]
@@ -558,13 +596,7 @@ fn greedy_generate_cached_batch_impl(
     };
 
     let last_logits = logits.narrow(1, seq_len.saturating_sub(1), 1)?.squeeze(1)?;
-    let mut next_ids = last_logits.argmax(1usize)?.to_vec1::<u32>()?;
-    if next_ids.len() != batch {
-        bail!(
-            "internal error: batch argmax mismatch: expected={batch}, got={}",
-            next_ids.len()
-        );
-    }
+    let mut next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
         t.prefill_us = t
@@ -643,13 +675,7 @@ fn greedy_generate_cached_batch_impl(
                 )?
             }
         };
-        let next = logits_new.squeeze(1)?.argmax(1usize)?.to_vec1::<u32>()?;
-        if next.len() != batch {
-            bail!(
-                "internal error: batch argmax mismatch: expected={batch}, got={}",
-                next.len()
-            );
-        }
+        let next = argmax_token_ids_from_logits(&logits_new.squeeze(1)?, batch)?;
         next_ids = next;
     }
     #[cfg(feature = "timing")]

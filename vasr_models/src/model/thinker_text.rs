@@ -1202,7 +1202,6 @@ impl ThinkerTextModel {
         self.hidden_size
     }
 
-    #[cfg(feature = "paged-attn")]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }

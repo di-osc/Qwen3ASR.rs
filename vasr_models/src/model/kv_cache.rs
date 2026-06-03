@@ -19,9 +19,17 @@ pub struct KVCacheEntry {
 }
 
 impl KVCacheEntry {
-    pub fn new(key: Tensor, value: Tensor) -> Result<Self> {
+    pub fn new(key: Tensor, value: Tensor, max_seq_len: Option<usize>) -> Result<Self> {
         let seq_len = key.dim(2)?;
-        let capacity_seq_len = seq_len.saturating_add(CACHE_GROW_SIZE);
+        let capacity_seq_len = match max_seq_len {
+            Some(max_len) if max_len >= seq_len => max_len,
+            Some(max_len) => {
+                candle_core::bail!(
+                    "kv cache max_seq_len smaller than initial prompt: max_seq_len={max_len} seq_len={seq_len}"
+                );
+            }
+            None => seq_len.saturating_add(CACHE_GROW_SIZE),
+        };
         let key = backing_tensor(&key, capacity_seq_len)?;
         let value = backing_tensor(&value, capacity_seq_len)?;
         Ok(Self {
@@ -43,19 +51,47 @@ impl KVCacheEntry {
         ))
     }
 
-    fn append_to_backing(&mut self, new_key: &Tensor, new_value: &Tensor) -> Result<()> {
-        let new_key = new_key.contiguous()?;
-        let new_value = new_value.contiguous()?;
+    fn append_to_backing(
+        &mut self,
+        new_key: &Tensor,
+        new_value: &Tensor,
+        max_seq_len: Option<usize>,
+    ) -> Result<()> {
+        let new_key = if new_key.is_contiguous() {
+            new_key.clone()
+        } else {
+            new_key.contiguous()?
+        };
+        let new_value = if new_value.is_contiguous() {
+            new_value.clone()
+        } else {
+            new_value.contiguous()?
+        };
         let new_len = new_key.dim(2)?;
         let needed = self.seq_len.saturating_add(new_len);
         if needed > self.capacity_seq_len {
-            let diff = needed - self.capacity_seq_len;
-            let blocks = diff.div_ceil(CACHE_GROW_SIZE);
-            self.capacity_seq_len += blocks * CACHE_GROW_SIZE;
-            let old_key = self.key.narrow(2, 0, self.seq_len)?;
-            let old_value = self.value.narrow(2, 0, self.seq_len)?;
-            self.key = backing_tensor(&old_key, self.capacity_seq_len)?;
-            self.value = backing_tensor(&old_value, self.capacity_seq_len)?;
+            if let Some(max_len) = max_seq_len {
+                if needed > max_len {
+                    candle_core::bail!(
+                        "kv cache append exceeds reserved max_seq_len: needed={needed} max_seq_len={max_len}"
+                    );
+                }
+                if max_len > self.capacity_seq_len {
+                    self.capacity_seq_len = max_len;
+                    let old_key = self.key.narrow(2, 0, self.seq_len)?;
+                    let old_value = self.value.narrow(2, 0, self.seq_len)?;
+                    self.key = backing_tensor(&old_key, self.capacity_seq_len)?;
+                    self.value = backing_tensor(&old_value, self.capacity_seq_len)?;
+                }
+            } else {
+                let diff = needed - self.capacity_seq_len;
+                let blocks = diff.div_ceil(CACHE_GROW_SIZE);
+                self.capacity_seq_len += blocks * CACHE_GROW_SIZE;
+                let old_key = self.key.narrow(2, 0, self.seq_len)?;
+                let old_value = self.value.narrow(2, 0, self.seq_len)?;
+                self.key = backing_tensor(&old_key, self.capacity_seq_len)?;
+                self.value = backing_tensor(&old_value, self.capacity_seq_len)?;
+            }
         }
 
         self.key.slice_set(&new_key, 2, self.seq_len)?;
@@ -64,8 +100,13 @@ impl KVCacheEntry {
         Ok(())
     }
 
-    pub fn update(&mut self, new_key: &Tensor, new_value: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.append_to_backing(new_key, new_value)?;
+    pub fn update(
+        &mut self,
+        new_key: &Tensor,
+        new_value: &Tensor,
+        max_seq_len: Option<usize>,
+    ) -> Result<(Tensor, Tensor)> {
+        self.append_to_backing(new_key, new_value, max_seq_len)?;
         self.current_key_value()
     }
 }
@@ -84,13 +125,19 @@ fn backing_tensor(src: &Tensor, capacity_seq_len: usize) -> Result<Tensor> {
 pub struct KVCache {
     entries: Vec<Option<KVCacheEntry>>,
     seq_len: usize,
+    max_seq_len: Option<usize>,
 }
 
 impl KVCache {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_max_seq_len(num_layers: usize, max_seq_len: usize) -> Self {
         Self {
-            entries: Vec::new(),
+            entries: vec![None; num_layers],
             seq_len: 0,
+            max_seq_len: Some(max_seq_len),
         }
     }
 
@@ -98,6 +145,7 @@ impl KVCache {
         Self {
             entries: vec![None; num_layers],
             seq_len: 0,
+            max_seq_len: None,
         }
     }
 
@@ -127,14 +175,18 @@ impl KVCache {
 
         match &mut self.entries[layer_idx] {
             Some(entry) => {
-                let result = entry.update(key, value)?;
+                let result = entry.update(key, value, self.max_seq_len)?;
                 if layer_idx == 0 {
                     self.seq_len = self.seq_len.saturating_add(new_len);
                 }
                 Ok(result)
             }
             None => {
-                self.entries[layer_idx] = Some(KVCacheEntry::new(key.clone(), value.clone())?);
+                self.entries[layer_idx] = Some(KVCacheEntry::new(
+                    key.clone(),
+                    value.clone(),
+                    self.max_seq_len,
+                )?);
                 if layer_idx == 0 {
                     self.seq_len = new_len;
                 }
@@ -228,6 +280,40 @@ mod tests {
         }
         if cache.seq_len() != 0 {
             anyhow::bail!("expected seq_len=0 after clear");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_kv_cache_with_max_seq_len_reserves_capacity() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let mut cache = KVCache::with_max_seq_len(1, 8);
+        let value = Tensor::zeros((1, 2, 5, 4), DType::F32, &device)?;
+        let key = Tensor::zeros((1, 2, 5, 4), DType::F32, &device)?;
+        cache.update(0, &key, &value)?;
+        let capacity = cache
+            .get(0)
+            .ok_or_else(|| anyhow::anyhow!("missing kv cache entry"))?
+            .key
+            .dim(2)?;
+        if capacity != 8 {
+            anyhow::bail!("expected reserved capacity 8, got {capacity}");
+        }
+
+        let key_step = Tensor::zeros((1, 2, 1, 4), DType::F32, &device)?;
+        let value_step = Tensor::zeros((1, 2, 1, 4), DType::F32, &device)?;
+        cache.update(0, &key_step, &value_step)?;
+        let capacity_after = cache
+            .get(0)
+            .ok_or_else(|| anyhow::anyhow!("missing kv cache entry"))?
+            .key
+            .dim(2)?;
+        if capacity_after != 8 {
+            anyhow::bail!("expected stable reserved capacity 8, got {capacity_after}");
+        }
+        if cache.seq_len() != 6 {
+            anyhow::bail!("expected seq_len=6, got {}", cache.seq_len());
         }
 
         Ok(())
