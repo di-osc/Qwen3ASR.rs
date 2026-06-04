@@ -79,6 +79,7 @@ fn main() -> Result<()> {
         return_timestamps: false,
         max_new_tokens,
         max_batch_size: batch_size,
+        max_batch_audio_sec: 60.0,
         chunk_max_sec: None,
         bucket_by_length: false,
     };

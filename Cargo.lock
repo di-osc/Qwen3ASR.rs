@@ -5196,6 +5196,7 @@ dependencies = [
  "candle-core",
  "ndarray",
  "ort",
+ "tokio",
  "vasr-data",
  "vasr-models",
 ]

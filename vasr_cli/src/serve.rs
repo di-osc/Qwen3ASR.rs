@@ -6,7 +6,6 @@ use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
 use candle_core::{DType, Device};
 use clap::{Args, Subcommand};
-use vasr_audio::AudioLoader;
 use vasr_models::qwen3_asr::LoadOptions;
 use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
 #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
@@ -16,7 +15,8 @@ use vasr_runtime::{
     VadModel, VadOptions,
 };
 use vasr_server::{
-    InferenceScheduler, RealtimeService, RealtimeSession, ScheduledAsrModel, TranscribeService,
+    InferenceScheduler, RealtimeService, RealtimeSession, ScheduledAsrModel,
+    build_transcribe_service_from_parts,
 };
 
 #[derive(Debug, Clone, Args)]
@@ -134,20 +134,19 @@ async fn run_transcribe(args: TranscribeServeArgs) -> Result<()> {
             vad.path().display(),
             vad_load_start.elapsed().as_secs_f64()
         );
-        Some(Box::new(vad) as Box<dyn VadModel>)
+        Some(Arc::new(vad) as Arc<dyn VadModel>)
     };
-    let offline = OfflinePipeline {
+    let offline = Arc::new(OfflinePipeline {
         vad: offline_vad,
         asr,
-    };
-    let transcribe_service = Arc::new(TranscribeService {
-        pipeline: Arc::new(offline),
-        loader: AudioLoader,
-        options: AsrOptions {
+    });
+    let transcribe_service = build_transcribe_service_from_parts(
+        offline,
+        AsrOptions {
             max_new_tokens: args.common.max_new_tokens,
             ..AsrOptions::default()
         },
-    });
+    );
 
     let app = Router::new()
         .route("/health", get(health))

@@ -2,15 +2,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{Json, Router, routing::post};
-use vasr_audio::{AudioLoadOptions, AudioLoader};
 use vasr_data::AudioSource;
 use vasr_protocol::{InferenceData, InferencePerformance, TranscribeRequest, TranscribeResponse};
-use vasr_runtime::{AsrOptions, OfflinePipeline};
+use vasr_runtime::AsrOptions;
+
+use crate::async_transcribe::{AsyncTranscribePipeline, TranscribeInput};
 
 pub struct TranscribeService {
-    pub pipeline: Arc<OfflinePipeline>,
-    pub loader: AudioLoader,
-    pub options: AsrOptions,
+    pub pipeline: Arc<AsyncTranscribePipeline>,
 }
 
 pub fn transcribe_router(service: Arc<TranscribeService>) -> Router {
@@ -25,16 +24,16 @@ async fn handle_transcribe(
     Json(request): Json<TranscribeRequest>,
 ) -> Json<TranscribeResponse> {
     let start = Instant::now();
-    let mut data = Vec::new();
-    let mut total_audio_duration_seconds = 0.0;
+    let mut inputs = Vec::new();
+    let mut validation_errors = Vec::new();
 
-    for input in request.inputs {
+    for (index, input) in request.inputs.into_iter().enumerate() {
         let source = if let Some(url) = input.url {
             AudioSource::Url(url)
         } else if let Some(b64) = input.b64_str {
             AudioSource::Base64(b64)
         } else {
-            data.push(InferenceData {
+            validation_errors.push(InferenceData {
                 service_id: String::new(),
                 spent_seconds: 0.0,
                 spent_details: Default::default(),
@@ -46,23 +45,23 @@ async fn handle_transcribe(
             });
             continue;
         };
+        inputs.push(TranscribeInput { index, source });
+    }
 
-        match service.loader.load(&source, &AudioLoadOptions::default()) {
-            Ok(waveform) => {
-                total_audio_duration_seconds += waveform.duration_seconds();
-                let pipeline = Arc::clone(&service.pipeline);
-                let options = service.options.clone();
-                let task =
-                    tokio::task::spawn_blocking(move || pipeline.transcribe(&waveform, &options));
-                match task
-                    .await
-                    .unwrap_or_else(|err| Err(anyhow::anyhow!("transcribe task join error: {err}")))
-                {
-                    Ok(timeline) => data.push(InferenceData::from_timeline("", &timeline)),
-                    Err(err) => data.push(error_data("recognizer", err.to_string())),
-                }
+    let outcomes = service.pipeline.transcribe_many(inputs).await;
+    let mut data = validation_errors;
+    let mut total_audio_duration_seconds = 0.0;
+
+    for outcome in outcomes {
+        match outcome.result {
+            Ok(timeline) => {
+                total_audio_duration_seconds += outcome.audio_seconds;
+                data.push(InferenceData::from_timeline("", &timeline));
             }
-            Err(err) => data.push(error_data("loader", err.to_string())),
+            Err(error) => data.push(error_data(
+                outcome.bad_component.unwrap_or("recognizer"),
+                error.to_string(),
+            )),
         }
     }
 
@@ -104,4 +103,19 @@ fn error_data(component: &str, reason: String) -> InferenceData {
         bad_reason: Some(reason),
         bad_component: Some(component.to_string()),
     }
+}
+
+pub fn build_transcribe_service(pipeline: Arc<AsyncTranscribePipeline>) -> Arc<TranscribeService> {
+    Arc::new(TranscribeService { pipeline })
+}
+
+pub fn build_transcribe_service_from_parts(
+    offline: Arc<vasr_runtime::OfflinePipeline>,
+    asr_options: AsrOptions,
+) -> Arc<TranscribeService> {
+    build_transcribe_service(Arc::new(AsyncTranscribePipeline::new(
+        vasr_audio::AudioLoader,
+        offline,
+        asr_options,
+    )))
 }

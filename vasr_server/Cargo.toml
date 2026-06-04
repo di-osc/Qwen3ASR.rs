@@ -16,7 +16,7 @@ uuid = { version = "1", features = ["v4"] }
 vasr-audio = { path = "../vasr_audio" }
 vasr-data = { path = "../vasr_data" }
 vasr-protocol = { path = "../vasr_protocol" }
-vasr-runtime = { path = "../vasr_runtime" }
+vasr-runtime = { path = "../vasr_runtime", features = ["async"] }
 
 [lints]
 workspace = true

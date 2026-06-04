@@ -5,14 +5,16 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device};
-use vasr_audio::{AudioLoadOptions, AudioLoader};
+use vasr_audio::AudioLoader;
 use vasr_data::AudioSource;
 use vasr_models::qwen3_asr::LoadOptions;
 use vasr_runtime::{
     AsrModel, AsrOptions, OfflinePipeline, Qwen3AsrModel, SileroVadModel, VadModel,
 };
+use vasr_server::{AsyncTranscribePipeline, TranscribeInput};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: bench_transcribe_dir MODEL_DIR AUDIO_DIR [max_new_tokens] [dtype] [isq] [limit] [language]";
     let model = args.next().context(usage)?;
@@ -57,49 +59,64 @@ fn main() -> Result<()> {
     )?);
     let load_seconds = load_start.elapsed().as_secs_f64();
     let vad = SileroVadModel::from_default_model()?;
-    let pipeline = OfflinePipeline {
-        vad: Some(Box::new(vad) as Box<dyn VadModel>),
+    let offline = Arc::new(OfflinePipeline {
+        vad: Some(Arc::new(vad) as Arc<dyn VadModel>),
         asr,
-    };
-    let loader = AudioLoader;
+    });
     let options = AsrOptions {
         language,
         max_new_tokens,
         ..AsrOptions::default()
     };
+    let pipeline = AsyncTranscribePipeline::new(AudioLoader, offline, options);
+
+    let inputs = files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| TranscribeInput {
+            index,
+            source: AudioSource::Path(path.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    let batch_start = Instant::now();
+    let outcomes = pipeline.transcribe_many(inputs).await;
 
     let mut total_audio_seconds = 0.0;
     let mut total_items = 0usize;
     let mut total_annotations = 0usize;
-    let batch_start = Instant::now();
-    for path in files {
-        let item_start = Instant::now();
-        let waveform = loader.load(
-            &AudioSource::Path(path.clone()),
-            &AudioLoadOptions::default(),
-        )?;
-        let audio_seconds = waveform.duration_seconds();
-        let timeline = pipeline.transcribe(&waveform, &options)?;
-        let wall = item_start.elapsed().as_secs_f64();
+
+    for (path, outcome) in files.iter().zip(outcomes.iter()) {
+        let audio_seconds = outcome.audio_seconds;
         total_audio_seconds += audio_seconds;
         total_items += 1;
-        total_annotations += timeline.annotations.len();
-        let text = timeline.transcript().text;
-        println!(
-            "file={} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4} annotations={} text_chars={} text={:?}",
-            path.display(),
-            audio_seconds,
-            wall,
-            audio_seconds / wall.max(f64::EPSILON),
-            wall / audio_seconds.max(f64::EPSILON),
-            timeline.annotations.len(),
-            text.chars().count(),
-            text
-        );
+        match &outcome.result {
+            Ok(timeline) => {
+                total_annotations += timeline.annotations.len();
+                let text = timeline.transcript().text;
+                println!(
+                    "file={} audio_seconds={:.3} annotations={} text_chars={} text={:?}",
+                    path.display(),
+                    audio_seconds,
+                    timeline.annotations.len(),
+                    text.chars().count(),
+                    text
+                );
+            }
+            Err(error) => {
+                println!(
+                    "file={} audio_seconds={:.3} error={error} component={:?}",
+                    path.display(),
+                    audio_seconds,
+                    outcome.bad_component
+                );
+            }
+        }
     }
+
     let wall = batch_start.elapsed().as_secs_f64();
     println!(
-        "summary files={} load_seconds={:.3} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4} annotations={}",
+        "summary files={} model_load_seconds={:.3} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4} annotations={}",
         total_items,
         load_seconds,
         total_audio_seconds,

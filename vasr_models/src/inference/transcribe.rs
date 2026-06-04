@@ -215,8 +215,86 @@ struct ChunkAsrBatch<'a> {
     forced_langs_norm: &'a [Option<String>],
     max_new_tokens: usize,
     max_batch_size: usize,
+    max_batch_audio_sec: f32,
     bucket_by_length: bool,
     eos_token_ids: &'a [u32],
+}
+
+fn chunk_audio_seconds(samples: usize) -> f32 {
+    samples as f32 / SAMPLE_RATE_HZ as f32
+}
+
+fn effective_max_batch_count(max_batch_size: usize, chunk_len: usize) -> usize {
+    if max_batch_size == 0 {
+        chunk_len.max(1)
+    } else {
+        max_batch_size
+    }
+}
+
+/// Group chunk indices into ASR micro-batches bounded by total audio seconds and/or count.
+fn group_chunk_indices(
+    ordered_indices: &[usize],
+    chunks: &[ChunkItem],
+    max_batch_size: usize,
+    max_batch_audio_sec: f32,
+) -> Result<Vec<Vec<usize>>> {
+    if ordered_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let count_cap = effective_max_batch_count(max_batch_size, ordered_indices.len());
+    if max_batch_audio_sec <= 0.0 {
+        return Ok(ordered_indices
+            .chunks(count_cap)
+            .map(|group| group.to_vec())
+            .collect());
+    }
+
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_sec = 0.0f32;
+
+    for &idx in ordered_indices {
+        let chunk = chunks
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("missing chunk {idx}"))?;
+        let sec = chunk_audio_seconds(chunk.wav.len());
+
+        if sec > max_batch_audio_sec {
+            if !current.is_empty() {
+                groups.push(current);
+                current = Vec::new();
+                current_sec = 0.0;
+            }
+            groups.push(vec![idx]);
+            continue;
+        }
+
+        let exceeds_duration =
+            !current.is_empty() && current_sec + sec > max_batch_audio_sec + f32::EPSILON;
+        let exceeds_count = !current.is_empty() && current.len() >= count_cap;
+        if exceeds_duration || exceeds_count {
+            groups.push(current);
+            current = Vec::new();
+            current_sec = 0.0;
+        }
+
+        current.push(idx);
+        current_sec += sec;
+
+        if current.len() >= count_cap {
+            groups.push(current);
+            current = Vec::new();
+            current_sec = 0.0;
+        }
+    }
+
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    Ok(groups)
 }
 
 fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, Vec<String>)> {
@@ -231,19 +309,29 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
         );
     }
 
-    let batch_size = if batch.max_batch_size == 0 {
-        batch.chunks.len().max(1)
-    } else {
-        batch.max_batch_size
-    };
-
     if !batch.bucket_by_length {
         let mut per_chunk_lang: Vec<String> = Vec::with_capacity(batch.chunks.len());
         let mut per_chunk_text: Vec<String> = Vec::with_capacity(batch.chunks.len());
+        let ordered: Vec<usize> = (0..batch.chunks.len()).collect();
+        let index_groups = group_chunk_indices(
+            ordered.as_slice(),
+            batch.chunks,
+            batch.max_batch_size,
+            batch.max_batch_audio_sec,
+        )?;
 
-        for chunk_batch in batch.chunks.chunks(batch_size) {
+        for batch_chunk_idx in index_groups {
+            let chunk_batch: Vec<&ChunkItem> = batch_chunk_idx
+                .iter()
+                .map(|&idx| {
+                    batch
+                        .chunks
+                        .get(idx)
+                        .ok_or_else(|| anyhow::anyhow!("missing chunk {idx}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(chunk_batch.len());
-            for c in chunk_batch {
+            for c in &chunk_batch {
                 audio_inputs.push(AudioInput::Waveform {
                     samples: c.wav.as_slice(),
                     sample_rate: SAMPLE_RATE_HZ,
@@ -302,10 +390,16 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
         lb.cmp(&la).then_with(|| a.cmp(&b))
     });
 
-    for idx_batch in indices.chunks(batch_size) {
-        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(idx_batch.len());
-        let mut batch_chunk_idx: Vec<usize> = Vec::with_capacity(idx_batch.len());
-        for &chunk_idx in idx_batch {
+    let index_groups = group_chunk_indices(
+        indices.as_slice(),
+        batch.chunks,
+        batch.max_batch_size,
+        batch.max_batch_audio_sec,
+    )?;
+
+    for batch_chunk_idx in index_groups {
+        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(batch_chunk_idx.len());
+        for &chunk_idx in &batch_chunk_idx {
             let c = batch
                 .chunks
                 .get(chunk_idx)
@@ -314,10 +408,9 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
                 samples: c.wav.as_slice(),
                 sample_rate: SAMPLE_RATE_HZ,
             });
-            batch_chunk_idx.push(chunk_idx);
         }
 
-        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(idx_batch.len());
+        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(batch_chunk_idx.len());
         for (&chunk_idx, a) in batch_chunk_idx.iter().zip(audio_inputs.iter()) {
             let c = batch
                 .chunks
@@ -544,21 +637,31 @@ fn run_asr_on_chunks_batched_timed(
         );
     }
 
-    let batch_size = if batch.max_batch_size == 0 {
-        batch.chunks.len().max(1)
-    } else {
-        batch.max_batch_size
-    };
-
     if !batch.bucket_by_length {
         let mut per_chunk_lang: Vec<String> = Vec::with_capacity(batch.chunks.len());
         let mut per_chunk_text: Vec<String> = Vec::with_capacity(batch.chunks.len());
+        let ordered: Vec<usize> = (0..batch.chunks.len()).collect();
+        let index_groups = group_chunk_indices(
+            ordered.as_slice(),
+            batch.chunks,
+            batch.max_batch_size,
+            batch.max_batch_audio_sec,
+        )?;
 
-        for chunk_batch in batch.chunks.chunks(batch_size) {
+        for batch_chunk_idx in index_groups {
             timings.batches = timings.batches.saturating_add(1);
 
+            let chunk_batch: Vec<&ChunkItem> = batch_chunk_idx
+                .iter()
+                .map(|&idx| {
+                    batch
+                        .chunks
+                        .get(idx)
+                        .ok_or_else(|| anyhow::anyhow!("missing chunk {idx}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
             let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(chunk_batch.len());
-            for c in chunk_batch {
+            for c in &chunk_batch {
                 audio_inputs.push(AudioInput::Waveform {
                     samples: c.wav.as_slice(),
                     sample_rate: SAMPLE_RATE_HZ,
@@ -623,12 +726,18 @@ fn run_asr_on_chunks_batched_timed(
     let mut per_chunk_lang: Vec<Option<String>> = vec![None; batch.chunks.len()];
     let mut per_chunk_text: Vec<Option<String>> = vec![None; batch.chunks.len()];
 
-    for idx_batch in indices.chunks(batch_size) {
+    let index_groups = group_chunk_indices(
+        indices.as_slice(),
+        batch.chunks,
+        batch.max_batch_size,
+        batch.max_batch_audio_sec,
+    )?;
+
+    for batch_chunk_idx in index_groups {
         timings.batches = timings.batches.saturating_add(1);
 
-        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(idx_batch.len());
-        let mut batch_chunk_idx: Vec<usize> = Vec::with_capacity(idx_batch.len());
-        for &chunk_idx in idx_batch {
+        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(batch_chunk_idx.len());
+        for &chunk_idx in &batch_chunk_idx {
             let c = batch
                 .chunks
                 .get(chunk_idx)
@@ -637,10 +746,9 @@ fn run_asr_on_chunks_batched_timed(
                 samples: c.wav.as_slice(),
                 sample_rate: SAMPLE_RATE_HZ,
             });
-            batch_chunk_idx.push(chunk_idx);
         }
 
-        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(idx_batch.len());
+        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(batch_chunk_idx.len());
         for (&chunk_idx, a) in batch_chunk_idx.iter().zip(audio_inputs.iter()) {
             let c = batch
                 .chunks
@@ -793,6 +901,7 @@ pub fn transcribe(
         forced_langs_norm: forced_langs_norm.as_slice(),
         max_new_tokens: opts.max_new_tokens,
         max_batch_size: opts.max_batch_size,
+        max_batch_audio_sec: opts.max_batch_audio_sec,
         bucket_by_length: opts.bucket_by_length,
         eos_token_ids: eos_token_ids.as_slice(),
     };
@@ -921,6 +1030,7 @@ pub fn transcribe_timed(
         forced_langs_norm: forced_langs_norm.as_slice(),
         max_new_tokens: opts.max_new_tokens,
         max_batch_size: opts.max_batch_size,
+        max_batch_audio_sec: opts.max_batch_audio_sec,
         bucket_by_length: opts.bucket_by_length,
         eos_token_ids: eos_token_ids.as_slice(),
     };
@@ -1166,12 +1276,6 @@ pub fn transcribe_with_forced_aligner_timed(
         prompts.push(processor.build_text_prompt(ctx.as_str(), lang.as_deref()));
     }
 
-    let batch_size = if opts.max_batch_size == 0 {
-        chunks.len().max(1)
-    } else {
-        opts.max_batch_size
-    };
-
     let mut indices: Vec<usize> = (0..chunks.len()).collect();
     if opts.bucket_by_length {
         indices.sort_by(|&a, &b| {
@@ -1185,12 +1289,18 @@ pub fn transcribe_with_forced_aligner_timed(
     let mut per_chunk_text_opt: Vec<Option<String>> = vec![None; chunks.len()];
     let mut per_chunk_align_items: Vec<Option<Vec<TimestampItem>>> = vec![None; chunks.len()];
 
-    for idx_batch in indices.chunks(batch_size) {
+    let index_groups = group_chunk_indices(
+        indices.as_slice(),
+        chunks.as_slice(),
+        opts.max_batch_size,
+        opts.max_batch_audio_sec,
+    )?;
+
+    for batch_chunk_idx in index_groups {
         timings.batches = timings.batches.saturating_add(1);
 
-        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(idx_batch.len());
-        let mut batch_chunk_idx: Vec<usize> = Vec::with_capacity(idx_batch.len());
-        for &chunk_idx in idx_batch {
+        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(batch_chunk_idx.len());
+        for &chunk_idx in &batch_chunk_idx {
             let c = chunks
                 .get(chunk_idx)
                 .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
@@ -1198,10 +1308,9 @@ pub fn transcribe_with_forced_aligner_timed(
                 samples: c.wav.as_slice(),
                 sample_rate: SAMPLE_RATE_HZ,
             });
-            batch_chunk_idx.push(chunk_idx);
         }
 
-        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(idx_batch.len());
+        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(batch_chunk_idx.len());
         for (&chunk_idx, a) in batch_chunk_idx.iter().zip(audio_inputs.iter()) {
             let c = chunks
                 .get(chunk_idx)
@@ -1484,12 +1593,6 @@ pub fn transcribe_with_forced_aligner(
         prompts.push(processor.build_text_prompt(ctx.as_str(), lang.as_deref()));
     }
 
-    let batch_size = if opts.max_batch_size == 0 {
-        chunks.len().max(1)
-    } else {
-        opts.max_batch_size
-    };
-
     let mut indices: Vec<usize> = (0..chunks.len()).collect();
     if opts.bucket_by_length {
         indices.sort_by(|&a, &b| {
@@ -1504,10 +1607,16 @@ pub fn transcribe_with_forced_aligner(
     let mut per_chunk_align_items: Vec<Option<Vec<TimestampItem>>> = vec![None; chunks.len()];
 
     // Run ASR and forced alignment per batch to reuse audio features between the two models.
-    for idx_batch in indices.chunks(batch_size) {
-        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(idx_batch.len());
-        let mut batch_chunk_idx: Vec<usize> = Vec::with_capacity(idx_batch.len());
-        for &chunk_idx in idx_batch {
+    let index_groups = group_chunk_indices(
+        indices.as_slice(),
+        chunks.as_slice(),
+        opts.max_batch_size,
+        opts.max_batch_audio_sec,
+    )?;
+
+    for batch_chunk_idx in index_groups {
+        let mut audio_inputs: Vec<AudioInput<'_>> = Vec::with_capacity(batch_chunk_idx.len());
+        for &chunk_idx in &batch_chunk_idx {
             let c = chunks
                 .get(chunk_idx)
                 .ok_or_else(|| anyhow::anyhow!("missing chunk {chunk_idx}"))?;
@@ -1515,10 +1624,9 @@ pub fn transcribe_with_forced_aligner(
                 samples: c.wav.as_slice(),
                 sample_rate: SAMPLE_RATE_HZ,
             });
-            batch_chunk_idx.push(chunk_idx);
         }
 
-        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(idx_batch.len());
+        let mut items: Vec<(&str, &AudioInput<'_>)> = Vec::with_capacity(batch_chunk_idx.len());
         for (&chunk_idx, a) in batch_chunk_idx.iter().zip(audio_inputs.iter()) {
             let c = chunks
                 .get(chunk_idx)
@@ -1901,6 +2009,46 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod batch_grouping_tests {
+    use super::{ChunkItem, chunk_audio_seconds, group_chunk_indices};
+
+    fn chunk_with_seconds(seconds: f32) -> ChunkItem {
+        let samples = (seconds * 16_000.0).round() as usize;
+        ChunkItem {
+            orig_index: 0,
+            wav: vec![0.0; samples.max(1)],
+            #[cfg(feature = "forced-aligner")]
+            offset_sec: 0.0,
+        }
+    }
+
+    #[test]
+    fn group_chunk_indices_respects_audio_seconds_budget() -> anyhow::Result<()> {
+        let chunks = vec![
+            chunk_with_seconds(20.0),
+            chunk_with_seconds(25.0),
+            chunk_with_seconds(10.0),
+            chunk_with_seconds(30.0),
+        ];
+        let indices = vec![0, 1, 2, 3];
+        let groups = group_chunk_indices(indices.as_slice(), &chunks, 0, 60.0)?;
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![0, 1, 2]);
+        assert_eq!(groups[1], vec![3]);
+        Ok(())
+    }
+
+    #[test]
+    fn group_chunk_indices_puts_oversized_chunk_alone() -> anyhow::Result<()> {
+        let chunks = vec![chunk_with_seconds(65.0), chunk_with_seconds(5.0)];
+        let groups = group_chunk_indices(&[0, 1], &chunks, 0, 60.0)?;
+        assert_eq!(groups, vec![vec![0], vec![1]]);
+        assert!(chunk_audio_seconds(chunks[0].wav.len()) > 60.0);
         Ok(())
     }
 }

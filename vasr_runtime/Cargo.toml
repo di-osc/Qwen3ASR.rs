@@ -10,11 +10,13 @@ anyhow = "1"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
 ndarray = "0.17"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"], optional = true }
 vasr-models = { path = "../vasr_models" }
 vasr-data = { path = "../vasr_data" }
 
 [features]
 default = []
+async = ["dep:tokio"]
 accelerate = ["vasr-models/accelerate"]
 cuda = ["vasr-models/cuda"]
 cuda-graph = ["vasr-models/cuda-graph"]
@@ -23,6 +25,9 @@ metal-paged-attn = ["vasr-models/metal-paged-attn"]
 cuda-paged-attn = ["vasr-models/cuda-paged-attn"]
 audio-loading = ["vasr-models/audio-loading"]
 timing = ["vasr-models/timing"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

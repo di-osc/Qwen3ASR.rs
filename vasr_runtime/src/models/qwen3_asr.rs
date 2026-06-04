@@ -50,6 +50,7 @@ impl AsrModel for Qwen3AsrModel {
             return_timestamps: false,
             max_new_tokens: options.max_new_tokens,
             max_batch_size: RuntimeTranscribeOptions::default().max_batch_size,
+            max_batch_audio_sec: RuntimeTranscribeOptions::default().max_batch_audio_sec,
             chunk_max_sec: None,
             bucket_by_length: true,
         };

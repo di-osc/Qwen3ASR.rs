@@ -124,7 +124,7 @@ fn offline_pipeline_merges_vad_and_asr_annotations() -> Result<()> {
     let waveform = Waveform::new(vec![0.05; 160_000], 16_000);
     let asr = Arc::new(FakeAsr::default());
     let pipeline = OfflinePipeline {
-        vad: Some(Box::new(FakeVad {
+        vad: Some(Arc::new(FakeVad {
             segments: vec![VadSegment {
                 range: TimeRange::new(
                     DurationMs(0),
@@ -148,7 +148,7 @@ fn offline_pipeline_feeds_vad_segments_to_asr_and_offsets_annotations() -> Resul
     let waveform = Waveform::new(vec![0.05; 160_000], 16_000);
     let asr = Arc::new(FakeAsr::default());
     let pipeline = OfflinePipeline {
-        vad: Some(Box::new(FakeVad {
+        vad: Some(Arc::new(FakeVad {
             segments: vec![
                 VadSegment {
                     range: TimeRange::new(DurationMs(1_000), DurationMs(2_500)),

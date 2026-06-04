@@ -56,6 +56,7 @@ fn main() -> Result<()> {
         return_timestamps: false,
         max_new_tokens,
         max_batch_size: 1,
+        max_batch_audio_sec: 0.0,
         chunk_max_sec: None,
         bucket_by_length: false,
     };
