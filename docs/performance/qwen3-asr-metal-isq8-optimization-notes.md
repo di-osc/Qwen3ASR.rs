@@ -6,11 +6,13 @@ This document records the recent Metal decode optimization work against
 `mistral.rs`, with separate notes for changes that helped, changes that did not
 help, and the remaining performance gap.
 
-Update: 2026-06-04 (Pass 12)
+Update: 2026-06-04 (Pass 13)
 
-Metal production default is now **eager KV decode** (single + batch) with **ISQ8
-(`auto8`)** weights. End-to-end `raw_audios` (20 files, VAD+ASR) reaches **64.8×
-speedup / RTF 0.0154** after Pass 12 length bucketing (was 62.5× / 0.0160 pre-bucket).
+Metal production default is **eager KV decode** (single + batch) with **ISQ8
+(`auto8`)** weights. HTTP serve and `bench_transcribe_dir` now use an **async
+Loader→VAD→ASR pipeline** that overlaps stages across files; ASR micro-batches default
+to **≤60 s audio per batch** (`max_batch_audio_sec`). End-to-end `raw_audios` (20 files)
+reaches **65.6× speedup / RTF 0.0152** (wall **25.2 s**, down from **25.5 s** Pass 12).
 Use `VASR_FORCE_PAGED_ATTN=1` only for paged regression tests; forced paged can exhaust
 the KV block pool on long multi-segment clips.
 
@@ -1649,4 +1651,173 @@ Takeaway: length bucketing is a low-risk E2E win on **multi-segment long clips**
 1. Metal command-buffer pipelining where paged-attn remains required (CUDA / forced).
 2. Increase paged block pool or per-request lifecycle for `VASR_FORCE_PAGED_ATTN=1` long
    VAD runs (correctness/stability, not default-path perf).
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-04 Pass 13: Async Loader/VAD/ASR Pipeline + 60s ASR Batching (Metal)
+
+Date: 2026-06-04
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`auto8` → AFQ8 on Metal)
+- Workload: full offline pipeline (Silero VAD + batched ASR), multi-file E2E
+- Corpus: `raw_audios/` (20 customer-service WAV files, ~27.5 min total)
+
+### What Changed
+
+#### 1. Async three-stage transcribe pipeline (cross-file overlap)
+
+Files:
+
+- `vasr_server/src/async_transcribe.rs`
+- `vasr_server/src/transcribe.rs`
+- `vasr_runtime/src/pipeline/async.rs`
+- `vasr_runtime/src/pipeline/mod.rs`
+- `vasr_cli/examples/bench_transcribe_dir.rs`
+- `vasr_cli/src/serve.rs`
+
+Behavior:
+
+- **`AsyncTranscribePipeline`** runs three concurrent workers connected by bounded
+  `mpsc` channels (default buffer **4**):
+  - **Loader** — read/decode audio off the hot path (`spawn_blocking`)
+  - **VAD** — `OfflinePipeline::prepare_vad`
+  - **ASR** — `OfflinePipeline::transcribe_prepared`
+- HTTP `/transcribe` and `bench_transcribe_dir` use this pipeline for multi-input
+  batches; a single input still runs sequentially (load → VAD → ASR).
+- **`AsyncOfflinePipeline`** (feature `async` on `vasr-runtime`) provides the same
+  overlap for in-memory `Waveform` batches.
+
+Parallelism boundary:
+
+- **Across files/jobs**: while file *A* is in ASR, file *B* can run VAD and file *C*
+  can load — Loader/VAD overlap ASR wall time.
+- **Within one file**: still **VAD → ASR** (ASR needs VAD slices first). No
+  segment-level streaming yet.
+
+Why:
+
+- Pass 12 stage profiling showed VAD ≈ **17%** of sequential wall on 5 files; on 20
+  files VAD is **~4.1 s** vs ASR **~24.9 s**. Overlapping VAD/Loader with ASR across
+  files recovers most of the non-ASR time without changing GPU decode routing.
+
+#### 2. OfflinePipeline stage split + shared VAD
+
+Files:
+
+- `vasr_runtime/src/pipeline/mod.rs`
+
+Behavior:
+
+- Split monolithic `transcribe` into **`prepare_vad`** and **`transcribe_prepared`** so
+  the async workers can hand off `VadPrepared` (speech annotations + slices) between
+  stages.
+- `VadModel` holder changed from `Box<dyn VadModel>` to **`Arc<dyn VadModel>`** so VAD
+  is cheaply shared across blocking worker threads.
+
+#### 3. ASR micro-batch grouping by audio duration (60 s cap)
+
+Files:
+
+- `vasr_models/src/inference/transcribe.rs` (`group_chunk_indices`)
+- `vasr_models/src/inference/types.rs`
+- `vasr_runtime/src/models/qwen3_asr.rs`
+
+Behavior:
+
+- New option **`max_batch_audio_sec`** (default **`60.0`**).
+- After length bucketing, chunk indices are grouped greedily so each ASR forward batch
+  carries **≤60 s** of audio (single segments **>60 s** get their own batch).
+- **`max_batch_size: 0`** means no count cap — only duration bounds batch size.
+- Decode-only benches (`bench_transcribe`, `bench_transcribe_wall`) set
+  `max_batch_audio_sec: 0.0` to preserve single-chunk behavior.
+
+Why:
+
+- Long VAD-heavy files (e.g. 171 s clips with dozens of segments) previously fed very
+  large mixed batches into eager prefill. Capping batch audio seconds keeps GPU memory
+  and prefill padding predictable while still batching short segments together.
+
+### Verification
+
+Unit test (pipeline overlap, no real model):
+
+```bash
+cargo test -p vasr-runtime --features async async_pipeline
+```
+
+Async E2E (production path):
+
+```bash
+MODEL="/Users/wangmengdi/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-0.6B/snapshots/5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
+
+cargo run --release -p vasr-cli --example bench_transcribe_dir \
+  --features metal-paged-attn -- \
+  "$MODEL" raw_audios 128 bf16 auto8 20
+```
+
+Sequential stage breakdown (does **not** overlap stages — for profiling only):
+
+```bash
+cargo run --release -p vasr-cli --example bench_transcribe_stages \
+  --features metal-paged-attn -- \
+  "$MODEL" raw_audios 128 bf16 auto8 20 all
+```
+
+### Measured Results (this pass)
+
+Compare **async pipeline** (`bench_transcribe_dir`) vs **sequential stages**
+(`bench_transcribe_stages`, load + VAD + ASR summed per file):
+
+| Scope | Async wall (s) | Sequential wall (s) | Δ wall | Async speedup | Async RTF |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **5 files** (315.4 s audio) | **4.14** | 4.66 | **−11%** | **76.2×** | **0.0131** |
+| **20 files** (1652.1 s audio) | **25.18** | 29.15 | **−14%** | **65.6×** | **0.0152** |
+
+Sequential stage split (20 files, for reference):
+
+| Stage | Time (s) | Share |
+| --- | ---: | ---: |
+| Load | 0.09 | ~0.3% |
+| VAD | 4.11 | ~14% |
+| ASR | 24.94 | ~86% |
+| **Sum** | **29.15** | — |
+
+Async wall **25.18 s** vs sequential sum **29.15 s** → recovered **~4.0 s**
+(~14%), consistent with overlapping VAD/Loader while ASR runs on other files.
+
+Relative Pass 12 post-bucketing (same corpus, sequential `bench_transcribe_dir`):
+
+| Scope | Pass 12 wall (s) | Pass 13 async wall (s) | Δ |
+| --- | ---: | ---: | ---: |
+| 5 files | 4.57 | **4.14** | **−9%** |
+| 20 files | 25.50 | **25.18** | **−1%** |
+
+Notes:
+
+- Pass 12 → Pass 13 comparison mixes pipeline change with `max_batch_audio_sec`; the
+  20-file delta is small because ASR still dominates and GPU ASR remains single-worker
+  serialized via `ScheduledAsrModel`.
+- All spot-checked transcriptions completed without error (189 annotations / 5 files,
+  935 / 20 files in the async run).
+- **`bench_transcribe_stages` wall ≈ load + VAD + ASR**; do not use it as the async
+  pipeline ceiling.
+
+Takeaways:
+
+- **Async pipeline is now the production default** for HTTP transcribe and directory
+  benchmarks; multi-file workloads should prefer `transcribe_many` / batch HTTP inputs.
+- **Biggest win is cross-file overlap**, not parallel ASR forwards (GPU still one decode
+  stream at a time).
+- **60 s ASR batch cap** is a safe default for long multi-segment clips; tune via
+  `TranscribeOptions.max_batch_audio_sec` if memory/latency trade-offs change.
+
+### Next Steps (Metal-first)
+
+1. Segment-level VAD→ASR streaming (overlap VAD and ASR within one long file) if Silero
+   streaming API is wired in.
+2. Metal command-buffer pipelining where paged-attn remains required (CUDA / forced).
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
