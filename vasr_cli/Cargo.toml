@@ -27,11 +27,14 @@ vasr-server = { path = "../vasr_server" }
 [features]
 default = []
 accelerate = ["vasr-runtime/accelerate"]
-cuda = ["vasr-runtime/cuda"]
+cuda = ["cuda-graph"]
 cuda-graph = ["vasr-runtime/cuda-graph"]
+cuda-quant = ["cuda", "vasr-runtime/cuda-quant"]
+flash-attn = ["cuda", "vasr-runtime/flash-attn"]
 metal = ["vasr-runtime/metal"]
 metal-paged-attn = ["metal", "vasr-runtime/metal-paged-attn"]
-cuda-paged-attn = ["cuda", "vasr-runtime/cuda-paged-attn"]
+cuda-paged-attn = ["cuda"]
+timing = ["vasr-runtime/timing"]
 
 [lints]
 workspace = true

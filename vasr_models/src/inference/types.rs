@@ -72,7 +72,7 @@ impl Default for TranscribeOptions {
             return_timestamps: false,
             max_new_tokens: 0,
             max_batch_size: 0,
-            max_batch_audio_sec: 60.0,
+            max_batch_audio_sec: 180.0,
             chunk_max_sec: None,
             bucket_by_length: true,
         }

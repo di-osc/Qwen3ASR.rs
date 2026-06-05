@@ -332,7 +332,7 @@ pub fn accelerated_sdpa(
     softmax_scale: f32,
     causal: bool,
 ) -> Result<Option<Tensor>> {
-    if !(q.device().is_metal() || q.device().is_cuda()) {
+    if !q.device().is_metal() {
         return Ok(None);
     }
 

@@ -42,6 +42,11 @@ pub struct TranscribeTimings {
     pub audio_normalize_us: u64,
     pub audio_chunking_us: u64,
     pub processor_prepare_batch_us: u64,
+    pub processor_prepare_normalize_us: u64,
+    pub processor_prepare_token_lookup_us: u64,
+    pub processor_prepare_feature_extract_us: u64,
+    pub processor_prepare_tokenize_expand_us: u64,
+    pub processor_prepare_pad_us: u64,
     pub stack_features_us: u64,
     pub audio_encoder_us: u64,
     pub tokenizer_decode_us: u64,
@@ -55,6 +60,26 @@ pub struct TranscribeTimings {
     pub total_us: u64,
     pub chunks: usize,
     pub batches: usize,
+}
+
+#[cfg(feature = "timing")]
+fn add_prepare_batch_timings(
+    out: &mut TranscribeTimings,
+    t: &crate::processor::asr_processor::PrepareBatchTimings,
+) {
+    out.processor_prepare_normalize_us = out
+        .processor_prepare_normalize_us
+        .saturating_add(t.normalize_us);
+    out.processor_prepare_token_lookup_us = out
+        .processor_prepare_token_lookup_us
+        .saturating_add(t.token_lookup_us);
+    out.processor_prepare_feature_extract_us = out
+        .processor_prepare_feature_extract_us
+        .saturating_add(t.feature_extract_us);
+    out.processor_prepare_tokenize_expand_us = out
+        .processor_prepare_tokenize_expand_us
+        .saturating_add(t.tokenize_expand_us);
+    out.processor_prepare_pad_us = out.processor_prepare_pad_us.saturating_add(t.pad_us);
 }
 
 fn stack_features(prepared: &[PreparedInputs], device: &Device) -> Result<(Tensor, Vec<usize>)> {
@@ -563,6 +588,38 @@ fn generate_raw_prepared_batch_timed(
         .generation
         .prefill_us
         .saturating_add(gen_timings.prefill_us);
+    timings.generation.prefill_inputs_us = timings
+        .generation
+        .prefill_inputs_us
+        .saturating_add(gen_timings.prefill_inputs_us);
+    timings.generation.prefill_rope_us = timings
+        .generation
+        .prefill_rope_us
+        .saturating_add(gen_timings.prefill_rope_us);
+    timings.generation.prefill_metadata_us = timings
+        .generation
+        .prefill_metadata_us
+        .saturating_add(gen_timings.prefill_metadata_us);
+    timings.generation.prefill_mask_us = timings
+        .generation
+        .prefill_mask_us
+        .saturating_add(gen_timings.prefill_mask_us);
+    timings.generation.prefill_forward_us = timings
+        .generation
+        .prefill_forward_us
+        .saturating_add(gen_timings.prefill_forward_us);
+    timings.generation.prefill_gather_us = timings
+        .generation
+        .prefill_gather_us
+        .saturating_add(gen_timings.prefill_gather_us);
+    timings.generation.prefill_decode_setup_us = timings
+        .generation
+        .prefill_decode_setup_us
+        .saturating_add(gen_timings.prefill_decode_setup_us);
+    timings.generation.prefill_argmax_us = timings
+        .generation
+        .prefill_argmax_us
+        .saturating_add(gen_timings.prefill_argmax_us);
     timings.generation.decode_us = timings
         .generation
         .decode_us
@@ -591,6 +648,10 @@ fn generate_raw_prepared_batch_timed(
         .generation
         .decode_forward_us
         .saturating_add(gen_timings.decode_forward_us);
+    timings.generation.decode_pre_argmax_sync_us = timings
+        .generation
+        .decode_pre_argmax_sync_us
+        .saturating_add(gen_timings.decode_pre_argmax_sync_us);
     timings.generation.decode_argmax_us = timings
         .generation
         .decode_argmax_us
@@ -677,10 +738,12 @@ fn run_asr_on_chunks_batched_timed(
             }
 
             let start_prepare = std::time::Instant::now();
-            let prepared = batch.processor.prepare_batch(items.as_slice())?;
+            let (prepared, prepare_timings) =
+                batch.processor.prepare_batch_timed(items.as_slice())?;
             timings.processor_prepare_batch_us = timings
                 .processor_prepare_batch_us
                 .saturating_add(duration_to_us(start_prepare.elapsed()));
+            add_prepare_batch_timings(timings, &prepare_timings);
 
             let raws = generate_raw_prepared_batch_timed(
                 batch.thinker,
@@ -762,10 +825,11 @@ fn run_asr_on_chunks_batched_timed(
         }
 
         let start_prepare = std::time::Instant::now();
-        let prepared = batch.processor.prepare_batch(items.as_slice())?;
+        let (prepared, prepare_timings) = batch.processor.prepare_batch_timed(items.as_slice())?;
         timings.processor_prepare_batch_us = timings
             .processor_prepare_batch_us
             .saturating_add(duration_to_us(start_prepare.elapsed()));
+        add_prepare_batch_timings(timings, &prepare_timings);
         if prepared.len() != batch_chunk_idx.len() {
             bail!(
                 "internal error: prepare_batch size mismatch: expected={}, got={}",
@@ -1322,10 +1386,11 @@ pub fn transcribe_with_forced_aligner_timed(
         }
 
         let start_prepare = std::time::Instant::now();
-        let prepared = processor.prepare_batch(items.as_slice())?;
+        let (prepared, prepare_timings) = processor.prepare_batch_timed(items.as_slice())?;
         timings.processor_prepare_batch_us = timings
             .processor_prepare_batch_us
             .saturating_add(duration_to_us(start_prepare.elapsed()));
+        add_prepare_batch_timings(timings, &prepare_timings);
 
         if prepared.len() != batch_chunk_idx.len() {
             bail!(

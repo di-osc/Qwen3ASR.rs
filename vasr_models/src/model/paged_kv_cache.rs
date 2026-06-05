@@ -807,12 +807,17 @@ impl PagedKvCache {
             );
         }
 
-        let max_blocks = block_tables.iter().map(Vec::len).max().unwrap_or(0);
-        if max_blocks == 0 {
+        let raw_max_blocks = block_tables.iter().map(Vec::len).max().unwrap_or(0);
+        if raw_max_blocks == 0 {
             candle_core::bail!(
                 "paged batch decode metadata requires at least one block per sequence"
             );
         }
+        #[cfg(feature = "cuda-graph")]
+        let max_blocks =
+            crate::model::cuda_graph::bucket_block_table_cols(raw_max_blocks, self.block_size());
+        #[cfg(not(feature = "cuda-graph"))]
+        let max_blocks = raw_max_blocks;
 
         let mut block_table_host: Vec<u32> = Vec::with_capacity(batch * max_blocks);
         for table in block_tables {
@@ -1126,11 +1131,29 @@ mod tests {
         let precomputed =
             cache.decode_metadata_for_batch_steps(&block_tables, &prompt_lens, steps, &device)?;
 
+        #[cfg(feature = "cuda-graph")]
+        let padded_block_tables: Vec<Vec<usize>> = {
+            let raw_max = block_tables.iter().map(Vec::len).max().unwrap_or(0);
+            let cols =
+                crate::model::cuda_graph::bucket_block_table_cols(raw_max, cache.block_size());
+            block_tables
+                .iter()
+                .map(|table| {
+                    let mut padded = table.clone();
+                    padded.resize(cols, 0);
+                    padded
+                })
+                .collect()
+        };
+        #[cfg(not(feature = "cuda-graph"))]
+        let padded_block_tables: Vec<Vec<usize>> =
+            block_tables.iter().map(|table| table.to_vec()).collect();
+
         for step in 0..steps {
             let starts: Vec<usize> = prompt_lens.iter().map(|&len| len + step).collect();
             let context_lens: Vec<usize> = prompt_lens.iter().map(|&len| len + step + 1).collect();
             let expected = cache.input_metadata_from_block_tables(
-                &block_tables,
+                &padded_block_tables,
                 &starts,
                 1,
                 &context_lens,

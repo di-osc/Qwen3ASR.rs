@@ -144,7 +144,7 @@ fn offline_pipeline_merges_vad_and_asr_annotations() -> Result<()> {
 }
 
 #[test]
-fn offline_pipeline_feeds_vad_segments_to_asr_and_offsets_annotations() -> Result<()> {
+fn offline_pipeline_merges_nearby_vad_segments_before_asr() -> Result<()> {
     let waveform = Waveform::new(vec![0.05; 160_000], 16_000);
     let asr = Arc::new(FakeAsr::default());
     let pipeline = OfflinePipeline {
@@ -170,7 +170,7 @@ fn offline_pipeline_feeds_vad_segments_to_asr_and_offsets_annotations() -> Resul
             .lock()
             .expect("seen batch durations poisoned")
             .as_slice(),
-        &[vec![1_500, 1_000]]
+        &[vec![4_000]]
     );
     assert!(
         asr.seen_durations_ms
@@ -183,11 +183,38 @@ fn offline_pipeline_feeds_vad_segments_to_asr_and_offsets_annotations() -> Resul
         .iter()
         .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
         .collect::<Vec<_>>();
-    assert_eq!(final_segments.len(), 2);
+    assert_eq!(final_segments.len(), 1);
     assert_eq!(final_segments[0].range.start, DurationMs(1_000));
-    assert_eq!(final_segments[0].range.end, DurationMs(2_500));
-    assert_eq!(final_segments[1].range.start, DurationMs(4_000));
-    assert_eq!(final_segments[1].range.end, DurationMs(5_000));
-    assert_eq!(timeline.transcript().text, "hello batch hello batch");
+    assert_eq!(final_segments[0].range.end, DurationMs(5_000));
+    assert_eq!(timeline.transcript().text, "hello batch");
+    Ok(())
+}
+
+#[test]
+fn offline_pipeline_skips_asr_when_vad_finds_no_speech() -> Result<()> {
+    let waveform = Waveform::new(vec![0.05; 160_000], 16_000);
+    let asr = Arc::new(FakeAsr::default());
+    let pipeline = OfflinePipeline {
+        vad: Some(Arc::new(FakeVad {
+            segments: Vec::new(),
+        })),
+        asr: asr.clone(),
+    };
+
+    let timeline = pipeline.transcribe(&waveform, &AsrOptions::default())?;
+
+    assert!(timeline.annotations.is_empty());
+    assert!(
+        asr.seen_durations_ms
+            .lock()
+            .expect("seen durations poisoned")
+            .is_empty()
+    );
+    assert!(
+        asr.seen_batch_durations_ms
+            .lock()
+            .expect("seen batch durations poisoned")
+            .is_empty()
+    );
     Ok(())
 }

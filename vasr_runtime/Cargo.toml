@@ -8,9 +8,13 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+kaldi-fbank-rust-kautism = "0.1.0"
 ndarray = "0.17"
-ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
+rayon = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"], optional = true }
+tracing = "0.1"
 vasr-models = { path = "../vasr_models" }
 vasr-data = { path = "../vasr_data" }
 
@@ -18,15 +22,20 @@ vasr-data = { path = "../vasr_data" }
 default = []
 async = ["dep:tokio"]
 accelerate = ["vasr-models/accelerate"]
-cuda = ["vasr-models/cuda"]
-cuda-graph = ["vasr-models/cuda-graph"]
+cuda-vad = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["cuda-vad", "vasr-models/cuda"]
+cuda-graph = ["cuda", "vasr-models/cuda-graph"]
+cuda-quant = ["cuda", "vasr-models/cuda-quant"]
+flash-attn = ["cuda", "vasr-models/flash-attn"]
 metal = ["vasr-models/metal"]
 metal-paged-attn = ["vasr-models/metal-paged-attn"]
-cuda-paged-attn = ["vasr-models/cuda-paged-attn"]
+cuda-paged-attn = ["cuda"]
 audio-loading = ["vasr-models/audio-loading"]
 timing = ["vasr-models/timing"]
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

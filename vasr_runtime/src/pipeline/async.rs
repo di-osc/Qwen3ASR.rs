@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use vasr_data::{Timeline, Waveform};
 
-use super::{OfflinePipeline, VadPrepared};
+use super::{OfflinePipeline, VadPreparation};
 use crate::model::{AsrOptions, VadOptions};
 
 const DEFAULT_STAGE_BUFFER: usize = 4;
@@ -46,7 +46,7 @@ impl From<AsrOptions> for ParallelTranscribeOptions {
 #[derive(Debug)]
 struct AsrJob {
     index: usize,
-    prepared: Option<VadPrepared>,
+    prepared: VadPreparation,
     waveform: Waveform,
 }
 
@@ -157,7 +157,7 @@ fn spawn_vad_worker(
                 let pipeline = Arc::clone(&pipeline);
                 let waveform = waveform.clone();
                 let vad_options = vad_options.clone();
-                move || pipeline.prepare_vad(&waveform, &vad_options)
+                move || pipeline.prepare_vad_stage(&waveform, &vad_options)
             })
             .await??;
 
@@ -214,12 +214,13 @@ fn run_asr_job(
 ) -> Result<StageResult> {
     let mut timeline = Timeline::new("offline_audio");
     match job.prepared {
-        Some(prepared) => {
+        VadPreparation::Speech(prepared) => {
             timeline
                 .annotations
                 .extend(pipeline.transcribe_prepared(prepared, asr_options)?);
         }
-        None => {
+        VadPreparation::NoSpeech => {}
+        VadPreparation::Disabled => {
             timeline.annotations.extend(
                 pipeline
                     .asr

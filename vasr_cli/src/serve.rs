@@ -8,11 +8,13 @@ use candle_core::{DType, Device};
 use clap::{Args, Subcommand};
 use vasr_models::qwen3_asr::LoadOptions;
 use vasr_models::qwen3_asr::model::isq_linear::resolve_isq_display;
-#[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
-use vasr_models::qwen3_asr::model::paged_cache_runtime::{PagedCacheConfig, PagedCacheMemory};
+#[cfg(any(feature = "metal-paged-attn", feature = "cuda"))]
+use vasr_models::qwen3_asr::model::paged_cache_runtime::{
+    PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
+};
 use vasr_runtime::{
-    AsrModel, AsrOptions, OfflinePipeline, Qwen3AsrModel, RealtimePipeline, SileroVadModel,
-    VadModel, VadOptions,
+    AsrModel, AsrOptions, FsmnVadModel, OfflinePipeline, Qwen3AsrModel, RealtimePipeline, VadModel,
+    VadOptions,
 };
 use vasr_server::{
     InferenceScheduler, RealtimeService, RealtimeSession, ScheduledAsrModel,
@@ -67,10 +69,18 @@ pub struct CommonServeArgs {
     #[arg(long, default_value_t = 256, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
 
-    /// PagedAttention KV cache context length to preallocate.
+    /// PagedAttention KV pool as a fraction of total GPU memory (CUDA). Used when `pa_context_len` is 0.
+    #[arg(
+        long = "pa-gpu-memory-fraction",
+        default_value_t = 0.65,
+        env = "VASR_PA_GPU_MEMORY_FRACTION"
+    )]
+    pub pa_gpu_memory_fraction: f32,
+
+    /// Explicit KV context tokens. Set 0 to auto-size from `--pa-gpu-memory-fraction`.
     #[arg(
         long = "pa-context-len",
-        default_value_t = 4096,
+        default_value_t = 0,
         env = "VASR_PA_CONTEXT_LEN"
     )]
     pub pa_context_len: usize,
@@ -89,13 +99,29 @@ pub struct TranscribeServeArgs {
     #[command(flatten)]
     pub common: CommonServeArgs,
 
+    /// Maximum number of ready raw audio items to send to one ASR batch.
+    #[arg(long, default_value_t = 20, env = "VASR_MAX_BATCH_SIZE")]
+    pub max_batch_size: usize,
+
+    /// Maximum total segment audio seconds per ASR micro-batch. Set 0 to disable.
+    #[arg(long, default_value_t = 180.0, env = "VASR_MAX_BATCH_AUDIO_SEC")]
+    pub max_batch_audio_sec: f32,
+
+    /// Maximum raw audio seconds per model chunk before ASR. If omitted, the model default is used.
+    #[arg(long, env = "VASR_CHUNK_MAX_SEC")]
+    pub chunk_max_sec: Option<f32>,
+
     /// Disable VAD segmentation in offline transcribe.
     #[arg(long, default_value_t = false)]
     pub no_vad: bool,
 
-    /// Silero VAD ONNX model path. If omitted, vASR searches local Silero caches.
+    /// FunASR FSMN VAD model directory. If omitted, vASR downloads/uses `funasr/fsmn-vad`.
     #[arg(long, env = "VASR_VAD_MODEL")]
     pub vad_model: Option<String>,
+
+    /// FSMN VAD speech probability threshold.
+    #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
+    pub vad_threshold: f32,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -103,9 +129,13 @@ pub struct RealtimeServeArgs {
     #[command(flatten)]
     pub common: CommonServeArgs,
 
-    /// Silero VAD ONNX model path. If omitted, vASR searches local Silero caches.
+    /// FunASR FSMN VAD model directory. If omitted, vASR downloads/uses `funasr/fsmn-vad`.
     #[arg(long, env = "VASR_VAD_MODEL")]
     pub vad_model: Option<String>,
+
+    /// FSMN VAD speech probability threshold.
+    #[arg(long, default_value_t = 0.6, env = "VASR_VAD_THRESHOLD")]
+    pub vad_threshold: f32,
 }
 
 pub async fn run(args: ServeArgs) -> Result<()> {
@@ -117,21 +147,22 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 
 async fn run_transcribe(args: TranscribeServeArgs) -> Result<()> {
     validate_common(&args.common)?;
-    let asr = load_asr_model(&args.common)?;
+    validate_vad_threshold(args.vad_threshold)?;
+    let asr = load_asr_model(&args.common, Some(args.max_batch_size))?;
 
     let offline_vad = if args.no_vad {
         tracing::info!(
             target: "vasr_cli::serve",
-            "Offline Silero VAD segmentation disabled."
+            "Offline FSMN VAD segmentation disabled."
         );
         None
     } else {
         let vad_load_start = Instant::now();
-        let vad = load_silero(&args.vad_model)?;
+        let vad = load_fsmn_vad(&args.vad_model)?;
         tracing::info!(
             target: "vasr_cli::serve",
-            "Silero VAD loaded from `{}` in {:.3}s.",
-            vad.path().display(),
+            "FSMN VAD loaded from `{}` in {:.3}s.",
+            vad.model_dir().display(),
             vad_load_start.elapsed().as_secs_f64()
         );
         Some(Arc::new(vad) as Arc<dyn VadModel>)
@@ -144,8 +175,16 @@ async fn run_transcribe(args: TranscribeServeArgs) -> Result<()> {
         offline,
         AsrOptions {
             max_new_tokens: args.common.max_new_tokens,
+            max_batch_size: args.max_batch_size,
+            max_batch_audio_sec: args.max_batch_audio_sec,
+            chunk_max_sec: args.chunk_max_sec,
             ..AsrOptions::default()
         },
+        VadOptions {
+            threshold: args.vad_threshold,
+            ..VadOptions::default()
+        },
+        args.max_batch_size,
     );
 
     let app = Router::new()
@@ -157,14 +196,19 @@ async fn run_transcribe(args: TranscribeServeArgs) -> Result<()> {
 
 async fn run_realtime(args: RealtimeServeArgs) -> Result<()> {
     validate_common(&args.common)?;
-    let asr = load_asr_model(&args.common)?;
+    validate_vad_threshold(args.vad_threshold)?;
+    let asr = load_asr_model(&args.common, Some(1))?;
 
     let realtime_asr = Arc::clone(&asr);
     let max_new_tokens = args.common.max_new_tokens;
     let vad_model = args.vad_model.clone();
+    let vad_options = VadOptions {
+        threshold: args.vad_threshold,
+        ..VadOptions::default()
+    };
     let realtime_service = Arc::new(RealtimeService {
         make_session: Arc::new(move || {
-            let vad = load_silero(&vad_model)?.start_stream(&VadOptions::default())?;
+            let vad = load_fsmn_vad(&vad_model)?.start_stream(&vad_options)?;
             let asr_stream = realtime_asr.start_stream(&AsrOptions {
                 max_new_tokens,
                 ..AsrOptions::default()
@@ -193,21 +237,76 @@ fn validate_common(args: &CommonServeArgs) -> Result<()> {
     if args.max_new_tokens == 0 {
         bail!("--max-new-tokens must be greater than zero");
     }
+    if !(args.pa_gpu_memory_fraction > 0.0 && args.pa_gpu_memory_fraction <= 1.0) {
+        bail!("--pa-gpu-memory-fraction must be in (0.0, 1.0]");
+    }
     Ok(())
 }
 
-fn load_asr_model(args: &CommonServeArgs) -> Result<Arc<dyn AsrModel>> {
+fn build_paged_cache_config(
+    device: &Device,
+    pa_context_len: usize,
+    pa_gpu_memory_fraction: f32,
+    pa_block_size: usize,
+) -> Result<PagedCacheConfig> {
+    let memory = if pa_context_len > 0 {
+        PagedCacheMemory::ContextSize(pa_context_len)
+    } else if device.is_cuda() {
+        PagedCacheMemory::GpuMemoryFraction(pa_gpu_memory_fraction)
+    } else {
+        PagedCacheMemory::ContextSize(4096)
+    };
+    Ok(PagedCacheConfig {
+        block_size: pa_block_size,
+        memory,
+    })
+}
+
+fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
+    let sizing = match config.memory {
+        PagedCacheMemory::ContextSize(tokens) => format!("context_tokens={tokens}"),
+        PagedCacheMemory::Blocks(blocks) => format!("blocks={blocks}"),
+        PagedCacheMemory::GpuMemoryFraction(fraction) => {
+            format!("gpu_memory_fraction={fraction}")
+        }
+    };
+    tracing::info!(
+        target: "vasr_cli::serve",
+        "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, bytes={:.2} MiB.",
+        stats.block_size,
+        stats.num_blocks,
+        stats.free_blocks,
+        stats.max_context_tokens,
+        stats.bytes as f64 / (1024.0 * 1024.0)
+    );
+}
+
+fn validate_vad_threshold(threshold: f32) -> Result<()> {
+    if !(0.0..=1.0).contains(&threshold) {
+        bail!("--vad-threshold must be between 0.0 and 1.0");
+    }
+    Ok(())
+}
+
+fn load_asr_model(
+    args: &CommonServeArgs,
+    cuda_graph_max_batch: Option<usize>,
+) -> Result<Arc<dyn AsrModel>> {
     let device = resolve_device(&args.device)?;
     let dtype = resolve_dtype(&args.dtype, &device)?;
+    #[cfg(any(feature = "metal-paged-attn", feature = "cuda"))]
+    let paged_cache_config = build_paged_cache_config(
+        &device,
+        args.pa_context_len,
+        args.pa_gpu_memory_fraction,
+        args.pa_block_size,
+    )?;
     let load_options = LoadOptions {
         dtype,
         use_flash_attn: args.flash_attn,
         isq: args.isq.clone(),
-        #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
-        paged_cache: Some(PagedCacheConfig {
-            block_size: args.pa_block_size,
-            memory: PagedCacheMemory::ContextSize(args.pa_context_len),
-        }),
+        #[cfg(any(feature = "metal-paged-attn", feature = "cuda"))]
+        paged_cache: Some(paged_cache_config),
     };
 
     tracing::info!(
@@ -247,16 +346,18 @@ fn load_asr_model(args: &CommonServeArgs) -> Result<Arc<dyn AsrModel>> {
     let model_load_start = Instant::now();
     let qwen3_asr = Qwen3AsrModel::from_pretrained(&args.model, &device, &load_options)?;
     log_model_config(&qwen3_asr);
-    #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
+    #[cfg(any(feature = "metal-paged-attn", feature = "cuda"))]
     if let Some(stats) = qwen3_asr.inner().paged_cache_stats() {
+        log_paged_cache_stats(&stats, &paged_cache_config);
+    }
+    #[cfg(feature = "cuda-graph")]
+    if let Some(max_batch) = cuda_graph_max_batch.filter(|&n| n > 0) {
+        let prewarm_start = Instant::now();
+        let captured = qwen3_asr.inner().prewarm_cuda_decode_graphs(max_batch)?;
         tracing::info!(
             target: "vasr_cli::serve",
-            "PagedAttention KV cache: block_size={}, blocks={}, free_blocks={}, context_tokens={}, bytes={:.2} MiB.",
-            stats.block_size,
-            stats.num_blocks,
-            stats.free_blocks,
-            stats.max_context_tokens,
-            stats.bytes as f64 / (1024.0 * 1024.0)
+            "CUDA decode graph prewarm: graphs={captured} max_batch={max_batch} elapsed={:.3}s.",
+            prewarm_start.elapsed().as_secs_f64()
         );
     }
     tracing::info!(
@@ -300,11 +401,8 @@ async fn serve_app(app: Router, addr: SocketAddr, service: &'static str) -> Resu
     Ok(())
 }
 
-fn load_silero(path: &Option<String>) -> Result<SileroVadModel> {
-    match path {
-        Some(path) => SileroVadModel::from_onnx(path),
-        None => SileroVadModel::from_default_model(),
-    }
+fn load_fsmn_vad(path: &Option<String>) -> Result<FsmnVadModel> {
+    FsmnVadModel::from_pretrained(path.as_deref())
 }
 
 async fn health() -> Json<serde_json::Value> {

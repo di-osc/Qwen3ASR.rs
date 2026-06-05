@@ -9,20 +9,20 @@ use vasr_audio::AudioLoader;
 use vasr_data::AudioSource;
 use vasr_models::qwen3_asr::LoadOptions;
 use vasr_runtime::{
-    AsrModel, AsrOptions, OfflinePipeline, Qwen3AsrModel, SileroVadModel, VadModel,
+    AsrModel, AsrOptions, FsmnVadModel, OfflinePipeline, Qwen3AsrModel, VadModel, VadOptions,
 };
 use vasr_server::{AsyncTranscribePipeline, TranscribeInput};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: bench_transcribe_dir MODEL_DIR AUDIO_DIR [max_new_tokens] [dtype] [isq] [limit] [language]";
+    let usage = "usage: bench_transcribe_dir MODEL_DIR AUDIO_DIR [max_new_tokens] [dtype] [isq] [limit] [language] [device] [max_batch_size] [max_batch_audio_sec] [vad_model]";
     let model = args.next().context(usage)?;
     let audio_dir = args.next().context(usage)?;
     let max_new_tokens = args
         .next()
         .as_deref()
-        .unwrap_or("128")
+        .unwrap_or("256")
         .parse::<usize>()
         .context("failed to parse max_new_tokens")?;
     let dtype = parse_dtype(args.next().as_deref().unwrap_or("bf16"))?;
@@ -35,6 +35,20 @@ async fn main() -> Result<()> {
     let language = args
         .next()
         .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("none"));
+    let device = resolve_device(args.next().as_deref().unwrap_or("cuda"))?;
+    let max_batch_size = args
+        .next()
+        .as_deref()
+        .unwrap_or("20")
+        .parse::<usize>()
+        .context("failed to parse max_batch_size")?;
+    let max_batch_audio_sec = args
+        .next()
+        .as_deref()
+        .unwrap_or("60")
+        .parse::<f32>()
+        .context("failed to parse max_batch_audio_sec")?;
+    let vad_model = args.next();
 
     let mut files = audio_files(&audio_dir)?;
     if let Some(limit) = limit {
@@ -44,7 +58,6 @@ async fn main() -> Result<()> {
         bail!("no audio files found in {audio_dir:?}");
     }
 
-    let device = default_device()?;
     let load_start = Instant::now();
     let asr: Arc<dyn AsrModel> = Arc::new(Qwen3AsrModel::from_pretrained(
         &model,
@@ -53,22 +66,31 @@ async fn main() -> Result<()> {
             dtype,
             use_flash_attn: false,
             isq,
-            #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
+            #[cfg(any(
+                feature = "cuda",
+                feature = "cuda-paged-attn",
+                feature = "metal-paged-attn"
+            ))]
             paged_cache: None,
         },
     )?);
     let load_seconds = load_start.elapsed().as_secs_f64();
-    let vad = SileroVadModel::from_default_model()?;
+    let vad = FsmnVadModel::from_pretrained(vad_model.as_deref())?;
     let offline = Arc::new(OfflinePipeline {
         vad: Some(Arc::new(vad) as Arc<dyn VadModel>),
         asr,
     });
+    let vad_options = VadOptions::default();
     let options = AsrOptions {
         language,
         max_new_tokens,
+        max_batch_size,
+        max_batch_audio_sec,
         ..AsrOptions::default()
     };
-    let pipeline = AsyncTranscribePipeline::new(AudioLoader, offline, options);
+    let pipeline = AsyncTranscribePipeline::new(AudioLoader, offline, options.clone())
+        .with_vad_options(vad_options)
+        .with_stage_buffer(max_batch_size);
 
     let inputs = files
         .iter()
@@ -115,15 +137,24 @@ async fn main() -> Result<()> {
     }
 
     let wall = batch_start.elapsed().as_secs_f64();
+    let bad = outcomes
+        .iter()
+        .filter(|outcome| outcome.result.is_err())
+        .count();
     println!(
-        "summary files={} model_load_seconds={:.3} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4} annotations={}",
+        "summary device={} files={} model_load_seconds={:.3} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4} throughput_items_per_second={:.3} annotations={} bad={} max_batch_size={} max_batch_audio_sec={}",
+        device_label(&device),
         total_items,
         load_seconds,
         total_audio_seconds,
         wall,
         total_audio_seconds / wall.max(f64::EPSILON),
         wall / total_audio_seconds.max(f64::EPSILON),
-        total_annotations
+        total_items as f64 / wall.max(f64::EPSILON),
+        total_annotations,
+        bad,
+        max_batch_size,
+        max_batch_audio_sec
     );
     Ok(())
 }
@@ -156,14 +187,43 @@ fn parse_dtype(value: &str) -> Result<DType> {
     }
 }
 
-fn default_device() -> Result<Device> {
-    #[cfg(feature = "metal")]
-    {
-        return Device::new_metal(0)
-            .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"));
+fn resolve_device(value: &str) -> Result<Device> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cpu" => Ok(Device::Cpu),
+        "metal" => {
+            #[cfg(feature = "metal")]
+            {
+                Device::new_metal(0)
+                    .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                bail!("metal requested but vasr-cli was built without the metal feature")
+            }
+        }
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0)
+                    .map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                bail!("cuda requested but vasr-cli was built without the cuda feature")
+            }
+        }
+        other => bail!("unknown device {other:?}; expected cpu, metal, or cuda"),
     }
-    #[cfg(not(feature = "metal"))]
-    {
-        Ok(Device::Cpu)
+}
+
+fn device_label(device: &Device) -> &'static str {
+    if device.is_cpu() {
+        "cpu"
+    } else if device.is_metal() {
+        "metal"
+    } else if device.is_cuda() {
+        "cuda"
+    } else {
+        "unknown"
     }
 }

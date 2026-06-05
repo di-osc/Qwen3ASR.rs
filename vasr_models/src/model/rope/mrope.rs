@@ -79,37 +79,6 @@ impl MultimodalRotaryEmbedding {
 
         Ok((cos, sin))
     }
-
-    /// Compute cos/sin for a single position stream.
-    ///
-    /// During autoregressive text decode Qwen3-ASR broadcasts the same position
-    /// across the three mRoPE axes. Interleaved mRoPE's single-token fast path
-    /// only consumes modality 0, so this avoids materializing the two unused
-    /// modalities.
-    pub fn forward_first_modality(
-        &self,
-        x: &Tensor,
-        position_ids: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        let dtype = x.dtype();
-        let seq_len = position_ids.dim(2)?;
-
-        let inv_freq = self.core.get_inv_freq(seq_len)?;
-        let inv_freq = inv_freq.unsqueeze(0)?.unsqueeze(2)?.to_dtype(DType::F32)?;
-
-        let position_ids = position_ids.i(0)?.unsqueeze(1)?.to_dtype(DType::F32)?;
-        let freqs = inv_freq.broadcast_mul(&position_ids)?;
-        let freqs = freqs.transpose(1, 2)?.contiguous()?;
-
-        let cos = (freqs.cos()? * self.core.attention_scaling)?
-            .to_dtype(dtype)?
-            .unsqueeze(0)?;
-        let sin = (freqs.sin()? * self.core.attention_scaling)?
-            .to_dtype(dtype)?
-            .unsqueeze(0)?;
-
-        Ok((cos, sin))
-    }
 }
 
 /// Apply multimodal rotary position embedding for 3D positions.
@@ -177,19 +146,6 @@ fn apply_multimodal_rotary_pos_emb_interleaved(
     mrope_section: &[usize],
 ) -> Result<(Tensor, Tensor)> {
     let (_modalities, _batch, _seq_len, half_dim) = cos.dims4()?;
-    #[cfg(any(feature = "metal-paged-attn", feature = "cuda-paged-attn"))]
-    if _seq_len == 1 {
-        let cos_half = cos.i(0)?.contiguous()?;
-        let sin_half = sin.i(0)?.contiguous()?;
-        return mistralrs_quant::rotary::apply_rotary_qk(
-            &q.contiguous()?,
-            &k.contiguous()?,
-            &cos_half,
-            &sin_half,
-            true,
-        );
-    }
-
     let modality_num = mrope_section.len();
 
     let original_dtype = cos.dtype();

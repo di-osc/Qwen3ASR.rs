@@ -123,6 +123,22 @@ impl Qwen3Asr {
             .and_then(|runtime| runtime.lock().ok().map(|runtime| runtime.stats()))
     }
 
+    /// Pre-capture a vLLM-style padded CUDA decode graph at max_batch.
+    #[cfg(all(feature = "paged-attn", feature = "cuda-graph"))]
+    pub fn prewarm_cuda_decode_graphs(&self, max_batch: usize) -> Result<usize> {
+        let Some(runtime) = self.paged_cache.as_ref() else {
+            return Ok(0);
+        };
+        let mut guard = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+        Ok(guard.prewarm_cuda_decode_graphs(
+            &self._model.thinker,
+            self.device.as_ref(),
+            max_batch,
+        )?)
+    }
+
     pub fn transcribe(
         &self,
         audio: Vec<AudioInput<'_>>,

@@ -313,9 +313,6 @@ impl ThinkerTextRotaryEmbedding {
     }
 
     fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
-        if self.interleaved && position_ids.dim(2)? == 1 {
-            return self.rope.forward_first_modality(x, position_ids);
-        }
         self.rope.forward(x, position_ids)
     }
 }

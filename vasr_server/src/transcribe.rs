@@ -4,7 +4,7 @@ use std::time::Instant;
 use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
 use vasr_protocol::{InferenceData, InferencePerformance, TranscribeRequest, TranscribeResponse};
-use vasr_runtime::AsrOptions;
+use vasr_runtime::{AsrOptions, VadOptions};
 
 use crate::async_transcribe::{AsyncTranscribePipeline, TranscribeInput};
 
@@ -112,10 +112,12 @@ pub fn build_transcribe_service(pipeline: Arc<AsyncTranscribePipeline>) -> Arc<T
 pub fn build_transcribe_service_from_parts(
     offline: Arc<vasr_runtime::OfflinePipeline>,
     asr_options: AsrOptions,
+    vad_options: VadOptions,
+    max_batch_size: usize,
 ) -> Arc<TranscribeService> {
-    build_transcribe_service(Arc::new(AsyncTranscribePipeline::new(
-        vasr_audio::AudioLoader,
-        offline,
-        asr_options,
-    )))
+    build_transcribe_service(Arc::new(
+        AsyncTranscribePipeline::new(vasr_audio::AudioLoader, offline, asr_options)
+            .with_vad_options(vad_options)
+            .with_stage_buffer(max_batch_size),
+    ))
 }

@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use candle_core::cuda_backend::WrapErr;
+use candle_core::cuda_backend::CudaDType;
 use candle_core::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr};
+use candle_core::cuda_backend::cudarc::driver::{CudaStream, SyncOnDrop};
+use candle_core::op::BackpropOp;
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{CudaDevice, CudaStorage, DType, Device, Result, Shape, Storage, Tensor};
 
@@ -149,8 +151,8 @@ struct WorkspaceGuard<'a> {
 }
 
 impl WorkspaceGuard<'_> {
-    fn ptr_mut(&mut self) -> u64 {
-        *self.slot.slice.device_ptr_mut()
+    fn ptr_mut<'a>(&'a mut self, stream: &'a CudaStream) -> (u64, SyncOnDrop<'a>) {
+        self.slot.slice.device_ptr_mut(stream)
     }
 }
 
@@ -166,7 +168,7 @@ fn workspace_ensure<'a>(dev: &CudaDevice, bytes: usize) -> Result<WorkspaceGuard
         match guard.get(&device_key).copied() {
             Some(mtx) => mtx,
             None => {
-                let slice = unsafe { dev.alloc::<u8>(bytes.max(1)).w()? };
+                let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
                 let leaked = Box::leak(Box::new(Mutex::new(WorkspaceSlot {
                     slice,
                     cap: bytes.max(1),
@@ -178,7 +180,7 @@ fn workspace_ensure<'a>(dev: &CudaDevice, bytes: usize) -> Result<WorkspaceGuard
     };
     let mut slot = device_mtx.lock().unwrap();
     if slot.cap < bytes {
-        slot.slice = unsafe { dev.alloc::<u8>(bytes).w()? };
+        slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
         slot.cap = bytes;
     }
     Ok(WorkspaceGuard {
@@ -217,12 +219,35 @@ fn fused_glu_launcher(dtype: DType) -> Result<FusedGluLauncher> {
     }
 }
 
-fn slice_ptr_on_stream<'a, T: DeviceRepr>(v: &'a CudaSlice<T>, lo: usize) -> u64 {
-    *v.device_ptr() + (lo * std::mem::size_of::<T>()) as u64
+fn slice_ptr_on_stream<'a, T: DeviceRepr>(
+    v: &'a CudaSlice<T>,
+    stream: &'a CudaStream,
+    lo: usize,
+) -> (u64, SyncOnDrop<'a>) {
+    let (ptr, guard) = v.device_ptr(stream);
+    (ptr + (lo * std::mem::size_of::<T>()) as u64, guard)
 }
 
-fn slice_ptr_mut_on_stream<'a, T: DeviceRepr>(v: &'a mut CudaSlice<T>, lo: usize) -> u64 {
-    *v.device_ptr_mut() + (lo * std::mem::size_of::<T>()) as u64
+fn slice_ptr_mut_on_stream<'a, T: DeviceRepr>(
+    v: &'a mut CudaSlice<T>,
+    stream: &'a CudaStream,
+    lo: usize,
+) -> (u64, SyncOnDrop<'a>) {
+    let (ptr, guard) = v.device_ptr_mut(stream);
+    (ptr + (lo * std::mem::size_of::<T>()) as u64, guard)
+}
+
+fn tensor_from_cuda_slice<T: DeviceRepr + CudaDType>(
+    slice: CudaSlice<T>,
+    dev: &CudaDevice,
+    shape: Shape,
+) -> Tensor {
+    Tensor::from_storage(
+        Storage::Cuda(CudaStorage::wrap_cuda_slice(slice, dev.clone())),
+        shape,
+        BackpropOp::none(),
+        false,
+    )
 }
 
 pub fn can_run(w: &QTensor, xs: &Tensor) -> bool {
@@ -271,20 +296,20 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
         candle_core::bail!("q8_mmvq: shape mismatch weight [{nrows}, {ncols}] input tail {k}");
     }
 
-    let stream = dev.cu_stream();
+    let stream = dev.cuda_stream();
     let xs = xs.contiguous()?;
     let (xs_storage, xs_layout) = xs.storage_and_layout();
     let Storage::Cuda(xs_cuda) = &*xs_storage else {
         candle_core::bail!("q8_mmvq: input must live on CUDA");
     };
     let xs_offset = xs_layout.start_offset();
-    let stream_ptr = *stream as *mut std::ffi::c_void;
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let num_blocks_per_row = k_padded / Q8_1_BLOCK_SIZE;
     let dst_row_bytes = num_blocks_per_row * Q8_1_TYPE_SIZE;
     let scratch_bytes = b_size * dst_row_bytes;
     let mut workspace = workspace_ensure(&dev, scratch_bytes)?;
-    let scratch_ptr = workspace.ptr_mut();
+    let (scratch_ptr, scratch_guard) = workspace.ptr_mut(&stream);
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let weight_ptr = w.device_ptr()? as *const std::ffi::c_void;
     let launch = launcher(xs.dtype())?;
@@ -292,9 +317,9 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
     match xs.dtype() {
         DType::BF16 => {
             let slice = xs_cuda.as_cuda_slice::<half::bf16>()?;
-            let mut out = unsafe { dev.alloc::<half::bf16>(nrows * b_size).w()? };
-            let xs_ptr = slice_ptr_on_stream(slice, xs_offset);
-            let out_ptr = slice_ptr_mut_on_stream(&mut out, 0);
+            let mut out = unsafe { dev.alloc::<half::bf16>(nrows * b_size)? };
+            let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
+            let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
             unsafe {
                 launch_mmvq_gguf_quantize_q8_1_bf16(
                     xs_ptr as *const std::ffi::c_void,
@@ -316,16 +341,16 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                     stream_ptr,
                 );
             }
-            Tensor::from_storage(
-                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
-                output_shape(&xs, nrows),
-            )
+            drop(out_guard);
+            drop(xs_guard);
+            drop(scratch_guard);
+            Ok(tensor_from_cuda_slice(out, &dev, output_shape(&xs, nrows)))
         }
         DType::F16 => {
             let slice = xs_cuda.as_cuda_slice::<half::f16>()?;
-            let mut out = unsafe { dev.alloc::<half::f16>(nrows * b_size).w()? };
-            let xs_ptr = slice_ptr_on_stream(slice, xs_offset);
-            let out_ptr = slice_ptr_mut_on_stream(&mut out, 0);
+            let mut out = unsafe { dev.alloc::<half::f16>(nrows * b_size)? };
+            let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
+            let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
             unsafe {
                 launch_mmvq_gguf_quantize_q8_1_f16(
                     xs_ptr as *const std::ffi::c_void,
@@ -347,16 +372,16 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                     stream_ptr,
                 );
             }
-            Tensor::from_storage(
-                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
-                output_shape(&xs, nrows),
-            )
+            drop(out_guard);
+            drop(xs_guard);
+            drop(scratch_guard);
+            Ok(tensor_from_cuda_slice(out, &dev, output_shape(&xs, nrows)))
         }
         DType::F32 => {
             let slice = xs_cuda.as_cuda_slice::<f32>()?;
-            let mut out = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
-            let xs_ptr = slice_ptr_on_stream(slice, xs_offset);
-            let out_ptr = slice_ptr_mut_on_stream(&mut out, 0);
+            let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+            let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
+            let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
             unsafe {
                 launch_mmvq_gguf_quantize_q8_1_f32(
                     xs_ptr as *const std::ffi::c_void,
@@ -378,10 +403,10 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                     stream_ptr,
                 );
             }
-            Tensor::from_storage(
-                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
-                output_shape(&xs, nrows),
-            )
+            drop(out_guard);
+            drop(xs_guard);
+            drop(scratch_guard);
+            Ok(tensor_from_cuda_slice(out, &dev, output_shape(&xs, nrows)))
         }
         _ => unreachable!(),
     }
@@ -419,20 +444,20 @@ pub fn fused_glu_silu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> Result<T
         );
     }
 
-    let stream = dev.cu_stream();
+    let stream = dev.cuda_stream();
     let xs = xs.contiguous()?;
     let (xs_storage, xs_layout) = xs.storage_and_layout();
     let Storage::Cuda(xs_cuda) = &*xs_storage else {
         candle_core::bail!("q8_mmvq fused_glu: input must live on CUDA");
     };
     let xs_offset = xs_layout.start_offset();
-    let stream_ptr = *stream as *mut std::ffi::c_void;
+    let stream_ptr = stream.cu_stream() as *mut std::ffi::c_void;
     let k_padded = pad(k, MATRIX_ROW_PADDING);
     let num_blocks_per_row = k_padded / Q8_1_BLOCK_SIZE;
     let dst_row_bytes = num_blocks_per_row * Q8_1_TYPE_SIZE;
     let scratch_bytes = b_size * dst_row_bytes;
     let mut workspace = workspace_ensure(&dev, scratch_bytes)?;
-    let scratch_ptr = workspace.ptr_mut();
+    let (scratch_ptr, scratch_guard) = workspace.ptr_mut(&stream);
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let gate_ptr = gate_w.device_ptr()? as *const std::ffi::c_void;
     let up_ptr = up_w.device_ptr()? as *const std::ffi::c_void;
@@ -442,9 +467,9 @@ pub fn fused_glu_silu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> Result<T
     match xs.dtype() {
         DType::BF16 => {
             let slice = xs_cuda.as_cuda_slice::<half::bf16>()?;
-            let mut out = unsafe { dev.alloc::<half::bf16>(nrows * b_size).w()? };
-            let xs_ptr = slice_ptr_on_stream(slice, xs_offset);
-            let out_ptr = slice_ptr_mut_on_stream(&mut out, 0);
+            let mut out = unsafe { dev.alloc::<half::bf16>(nrows * b_size)? };
+            let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
+            let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
             unsafe {
                 launch_mmvq_gguf_quantize_q8_1_bf16(
                     xs_ptr as *const std::ffi::c_void,
@@ -468,16 +493,16 @@ pub fn fused_glu_silu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> Result<T
                     stream_ptr,
                 );
             }
-            Tensor::from_storage(
-                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
-                output_shape(&xs, nrows),
-            )
+            drop(out_guard);
+            drop(xs_guard);
+            drop(scratch_guard);
+            Ok(tensor_from_cuda_slice(out, &dev, output_shape(&xs, nrows)))
         }
         DType::F16 => {
             let slice = xs_cuda.as_cuda_slice::<half::f16>()?;
-            let mut out = unsafe { dev.alloc::<half::f16>(nrows * b_size).w()? };
-            let xs_ptr = slice_ptr_on_stream(slice, xs_offset);
-            let out_ptr = slice_ptr_mut_on_stream(&mut out, 0);
+            let mut out = unsafe { dev.alloc::<half::f16>(nrows * b_size)? };
+            let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
+            let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
             unsafe {
                 launch_mmvq_gguf_quantize_q8_1_f16(
                     xs_ptr as *const std::ffi::c_void,
@@ -501,16 +526,16 @@ pub fn fused_glu_silu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> Result<T
                     stream_ptr,
                 );
             }
-            Tensor::from_storage(
-                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
-                output_shape(&xs, nrows),
-            )
+            drop(out_guard);
+            drop(xs_guard);
+            drop(scratch_guard);
+            Ok(tensor_from_cuda_slice(out, &dev, output_shape(&xs, nrows)))
         }
         DType::F32 => {
             let slice = xs_cuda.as_cuda_slice::<f32>()?;
-            let mut out = unsafe { dev.alloc::<f32>(nrows * b_size).w()? };
-            let xs_ptr = slice_ptr_on_stream(slice, xs_offset);
-            let out_ptr = slice_ptr_mut_on_stream(&mut out, 0);
+            let mut out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
+            let (xs_ptr, xs_guard) = slice_ptr_on_stream(slice, &stream, xs_offset);
+            let (out_ptr, out_guard) = slice_ptr_mut_on_stream(&mut out, &stream, 0);
             unsafe {
                 launch_mmvq_gguf_quantize_q8_1_f32(
                     xs_ptr as *const std::ffi::c_void,
@@ -534,10 +559,10 @@ pub fn fused_glu_silu(gate_w: &QTensor, up_w: &QTensor, xs: &Tensor) -> Result<T
                     stream_ptr,
                 );
             }
-            Tensor::from_storage(
-                Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
-                output_shape(&xs, nrows),
-            )
+            drop(out_guard);
+            drop(xs_guard);
+            drop(scratch_guard);
+            Ok(tensor_from_cuda_slice(out, &dev, output_shape(&xs, nrows)))
         }
         _ => unreachable!(),
     }

@@ -33,7 +33,71 @@ pub fn extract_features(wav_16k_mono: &[f32]) -> Result<Features> {
     }
 
     let wav_f64: Vec<f64> = wav_16k_mono.iter().map(|&x| f64::from(x)).collect();
-    let padded = reflect_pad(&wav_f64, cfg.n_fft / 2, cfg.n_fft / 2);
+    let input_features = extract_log_mel_frames(&cfg, wav_f64.len(), frames, |src| wav_f64[src])?;
+
+    Ok(Features {
+        input_features,
+        feature_attention_mask: vec![1u8; frames],
+    })
+}
+
+/// Extract real-frame log-mel features using a longer zero-padded waveform length.
+///
+/// This preserves the old batch waveform-padding boundary semantics for real frames
+/// while avoiding FFT/log-mel work for frames that are fully masked out later.
+pub fn extract_features_with_padded_waveform_len(
+    wav_16k_mono: &[f32],
+    padded_len: usize,
+) -> Result<Features> {
+    let cfg = WhisperFeatureExtractorConfig::default();
+    if padded_len < wav_16k_mono.len() {
+        anyhow::bail!(
+            "padded waveform length {} is shorter than waveform length {}",
+            padded_len,
+            wav_16k_mono.len()
+        );
+    }
+
+    let frames_total = padded_len / cfg.hop_length;
+    let frames = if wav_16k_mono.is_empty() {
+        0
+    } else {
+        wav_16k_mono
+            .len()
+            .div_ceil(cfg.hop_length)
+            .min(frames_total)
+    };
+
+    if frames == 0 {
+        return Ok(Features {
+            input_features: vec![vec![]; cfg.feature_size],
+            feature_attention_mask: vec![],
+        });
+    }
+
+    let input_features = extract_log_mel_frames(&cfg, padded_len, frames, |src| {
+        wav_16k_mono.get(src).copied().map(f64::from).unwrap_or(0.0)
+    })?;
+
+    Ok(Features {
+        input_features,
+        feature_attention_mask: vec![1u8; frames],
+    })
+}
+
+fn extract_log_mel_frames<F>(
+    cfg: &WhisperFeatureExtractorConfig,
+    source_len: usize,
+    frames: usize,
+    sample_at: F,
+) -> Result<Vec<Vec<f32>>>
+where
+    F: Fn(usize) -> f64,
+{
+    if source_len == 0 {
+        return Ok(vec![vec![]; cfg.feature_size]);
+    }
+
     let window = hann_window_periodic(cfg.n_fft);
     let mel_filters_t = mel_filter_bank_slaney_t(
         1 + cfg.n_fft / 2,
@@ -61,7 +125,9 @@ pub fn extract_features(wav_16k_mono: &[f32]) -> Result<Features> {
         let start = frame_idx * cfg.hop_length;
 
         for i in 0..cfg.n_fft {
-            let x = padded.get(start + i).copied().unwrap_or_default();
+            let idx = start as isize + i as isize - (cfg.n_fft / 2) as isize;
+            let src = reflect_index(idx, source_len);
+            let x = sample_at(src);
             buf[i] = rustfft::num_complex::Complex::new(x * window[i], 0.0);
         }
 
@@ -101,10 +167,7 @@ pub fn extract_features(wav_16k_mono: &[f32]) -> Result<Features> {
         }
     }
 
-    Ok(Features {
-        input_features: log_spec,
-        feature_attention_mask: vec![1u8; frames],
-    })
+    Ok(log_spec)
 }
 
 /// Incremental log-mel feature extraction for streaming transcription.
@@ -378,26 +441,6 @@ fn reflect_index(i: isize, len: usize) -> usize {
     j as usize
 }
 
-fn reflect_pad(signal: &[f64], pad_left: usize, pad_right: usize) -> Vec<f64> {
-    if signal.is_empty() {
-        return vec![];
-    }
-
-    let len_out = signal
-        .len()
-        .saturating_add(pad_left)
-        .saturating_add(pad_right);
-    let mut out = Vec::with_capacity(len_out);
-
-    for k in 0..len_out {
-        let idx = k as isize - pad_left as isize;
-        let src = reflect_index(idx, signal.len());
-        out.push(signal[src]);
-    }
-
-    out
-}
-
 fn hertz_to_mel_slaney(freq_hz: f64) -> f64 {
     let min_log_hertz = 1000.0;
     let min_log_mel = 15.0;
@@ -475,7 +518,9 @@ fn mel_filter_bank_slaney_t(
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingFeatureExtractor, extract_features};
+    use super::{
+        StreamingFeatureExtractor, extract_features, extract_features_with_padded_waveform_len,
+    };
 
     #[test]
     fn test_extract_features_empty_audio() -> anyhow::Result<()> {
@@ -486,6 +531,47 @@ mod tests {
         if !feats.feature_attention_mask.is_empty() {
             anyhow::bail!("expected empty attention mask");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_features_with_padded_waveform_len_matches_full_padding_prefix()
+    -> anyhow::Result<()> {
+        let wav_len = 1723usize;
+        let padded_len = 4800usize;
+        let wav: Vec<f32> = (0..wav_len)
+            .map(|i| {
+                let t = i as f32;
+                (t * 0.017).sin() * 0.22 + (t * 0.031).cos() * 0.07
+            })
+            .collect();
+
+        let mut padded = wav.clone();
+        padded.resize(padded_len, 0.0);
+
+        let full = extract_features(&padded)?;
+        let got = extract_features_with_padded_waveform_len(&wav, padded_len)?;
+        let expected_frames = wav_len.div_ceil(160);
+
+        if got.feature_attention_mask != vec![1u8; expected_frames] {
+            anyhow::bail!(
+                "mask mismatch: got_len={} expected_frames={expected_frames}",
+                got.feature_attention_mask.len()
+            );
+        }
+
+        let mut expected = full;
+        for row in &mut expected.input_features {
+            row.truncate(expected_frames);
+        }
+        expected.feature_attention_mask = vec![1u8; expected_frames];
+
+        assert_features_close(
+            got.input_features.as_slice(),
+            got.feature_attention_mask.as_slice(),
+            &expected,
+        )?;
+
         Ok(())
     }
 

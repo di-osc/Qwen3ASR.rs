@@ -20,6 +20,15 @@ pub struct VadPrepared {
     pub slices: Vec<Waveform>,
 }
 
+/// Result of the VAD stage. `Disabled` is the only case that should fall back
+/// to raw ASR; `NoSpeech` means VAD ran and found nothing to recognize.
+#[derive(Debug, Clone)]
+pub enum VadPreparation {
+    Disabled,
+    NoSpeech,
+    Speech(VadPrepared),
+}
+
 impl OfflinePipeline {
     pub fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
         self.transcribe_with_vad_options(waveform, options, &VadOptions::default())
@@ -32,29 +41,34 @@ impl OfflinePipeline {
         vad_options: &VadOptions,
     ) -> Result<Timeline> {
         let mut timeline = Timeline::new("offline_audio");
-        if let Some(prepared) = self.prepare_vad(waveform, vad_options)? {
-            timeline
-                .annotations
-                .extend(self.transcribe_prepared(prepared, options)?);
-            return Ok(timeline);
+        match self.prepare_vad_stage(waveform, vad_options)? {
+            VadPreparation::Speech(prepared) => {
+                timeline
+                    .annotations
+                    .extend(self.transcribe_prepared(prepared, options)?);
+            }
+            VadPreparation::NoSpeech => {}
+            VadPreparation::Disabled => {
+                let asr_timeline = self.asr.transcribe(waveform, options)?;
+                timeline.annotations.extend(asr_timeline.annotations);
+            }
         }
-        let asr_timeline = self.asr.transcribe(waveform, options)?;
-        timeline.annotations.extend(asr_timeline.annotations);
         Ok(timeline)
     }
 
-    /// Run VAD and slice the waveform. Returns `None` when VAD is disabled or finds no speech.
-    pub fn prepare_vad(
+    /// Run VAD and slice the waveform, preserving whether VAD was disabled or
+    /// ran and found no speech.
+    pub fn prepare_vad_stage(
         &self,
         waveform: &Waveform,
         vad_options: &VadOptions,
-    ) -> Result<Option<VadPrepared>> {
+    ) -> Result<VadPreparation> {
         let Some(vad) = &self.vad else {
-            return Ok(None);
+            return Ok(VadPreparation::Disabled);
         };
         let segments = vad.detect(waveform, vad_options)?;
         if segments.is_empty() {
-            return Ok(None);
+            return Ok(VadPreparation::NoSpeech);
         }
         let speech_annotations = segments
             .iter()
@@ -67,15 +81,32 @@ impl OfflinePipeline {
                 )
             })
             .collect();
-        let slices = segments
+        let asr_segments = merge_vad_segments_for_asr(
+            segments.as_slice(),
+            vad_options.merge_max_gap_ms,
+            vad_options.merge_max_segment_ms,
+        );
+        let slices = asr_segments
             .iter()
             .map(|segment| waveform.slice_ms(segment.range.start.0, segment.range.end.0))
             .collect();
-        Ok(Some(VadPrepared {
+        Ok(VadPreparation::Speech(VadPrepared {
             speech_annotations,
-            segments,
+            segments: asr_segments,
             slices,
         }))
+    }
+
+    /// Run VAD and slice the waveform. Returns `None` when VAD is disabled or finds no speech.
+    pub fn prepare_vad(
+        &self,
+        waveform: &Waveform,
+        vad_options: &VadOptions,
+    ) -> Result<Option<VadPrepared>> {
+        match self.prepare_vad_stage(waveform, vad_options)? {
+            VadPreparation::Speech(prepared) => Ok(Some(prepared)),
+            VadPreparation::Disabled | VadPreparation::NoSpeech => Ok(None),
+        }
     }
 
     /// Run ASR on VAD slices and offset segment annotations back to the original timeline.
@@ -99,6 +130,37 @@ impl OfflinePipeline {
         }
         Ok(annotations)
     }
+}
+
+fn merge_vad_segments_for_asr(
+    segments: &[VadSegment],
+    max_gap_ms: u64,
+    max_segment_ms: u64,
+) -> Vec<VadSegment> {
+    if segments.is_empty() || max_gap_ms == 0 || max_segment_ms == 0 {
+        return segments.to_vec();
+    }
+
+    let mut sorted = segments.to_vec();
+    sorted.sort_by_key(|segment| (segment.range.start, segment.range.end));
+    let mut merged: Vec<VadSegment> = Vec::with_capacity(sorted.len());
+
+    for segment in sorted {
+        let Some(last) = merged.last_mut() else {
+            merged.push(segment);
+            continue;
+        };
+        let gap = segment.range.start.0.saturating_sub(last.range.end.0);
+        let merged_duration = segment.range.end.0.saturating_sub(last.range.start.0);
+        if gap <= max_gap_ms && merged_duration <= max_segment_ms {
+            last.range.end = last.range.end.max(segment.range.end);
+            last.probability = last.probability.max(segment.probability);
+        } else {
+            merged.push(segment);
+        }
+    }
+
+    merged
 }
 
 pub fn offset_annotations(annotations: Vec<Annotation>, offset: DurationMs) -> Vec<Annotation> {
