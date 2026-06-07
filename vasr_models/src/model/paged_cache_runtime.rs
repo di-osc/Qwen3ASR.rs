@@ -156,21 +156,41 @@ fn resolve_num_blocks(
         PagedCacheMemory::ContextSize(tokens) => Ok(tokens.div_ceil(block_size) + 1),
         PagedCacheMemory::Blocks(blocks) => Ok(blocks),
         PagedCacheMemory::GpuMemoryFraction(fraction) => {
-            if !device.is_cuda() {
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (
+                    fraction,
+                    device,
+                    num_layers,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    dtype,
+                );
                 candle_core::bail!(
-                    "GpuMemoryFraction paged cache sizing requires a CUDA device; got {device:?}"
+                    "GpuMemoryFraction paged cache sizing requires the `cuda` feature"
                 );
             }
-            if !(fraction > 0.0 && fraction <= 1.0) {
-                candle_core::bail!("GPU memory fraction must be in (0.0, 1.0]; got {fraction}");
+            #[cfg(feature = "cuda")]
+            {
+                if !device.is_cuda() {
+                    candle_core::bail!(
+                        "GpuMemoryFraction paged cache sizing requires a CUDA device; got {device:?}"
+                    );
+                }
+                if !(fraction > 0.0 && fraction <= 1.0) {
+                    candle_core::bail!("GPU memory fraction must be in (0.0, 1.0]; got {fraction}");
+                }
+                let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
+                    candle_core::bail!(
+                        "GpuMemoryFraction paged cache sizing requires a CUDA device"
+                    );
+                };
+                let byte_budget = cuda_kv_byte_budget(gpu_id, fraction)?;
+                let bytes_per_block =
+                    bytes_per_paged_block(num_layers, num_kv_heads, head_dim, block_size, dtype)?;
+                blocks_for_byte_budget(byte_budget, bytes_per_block)
             }
-            let candle_core::DeviceLocation::Cuda { gpu_id } = device.location() else {
-                candle_core::bail!("GpuMemoryFraction paged cache sizing requires a CUDA device");
-            };
-            let byte_budget = cuda_kv_byte_budget(gpu_id, fraction)?;
-            let bytes_per_block =
-                bytes_per_paged_block(num_layers, num_kv_heads, head_dim, block_size, dtype)?;
-            blocks_for_byte_budget(byte_budget, bytes_per_block)
         }
     }
 }
