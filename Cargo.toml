@@ -1,12 +1,12 @@
 [workspace]
 members = [
-  "vasr_models",
-  "vasr_audio",
-  "vasr_cli",
-  "vasr_data",
-  "vasr_protocol",
-  "vasr_runtime",
-  "vasr_server",
+  "vasr-models",
+  "vasr-audio",
+  "vasr-cli",
+  "vasr-data",
+  "vasr-protocol",
+  "vasr-runtime",
+  "vasr-server",
 ]
 resolver = "3"
 
