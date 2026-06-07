@@ -66,11 +66,7 @@ async fn main() -> Result<()> {
             dtype,
             use_flash_attn: false,
             isq,
-            #[cfg(any(
-                feature = "cuda",
-                feature = "cuda-paged-attn",
-                feature = "metal-paged-attn"
-            ))]
+            #[cfg(any(feature = "cuda", feature = "cuda-paged-attn", feature = "metal"))]
             paged_cache: None,
         },
     )?);

@@ -50,13 +50,18 @@ const LANG_PREFIX: &str = "language ";
 const DEFAULT_REPETITION_THRESHOLD: usize = 20;
 const MAX_PATTERN_LEN: usize = 20;
 
-/// Normalize a language name to the canonical "Qwen3-ASR" form:
-/// first letter uppercase, the rest lowercase (e.g., `cHINese` -> `Chinese`).
+/// Normalize a language name to the canonical "Qwen3-ASR" form.
+///
+/// Accepts canonical names (`Chinese`), common aliases (`mandarin`), and ISO codes (`zh`).
 pub fn normalize_language_name(language: &str) -> Result<String> {
     let s = language.trim();
     if s.is_empty() {
         bail!("language is empty");
     }
+    if let Some(canonical) = language_alias(s) {
+        return Ok(canonical.to_string());
+    }
+
     let mut chars = s.chars();
     let first = chars
         .next()
@@ -67,6 +72,42 @@ pub fn normalize_language_name(language: &str) -> Result<String> {
         out.extend(c.to_lowercase());
     }
     Ok(out)
+}
+
+fn language_alias(language: &str) -> Option<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "zh" | "zh-cn" | "zh-hans" | "cmn" | "mandarin" | "chinese" => Some("Chinese"),
+        "yue" | "zh-yue" | "zh-hk" | "cantonese" => Some("Cantonese"),
+        "en" | "english" => Some("English"),
+        "ar" | "arabic" => Some("Arabic"),
+        "de" | "german" => Some("German"),
+        "fr" | "french" => Some("French"),
+        "es" | "spanish" => Some("Spanish"),
+        "pt" | "portuguese" => Some("Portuguese"),
+        "id" | "indonesian" => Some("Indonesian"),
+        "it" | "italian" => Some("Italian"),
+        "ko" | "korean" => Some("Korean"),
+        "ru" | "russian" => Some("Russian"),
+        "th" | "thai" => Some("Thai"),
+        "vi" | "vietnamese" => Some("Vietnamese"),
+        "ja" | "japanese" => Some("Japanese"),
+        "tr" | "turkish" => Some("Turkish"),
+        "hi" | "hindi" => Some("Hindi"),
+        "ms" | "malay" => Some("Malay"),
+        "nl" | "dutch" => Some("Dutch"),
+        "sv" | "swedish" => Some("Swedish"),
+        "da" | "danish" => Some("Danish"),
+        "fi" | "finnish" => Some("Finnish"),
+        "pl" | "polish" => Some("Polish"),
+        "cs" | "czech" => Some("Czech"),
+        "fil" | "tl" | "filipino" | "tagalog" => Some("Filipino"),
+        "fa" | "pes" | "persian" | "farsi" => Some("Persian"),
+        "el" | "greek" => Some("Greek"),
+        "ro" | "romanian" => Some("Romanian"),
+        "hu" | "hungarian" => Some("Hungarian"),
+        "mk" | "macedonian" => Some("Macedonian"),
+        _ => None,
+    }
 }
 
 /// Validate that `language` is supported by the official Qwen3-ASR implementation.
@@ -266,7 +307,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_and_fix_repetitions, merge_languages, parse_asr_output};
+    use super::{
+        detect_and_fix_repetitions, merge_languages, normalize_language_name, parse_asr_output,
+        validate_language,
+    };
+
+    #[test]
+    fn normalize_language_name_accepts_iso_codes() -> anyhow::Result<()> {
+        assert_eq!(normalize_language_name("zh")?, "Chinese");
+        assert_eq!(normalize_language_name("ZH-CN")?, "Chinese");
+        assert_eq!(normalize_language_name("en")?, "English");
+        validate_language(&normalize_language_name("ja")?)?;
+        Ok(())
+    }
 
     #[test]
     fn test_detect_and_fix_repetitions_char_runs() -> anyhow::Result<()> {

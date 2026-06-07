@@ -41,7 +41,7 @@ async fn handle_realtime(
                 };
                 let _ = socket
                     .send(Message::Text(
-                        serde_json::to_string(&event).unwrap_or_default(),
+                        serde_json::to_string(&event).unwrap_or_default().into(),
                     ))
                     .await;
             }
@@ -54,7 +54,7 @@ async fn run_socket(mut socket: WebSocket, mut session: RealtimeSession) {
     let created = ServerRealtimeEvent::SessionCreated { session_id };
     let _ = socket
         .send(Message::Text(
-            serde_json::to_string(&created).unwrap_or_default(),
+            serde_json::to_string(&created).unwrap_or_default().into(),
         ))
         .await;
 
@@ -70,7 +70,7 @@ async fn run_socket(mut socket: WebSocket, mut session: RealtimeSession) {
                     };
                     let _ = socket
                         .send(Message::Text(
-                            serde_json::to_string(&err).unwrap_or_default(),
+                            serde_json::to_string(&err).unwrap_or_default().into(),
                         ))
                         .await;
                     continue;
@@ -86,7 +86,7 @@ async fn run_socket(mut socket: WebSocket, mut session: RealtimeSession) {
                 for event in events {
                     if socket
                         .send(Message::Text(
-                            serde_json::to_string(&event).unwrap_or_default(),
+                            serde_json::to_string(&event).unwrap_or_default().into(),
                         ))
                         .await
                         .is_err()

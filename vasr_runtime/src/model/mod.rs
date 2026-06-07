@@ -16,7 +16,7 @@ impl Default for AsrOptions {
         Self {
             language: None,
             context: String::new(),
-            max_new_tokens: 256,
+            max_new_tokens: 512,
             max_batch_size: 0,
             max_batch_audio_sec: 180.0,
             chunk_max_sec: None,
@@ -49,7 +49,7 @@ pub trait StreamingAsrModel: Send {
 
 #[derive(Debug, Clone)]
 pub struct VadOptions {
-    /// `speech_noise_thres` in funasr_onnx / fasr (default 0.6).
+    /// `speech_noise_thres` in funasr_onnx / fasr.
     pub threshold: f32,
     /// Kept for API compatibility; funasr E2E VAD uses window thresholds instead.
     pub min_speech_ms: u64,
@@ -64,7 +64,7 @@ pub struct VadOptions {
 impl Default for VadOptions {
     fn default() -> Self {
         Self {
-            threshold: 0.6,
+            threshold: 0.5,
             min_speech_ms: 250,
             min_silence_ms: 500,
             merge_max_gap_ms: 2_000,
@@ -78,9 +78,9 @@ mod tests {
     use super::VadOptions;
 
     #[test]
-    fn vad_defaults_match_fasr_fsmn() {
+    fn vad_defaults_match_vasr() {
         let opts = VadOptions::default();
-        assert_eq!(opts.threshold, 0.6);
+        assert_eq!(opts.threshold, 0.5);
         assert_eq!(opts.min_silence_ms, 500);
         assert_eq!(opts.merge_max_gap_ms, 2_000);
         assert_eq!(opts.merge_max_segment_ms, 30_000);

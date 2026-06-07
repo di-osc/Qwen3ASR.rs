@@ -6,8 +6,6 @@
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
 
-#[cfg(feature = "paged-attn")]
-use crate::model::attention;
 use crate::model::isq_linear::set_linear_is_prefill;
 use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
@@ -31,12 +29,19 @@ fn duration_to_us(d: std::time::Duration) -> u64 {
 }
 
 #[cfg(feature = "paged-attn")]
-fn use_paged_attn_on_device(device: &Device) -> bool {
+pub(crate) fn use_paged_attn_on_device(device: &Device) -> bool {
     if std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some() {
         return false;
     }
     if device.is_metal() {
-        return std::env::var_os("VASR_FORCE_PAGED_ATTN").is_some();
+        #[cfg(feature = "metal-paged-attn")]
+        {
+            return true;
+        }
+        #[cfg(not(feature = "metal-paged-attn"))]
+        {
+            return false;
+        }
     }
     device.is_cuda()
 }
@@ -237,7 +242,7 @@ fn kv_cache_for_generation(
     ))
 }
 
-fn argmax_token_ids_from_logits(logits: &Tensor, batch: usize) -> Result<Vec<u32>> {
+pub(crate) fn argmax_token_ids_from_logits(logits: &Tensor, batch: usize) -> Result<Vec<u32>> {
     if batch == 1 {
         let row = if logits.rank() == 1 {
             logits.clone()
@@ -991,467 +996,25 @@ fn greedy_generate_paged_batch(
     max_new_tokens: usize,
     eos_token_ids: &[u32],
     paged_runtime: Option<&SharedPagedCacheRuntime>,
-    #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
+    #[cfg(feature = "timing")] _timings: Option<&mut GenerationTimings>,
     #[cfg(not(feature = "timing"))] _timings: Option<&mut GenerationTimings>,
 ) -> Result<Vec<Vec<u32>>> {
-    let batch = input_ids.len();
-    if batch == 0 {
-        return Ok(vec![]);
-    }
-    let seq_len = input_ids
-        .first()
-        .map(|row| row.len())
-        .ok_or_else(|| anyhow::anyhow!("missing first input row"))?;
-    if seq_len == 0 {
-        bail!("input_ids rows are empty");
-    }
-    for (i, row) in input_ids.iter().enumerate() {
-        if row.len() != seq_len {
-            bail!(
-                "paged batch input_ids[{i}] length mismatch: expected={seq_len}, got={}",
-                row.len()
-            );
-        }
-    }
-    for (i, row) in attention_mask.iter().enumerate() {
-        if row.len() != seq_len {
-            bail!(
-                "paged batch attention_mask[{i}] length mismatch: expected={seq_len}, got={}",
-                row.len()
-            );
-        }
-    }
-    if max_new_tokens == 0 {
-        return Ok(vec![vec![]; batch]);
-    }
+    use crate::model::paged_batch_engine::{PagedBatchConfig, paged_batch_run};
 
-    let normalized_batch = if attention_masks_are_right_padded(attention_mask) {
-        None
-    } else {
-        Some(normalize_batch_for_paged_prefill(
-            input_ids,
-            attention_mask,
-        )?)
-    };
-    let (paged_id_rows, paged_mask_rows, prompt_lens_usize): (
-        Vec<&[u32]>,
-        Vec<&[u32]>,
-        Vec<usize>,
-    ) = if let Some((ids, masks, lens)) = normalized_batch.as_ref() {
-        (
-            ids.iter().map(Vec::as_slice).collect(),
-            masks.iter().map(Vec::as_slice).collect(),
-            lens.clone(),
-        )
-    } else {
-        (
-            input_ids.to_vec(),
-            attention_mask.to_vec(),
-            attention_mask
-                .iter()
-                .map(|row| row.iter().filter(|&&v| v != 0).count())
-                .collect(),
-        )
-    };
-
-    #[cfg(feature = "timing")]
-    let start_tensors = std::time::Instant::now();
-
-    let mut ids_flat: Vec<u32> = Vec::with_capacity(batch.saturating_mul(seq_len));
-    let mut attn_flat: Vec<u32> = Vec::with_capacity(batch.saturating_mul(seq_len));
-    for i in 0..batch {
-        ids_flat.extend_from_slice(paged_id_rows[i]);
-        attn_flat.extend_from_slice(paged_mask_rows[i]);
-    }
-    let input_ids_t = Tensor::from_vec(ids_flat, (batch, seq_len), device)?;
-    let attention_mask_t = Tensor::from_vec(attn_flat, (batch, seq_len), device)?;
-
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prompt_len = seq_len;
-        t.prompt_tensors_us = t
-            .prompt_tensors_us
-            .saturating_add(duration_to_us(start_tensors.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill = std::time::Instant::now();
-
-    #[cfg(feature = "timing")]
-    let start_prefill_inputs = std::time::Instant::now();
-    let audio_placeholder_count = if audio_features.is_some() {
-        count_audio_placeholders_batch(paged_id_rows.as_slice(), thinker.audio_token_id())?
-    } else {
-        0
-    };
-    let inputs_embeds = thinker.inputs_embeds_with_audio_features(
-        &input_ids_t,
-        audio_features,
-        audio_placeholder_count,
-    )?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_inputs_us = t
-            .prefill_inputs_us
-            .saturating_add(duration_to_us(start_prefill_inputs.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_metadata = std::time::Instant::now();
-    let max_tokens = seq_len
-        .checked_add(max_new_tokens)
-        .ok_or_else(|| anyhow::anyhow!("paged batch cache max token capacity overflow"))?;
     let mut runtime_guard = paged_runtime
         .ok_or_else(|| anyhow::anyhow!("paged batch generation requires a shared paged runtime"))?
         .lock()
         .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-    let request_ids: Vec<usize> = (0..batch).collect();
-    for &request_id in &request_ids {
-        runtime_guard
-            .manager_mut()
-            .allocate_slots(request_id, max_tokens)?;
-    }
-    let block_tables = request_ids
-        .iter()
-        .map(|&request_id| Ok(runtime_guard.manager().block_ids(request_id)?.to_vec()))
-        .collect::<Result<Vec<_>>>()?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_metadata_us = t
-            .prefill_metadata_us
-            .saturating_add(duration_to_us(start_prefill_metadata.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_rope = std::time::Instant::now();
-    let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_rope_us = t
-            .prefill_rope_us
-            .saturating_add(duration_to_us(start_prefill_rope.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_metadata = std::time::Instant::now();
-    let mut input_metadata = runtime_guard.cache().input_metadata_from_attention_masks(
-        &block_tables,
-        paged_mask_rows.as_slice(),
+    let config = PagedBatchConfig::for_static_batch(max_new_tokens, eos_token_ids);
+    paged_batch_run(
+        thinker,
         device,
-    )?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_metadata_us = t
-            .prefill_metadata_us
-            .saturating_add(duration_to_us(start_prefill_metadata.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_mask = std::time::Instant::now();
-    if !input_metadata.prefill_causal_only {
-        input_metadata.prefill_attention_mask = Some(attention::make_causal_mask(
-            input_metadata.token_attention_mask.as_ref(),
-            batch,
-            seq_len,
-            inputs_embeds.dtype(),
-            device,
-        )?);
-    }
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_mask_us = t
-            .prefill_mask_us
-            .saturating_add(duration_to_us(start_prefill_mask.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_forward = std::time::Instant::now();
-    let logits = {
-        let _linear_prefill_guard = set_linear_is_prefill(true);
-        thinker.forward_embeds_with_paged_cache(
-            &position_ids,
-            &inputs_embeds,
-            runtime_guard.cache(),
-            &input_metadata,
-        )?
-    };
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_forward_us = t
-            .prefill_forward_us
-            .saturating_add(duration_to_us(start_prefill_forward.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_gather = std::time::Instant::now();
-    let prompt_lens = input_metadata
-        .query_lens
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing query_lens"))?
-        .iter()
-        .map(|&len| {
-            i64::try_from(len).map_err(|_| anyhow::anyhow!("query_len overflows i64: {len}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let last_logits = gather_last_logits_for_prompt_lens(&logits, prompt_lens.as_slice())?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_gather_us = t
-            .prefill_gather_us
-            .saturating_add(duration_to_us(start_prefill_gather.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_us = t
-            .prefill_us
-            .saturating_add(duration_to_us(start_prefill.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_decode_setup = std::time::Instant::now();
-    let decode_metadata = runtime_guard.cache().decode_metadata_for_batch_steps(
-        &block_tables,
-        prompt_lens_usize.as_slice(),
-        max_new_tokens,
-        device,
-    )?;
-    let decode_position_ids =
-        position_ids_for_decode_steps_batch(prompt_lens.as_slice(), max_new_tokens, device)?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_decode_setup_us = t
-            .prefill_decode_setup_us
-            .saturating_add(duration_to_us(start_prefill_decode_setup.elapsed()));
-    }
-
-    #[cfg(feature = "timing")]
-    let start_prefill_argmax = std::time::Instant::now();
-    let mut next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_argmax_us = t
-            .prefill_argmax_us
-            .saturating_add(duration_to_us(start_prefill_argmax.elapsed()));
-    }
-    let mut generated: Vec<Vec<u32>> = vec![Vec::new(); batch];
-    let mut finished: Vec<bool> = next_ids
-        .iter()
-        .map(|id| eos_token_ids.contains(id))
-        .collect();
-    let eos_fill_id = *eos_token_ids
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("eos_token_ids is empty"))?;
-
-    #[cfg(feature = "timing")]
-    let start_decode = std::time::Instant::now();
-    for step in 0..max_new_tokens {
-        if finished.iter().all(|&done| done) {
-            break;
-        }
-
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_mut() {
-            t.steps = t.steps.saturating_add(1);
-        }
-
-        #[cfg(feature = "timing")]
-        let start_token_tensor = std::time::Instant::now();
-        let mut tokens_in = Vec::with_capacity(batch);
-        for i in 0..batch {
-            if finished[i] {
-                tokens_in.push(eos_fill_id);
-                continue;
-            }
-            let tok = next_ids
-                .get(i)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("next token id missing for batch row {i}"))?;
-            if eos_token_ids.contains(&tok) {
-                finished[i] = true;
-                tokens_in.push(eos_fill_id);
-            } else {
-                generated[i].push(tok);
-                tokens_in.push(tok);
-            }
-        }
-        let input_ids_new = Tensor::from_vec(tokens_in, (batch, 1usize), device)?;
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_mut() {
-            t.decode_token_tensor_us = t
-                .decode_token_tensor_us
-                .saturating_add(duration_to_us(start_token_tensor.elapsed()));
-        }
-
-        #[cfg(feature = "timing")]
-        let start_position = std::time::Instant::now();
-        let position_ids_full = decode_position_ids
-            .get(step)
-            .ok_or_else(|| anyhow::anyhow!("missing batch decode position ids for step {step}"))?
-            .clone();
-        let position_ids_new = position_ids_full;
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_mut() {
-            t.decode_position_us = t
-                .decode_position_us
-                .saturating_add(duration_to_us(start_position.elapsed()));
-        }
-
-        #[cfg(feature = "timing")]
-        let start_metadata = std::time::Instant::now();
-        let input_metadata_full = decode_metadata
-            .get(step)
-            .ok_or_else(|| anyhow::anyhow!("missing batch decode metadata for step {step}"))?;
-        let input_metadata = input_metadata_full;
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_mut() {
-            t.decode_metadata_us = t
-                .decode_metadata_us
-                .saturating_add(duration_to_us(start_metadata.elapsed()));
-        }
-
-        #[cfg(feature = "cuda-graph")]
-        let logits_new = if runtime_guard
-            .cuda_decode_graph_enabled_for(&input_ids_new, input_metadata)?
-        {
-            #[cfg(feature = "timing")]
-            let start_graph = std::time::Instant::now();
-            match runtime_guard.cuda_decode_graph(
-                thinker,
-                &input_ids_new,
-                &position_ids_new,
-                input_metadata,
-            ) {
-                Ok(logits) => {
-                    #[cfg(feature = "timing")]
-                    if let Some(t) = timings.as_mut() {
-                        let elapsed = duration_to_us(start_graph.elapsed());
-                        t.decode_graph_replay_us = t.decode_graph_replay_us.saturating_add(elapsed);
-                        t.decode_forward_us = t.decode_forward_us.saturating_add(elapsed);
-                    }
-                    logits
-                }
-                Err(err) => {
-                    tracing::warn!("CUDA decode graph key disabled after decode error: {err}");
-                    if let Err(disable_err) =
-                        runtime_guard.disable_cuda_decode_graph_for(&input_ids_new, input_metadata)
-                    {
-                        tracing::warn!(
-                            "failed to disable CUDA decode graph key after decode error: {disable_err}"
-                        );
-                    }
-                    #[cfg(feature = "timing")]
-                    let start_embed = std::time::Instant::now();
-                    let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
-                    #[cfg(feature = "timing")]
-                    if let Some(t) = timings.as_mut() {
-                        t.decode_embed_us = t
-                            .decode_embed_us
-                            .saturating_add(duration_to_us(start_embed.elapsed()));
-                    }
-                    #[cfg(feature = "timing")]
-                    let start_forward = std::time::Instant::now();
-                    let _linear_decode_guard = set_linear_is_prefill(false);
-                    let logits = thinker.forward_embeds_with_paged_cache(
-                        &position_ids_new,
-                        &inputs_embeds_new,
-                        runtime_guard.cache(),
-                        input_metadata,
-                    )?;
-                    #[cfg(feature = "timing")]
-                    if let Some(t) = timings.as_mut() {
-                        t.decode_forward_us = t
-                            .decode_forward_us
-                            .saturating_add(duration_to_us(start_forward.elapsed()));
-                    }
-                    logits
-                }
-            }
-        } else {
-            #[cfg(feature = "timing")]
-            let start_embed = std::time::Instant::now();
-            let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.decode_embed_us = t
-                    .decode_embed_us
-                    .saturating_add(duration_to_us(start_embed.elapsed()));
-            }
-            #[cfg(feature = "timing")]
-            let start_forward = std::time::Instant::now();
-            let _linear_decode_guard = set_linear_is_prefill(false);
-            let logits = thinker.forward_embeds_with_paged_cache(
-                &position_ids_new,
-                &inputs_embeds_new,
-                runtime_guard.cache(),
-                input_metadata,
-            )?;
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.decode_forward_us = t
-                    .decode_forward_us
-                    .saturating_add(duration_to_us(start_forward.elapsed()));
-            }
-            logits
-        };
-        #[cfg(not(feature = "cuda-graph"))]
-        let logits_new = {
-            #[cfg(feature = "timing")]
-            let start_embed = std::time::Instant::now();
-            let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.decode_embed_us = t
-                    .decode_embed_us
-                    .saturating_add(duration_to_us(start_embed.elapsed()));
-            }
-            #[cfg(feature = "timing")]
-            let start_forward = std::time::Instant::now();
-            let _linear_decode_guard = set_linear_is_prefill(false);
-            let logits = thinker.forward_embeds_with_paged_cache(
-                &position_ids_new,
-                &inputs_embeds_new,
-                runtime_guard.cache(),
-                input_metadata,
-            )?;
-            #[cfg(feature = "timing")]
-            if let Some(t) = timings.as_mut() {
-                t.decode_forward_us = t
-                    .decode_forward_us
-                    .saturating_add(duration_to_us(start_forward.elapsed()));
-            }
-            logits
-        };
-        #[cfg(feature = "timing")]
-        if timing_sync_before_argmax_enabled() {
-            let start_sync = std::time::Instant::now();
-            device.synchronize()?;
-            if let Some(t) = timings.as_mut() {
-                t.decode_pre_argmax_sync_us = t
-                    .decode_pre_argmax_sync_us
-                    .saturating_add(duration_to_us(start_sync.elapsed()));
-            }
-        }
-        #[cfg(feature = "timing")]
-        let start_argmax = std::time::Instant::now();
-        next_ids = argmax_token_ids_from_logits(&logits_new.squeeze(1)?, batch)?;
-        #[cfg(feature = "timing")]
-        if let Some(t) = timings.as_mut() {
-            t.decode_argmax_us = t
-                .decode_argmax_us
-                .saturating_add(duration_to_us(start_argmax.elapsed()));
-        }
-    }
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.decode_us = t
-            .decode_us
-            .saturating_add(duration_to_us(start_decode.elapsed()));
-    }
-
-    runtime_guard.manager_mut().free_many(&request_ids);
-
-    Ok(generated)
+        &mut runtime_guard,
+        input_ids,
+        attention_mask,
+        audio_features,
+        &config,
+    )
 }
 
 #[cfg(feature = "paged-attn")]
@@ -1478,7 +1041,10 @@ fn count_audio_placeholders(ids: &[u32], audio_token_id: u32) -> usize {
     ids.iter().filter(|&&id| id == audio_token_id).count()
 }
 
-fn count_audio_placeholders_batch(input_ids: &[&[u32]], audio_token_id: u32) -> Result<usize> {
+pub(crate) fn count_audio_placeholders_batch(
+    input_ids: &[&[u32]],
+    audio_token_id: u32,
+) -> Result<usize> {
     let mut total = 0usize;
     for (i, row) in input_ids.iter().enumerate() {
         let n = row.iter().filter(|&&id| id == audio_token_id).count();
@@ -1490,7 +1056,7 @@ fn count_audio_placeholders_batch(input_ids: &[&[u32]], audio_token_id: u32) -> 
 }
 
 #[cfg(feature = "paged-attn")]
-fn normalize_batch_for_paged_prefill(
+pub(crate) fn normalize_batch_for_paged_prefill(
     input_ids: &[&[u32]],
     attention_mask: &[&[u32]],
 ) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<usize>)> {
@@ -1574,7 +1140,7 @@ fn attention_mask_is_right_padded(attention_mask: &[u32]) -> bool {
 }
 
 #[cfg(feature = "paged-attn")]
-fn attention_masks_are_right_padded(attention_mask: &[&[u32]]) -> bool {
+pub(crate) fn attention_masks_are_right_padded(attention_mask: &[&[u32]]) -> bool {
     attention_mask
         .iter()
         .all(|row| attention_mask_is_right_padded(row))
@@ -1613,7 +1179,10 @@ fn prompt_lens_from_attention_masks(attention_mask: &[&[u32]], seq_len: usize) -
     Ok(out)
 }
 
-fn gather_last_logits_for_prompt_lens(logits: &Tensor, prompt_lens: &[i64]) -> Result<Tensor> {
+pub(crate) fn gather_last_logits_for_prompt_lens(
+    logits: &Tensor,
+    prompt_lens: &[i64],
+) -> Result<Tensor> {
     let (batch, seq_len, vocab) = logits.dims3()?;
     if prompt_lens.len() != batch {
         bail!(
@@ -1644,7 +1213,11 @@ fn gather_last_logits_for_prompt_lens(logits: &Tensor, prompt_lens: &[i64]) -> R
     Ok(flat_logits.index_select(&idx, 0)?)
 }
 
-fn position_ids_for_step(prompt_lens: &[i64], step: usize, device: &Device) -> Result<Tensor> {
+pub(crate) fn position_ids_for_step(
+    prompt_lens: &[i64],
+    step: usize,
+    device: &Device,
+) -> Result<Tensor> {
     if prompt_lens.is_empty() {
         bail!("prompt_lens is empty");
     }
@@ -1674,7 +1247,7 @@ fn position_ids_for_decode_steps(
         .collect()
 }
 
-fn position_ids_for_decode_steps_batch(
+pub(crate) fn position_ids_for_decode_steps_batch(
     prompt_lens: &[i64],
     max_steps: usize,
     device: &Device,

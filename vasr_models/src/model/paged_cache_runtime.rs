@@ -1,7 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(feature = "cuda-graph")]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use candle_core::{DType, Device, Result, Tensor};
+#[cfg(feature = "cuda-graph")]
+use candle_core::Tensor;
+use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
 use crate::model::cuda_graph::{
@@ -66,6 +70,7 @@ pub fn bytes_per_paged_block(
         .ok_or_else(|| candle_core::Error::Msg("paged block byte count overflow".into()))
 }
 
+#[cfg(feature = "cuda")]
 fn blocks_for_byte_budget(byte_budget: usize, bytes_per_block: usize) -> Result<usize> {
     if bytes_per_block == 0 {
         candle_core::bail!("paged block byte size must be non-zero");
@@ -237,7 +242,48 @@ impl PagedBlockManager {
         self.free.len()
     }
 
+    pub fn slots_available_for(&self, request_id: usize, num_tokens: usize) -> bool {
+        let required = num_tokens.div_ceil(self.block_size);
+        let existing = self
+            .request_blocks
+            .get(&request_id)
+            .map(|blocks| blocks.block_ids.len())
+            .unwrap_or(0);
+        let needed = required.saturating_sub(existing);
+        needed <= self.free.len()
+    }
+
+    pub fn blocks_for_request(&self, request_id: usize) -> usize {
+        self.request_blocks
+            .get(&request_id)
+            .map(|blocks| blocks.block_ids.len())
+            .unwrap_or(0)
+    }
+
+    pub fn total_allocated_blocks(&self) -> usize {
+        self.request_blocks
+            .values()
+            .map(|blocks| blocks.block_ids.len())
+            .sum()
+    }
+
+    /// Block ids `1..num_blocks` are allocatable; block `0` is reserved for padded batches.
+    pub fn allocatable_block_capacity(num_blocks: usize) -> usize {
+        num_blocks.saturating_sub(1)
+    }
+
     pub fn allocate_slots(&mut self, request_id: usize, num_tokens: usize) -> Result<()> {
+        if !self.try_allocate_slots(request_id, num_tokens)? {
+            candle_core::bail!(
+                "paged KV cache exhausted: request_id={request_id} num_tokens={num_tokens} free_blocks={}",
+                self.free.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Grow a request allocation to cover `num_tokens`. Returns false when the pool is full.
+    pub fn try_allocate_slots(&mut self, request_id: usize, num_tokens: usize) -> Result<bool> {
         let required = num_tokens.div_ceil(self.block_size);
         let existing = self
             .request_blocks
@@ -246,13 +292,10 @@ impl PagedBlockManager {
             .unwrap_or(0);
         let needed = required.saturating_sub(existing);
         if needed == 0 {
-            return Ok(());
+            return Ok(true);
         }
         if needed > self.free.len() {
-            candle_core::bail!(
-                "paged KV cache exhausted: request_id={request_id} needed_blocks={needed} free_blocks={}",
-                self.free.len()
-            );
+            return Ok(false);
         }
         let entry = self
             .request_blocks
@@ -267,7 +310,28 @@ impl PagedBlockManager {
                 .ok_or_else(|| candle_core::Error::Msg("paged KV free list underflow".into()))?;
             entry.block_ids.push(block_id);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Shrink a request allocation to the minimum blocks needed for `num_tokens`.
+    ///
+    /// Freed tail blocks are returned to the pool in reverse order (LRU-friendly), matching
+    /// mistral.rs `KVCacheManager::trim_request_to_num_tokens`.
+    pub fn trim_request_to_num_tokens(&mut self, request_id: usize, num_tokens: usize) {
+        let num_required_blocks = num_tokens.div_ceil(self.block_size);
+        let Some(entry) = self.request_blocks.get_mut(&request_id) else {
+            return;
+        };
+        if num_required_blocks >= entry.block_ids.len() {
+            return;
+        }
+        let mut removed: Vec<usize> = entry.block_ids.drain(num_required_blocks..).collect();
+        removed.reverse();
+        for block_id in removed {
+            if block_id != 0 {
+                self.free.push_back(block_id);
+            }
+        }
     }
 
     pub fn block_ids(&self, request_id: usize) -> Result<&[usize]> {
@@ -296,6 +360,13 @@ impl PagedBlockManager {
         for &request_id in request_ids {
             self.free_request(request_id);
         }
+    }
+
+    pub fn block_tables_for(&self, request_ids: &[usize]) -> Result<Vec<Vec<usize>>> {
+        request_ids
+            .iter()
+            .map(|&request_id| self.block_ids(request_id).map(|ids| ids.to_vec()))
+            .collect()
     }
 }
 
@@ -392,6 +463,10 @@ impl PagedCacheRuntime {
 
     pub fn manager_mut(&mut self) -> &mut PagedBlockManager {
         &mut self.manager
+    }
+
+    pub fn block_tables_for(&self, request_ids: &[usize]) -> Result<Vec<Vec<usize>>> {
+        self.manager.block_tables_for(request_ids)
     }
 
     pub fn stats(&self) -> PagedCacheStats {
@@ -635,9 +710,11 @@ pub type SharedPagedCacheRuntime = Arc<Mutex<PagedCacheRuntime>>;
 mod tests {
     use candle_core::{DType, Device, Tensor};
 
+    #[cfg(feature = "cuda")]
+    use super::blocks_for_byte_budget;
     use super::{
         PagedBlockManager, PagedCacheConfig, PagedCacheMemory, PagedCacheRuntime,
-        blocks_for_byte_budget, bytes_per_paged_block,
+        bytes_per_paged_block,
     };
 
     #[test]
@@ -648,6 +725,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn blocks_for_byte_budget_reserves_null_block() -> anyhow::Result<()> {
         let bytes_per_block = bytes_per_paged_block(28, 8, 128, 32, DType::BF16)?;
         let num_blocks = blocks_for_byte_budget(bytes_per_block * 10, bytes_per_block)?;
@@ -670,6 +748,32 @@ mod tests {
 
         manager.free_request(10);
         assert_eq!(manager.free_blocks(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn block_manager_trim_releases_tail_blocks() -> anyhow::Result<()> {
+        let mut manager = PagedBlockManager::new(8, 4);
+        manager.allocate_slots(10, 12)?;
+        assert_eq!(manager.block_ids(10)?.len(), 3);
+        assert_eq!(manager.free_blocks(), 4);
+
+        manager.trim_request_to_num_tokens(10, 5);
+        assert_eq!(manager.block_ids(10)?.len(), 2);
+        assert_eq!(manager.free_blocks(), 5);
+
+        manager.trim_request_to_num_tokens(10, 1);
+        assert_eq!(manager.block_ids(10)?.len(), 1);
+        assert_eq!(manager.free_blocks(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn block_manager_try_allocate_reports_exhaustion() -> anyhow::Result<()> {
+        let mut manager = PagedBlockManager::new(4, 4);
+        assert!(manager.try_allocate_slots(1, 4)?);
+        assert!(!manager.try_allocate_slots(2, 16)?);
+        assert_eq!(manager.free_blocks(), 2);
         Ok(())
     }
 

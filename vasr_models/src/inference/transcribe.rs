@@ -149,6 +149,7 @@ pub(crate) fn generate_raw_prepared_batch(
     #[cfg(feature = "paged-attn")] paged_runtime: Option<&SharedPagedCacheRuntime>,
     prepared: &[PreparedInputs],
     max_new_tokens: usize,
+    max_batch_size: usize,
     eos_token_ids: &[u32],
 ) -> Result<Vec<String>> {
     if prepared.is_empty() {
@@ -171,17 +172,36 @@ pub(crate) fn generate_raw_prepared_batch(
 
     let audio_features =
         thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+    let effective_max_batch = if max_batch_size == 0 {
+        prepared.len().max(1)
+    } else {
+        max_batch_size
+    };
     #[cfg(feature = "paged-attn")]
-    let gen_ids = greedy_generate_cached_batch_with_paged_runtime(
-        thinker,
-        device,
-        ids_rows.as_slice(),
-        attn_rows.as_slice(),
-        Some(&audio_features),
-        max_new_tokens,
-        eos_token_ids,
-        paged_runtime,
-    )?;
+    let gen_ids = if let Some(runtime) = paged_runtime {
+        use crate::inference::batch_scheduler::run_paged_prepared_batch;
+        run_paged_prepared_batch(
+            thinker,
+            device,
+            runtime,
+            prepared,
+            &audio_features,
+            max_new_tokens,
+            eos_token_ids,
+            effective_max_batch,
+        )?
+    } else {
+        greedy_generate_cached_batch_with_paged_runtime(
+            thinker,
+            device,
+            ids_rows.as_slice(),
+            attn_rows.as_slice(),
+            Some(&audio_features),
+            max_new_tokens,
+            eos_token_ids,
+            None,
+        )?
+    };
     #[cfg(not(feature = "paged-attn"))]
     let gen_ids = greedy_generate_cached_batch(
         thinker,
@@ -380,6 +400,7 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
                 batch.paged_runtime,
                 prepared.as_slice(),
                 batch.max_new_tokens,
+                batch.max_batch_size,
                 batch.eos_token_ids,
             )?;
 
@@ -465,6 +486,7 @@ fn run_asr_on_chunks_batched(batch: &ChunkAsrBatch<'_>) -> Result<(Vec<String>, 
             batch.paged_runtime,
             prepared.as_slice(),
             batch.max_new_tokens,
+            batch.max_batch_size,
             batch.eos_token_ids,
         )?;
         if raws.len() != batch_chunk_idx.len() {
@@ -1719,6 +1741,7 @@ pub fn transcribe_with_forced_aligner(
             None,
             prepared.as_slice(),
             opts.max_new_tokens,
+            opts.max_batch_size,
             eos_token_ids.as_slice(),
         )?;
         if raws.len() != batch_chunk_idx.len() {

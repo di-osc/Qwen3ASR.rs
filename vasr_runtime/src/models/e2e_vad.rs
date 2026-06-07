@@ -20,7 +20,9 @@ enum AudioChangeState {
     Speech2Sil,
     Sil2Sil,
     Sil2Speech,
+    #[allow(dead_code)]
     NoBegin,
+    #[allow(dead_code)]
     Invalid,
 }
 
@@ -91,10 +93,6 @@ struct SpeechSegmentBuf {
 }
 
 struct WindowDetector {
-    window_size_ms: i32,
-    sil_to_speech_time: i32,
-    speech_to_sil_time: i32,
-    frame_size_ms: i32,
     win_size_frame: i32,
     win_sum: i32,
     win_state: Vec<i32>,
@@ -113,10 +111,6 @@ impl WindowDetector {
     ) -> Self {
         let win_size_frame = window_size_ms / frame_size_ms;
         Self {
-            window_size_ms,
-            sil_to_speech_time,
-            speech_to_sil_time,
-            frame_size_ms,
             win_size_frame,
             win_sum: 0,
             win_state: vec![0; win_size_frame as usize],
@@ -196,7 +190,7 @@ pub struct E2EVadModel {
 }
 
 impl E2EVadModel {
-    pub fn new(mut opts: E2EVadConfig) -> Self {
+    pub fn new(opts: E2EVadConfig) -> Self {
         let speech_noise_thres = opts.speech_noise_thres;
         let max_end_sil_frame_cnt_thresh =
             opts.max_end_silence_time - opts.speech_to_sil_time_thres;
@@ -410,7 +404,6 @@ impl E2EVadModel {
 
         let local_t = (t - self.idx_pre_chunk) as usize;
         let frame_scores = scores.get(local_t);
-        let mut sum_score = 0.0f32;
         if self.opts.silence_pdf_num > 0 {
             let Some(frame_scores) = frame_scores else {
                 return FrameState::Sil;
@@ -421,7 +414,7 @@ impl E2EVadModel {
                 .iter()
                 .filter_map(|&id| frame_scores.get(id).copied())
                 .sum();
-            sum_score = 1.0 - sil_sum;
+            let sum_score = 1.0 - sil_sum;
             let noise_prob = (sil_sum.max(1e-10)).ln() * self.opts.speech_2_noise_ratio;
             let speech_prob = (sum_score.max(1e-10)).ln();
             if speech_prob.exp() >= noise_prob.exp() + self.speech_noise_thres {
@@ -451,7 +444,7 @@ impl E2EVadModel {
         cur_frm_state: FrameState,
         cur_frm_idx: i32,
         is_final_frame: bool,
-        scores: &[Vec<f32>],
+        _scores: &[Vec<f32>],
     ) {
         let tmp_cur_frm_state = match cur_frm_state {
             FrameState::Speech if 1.0_f32.abs() > self.opts.fe_prior_thres => FrameState::Speech,

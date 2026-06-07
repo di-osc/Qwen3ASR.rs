@@ -15,10 +15,14 @@ use candle_core::Device;
 use std::sync::Arc;
 
 pub use audio::input::AudioInput;
+#[cfg(feature = "paged-attn")]
+pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
 pub use inference::streaming::AsrStream;
 #[cfg(feature = "timing")]
 pub use inference::transcribe::TranscribeTimings;
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
+#[cfg(feature = "paged-attn")]
+pub use model::paged_batch_engine::{PagedBatchConfig, PagedBatchState, PagedDecodeSlot};
 #[cfg(feature = "paged-attn")]
 pub use model::paged_cache_runtime::{PagedCacheConfig, PagedCacheStats};
 pub use model::weights::LoadOptions;
@@ -35,12 +39,15 @@ pub mod qwen3_asr {
     pub use crate::inference;
     pub use crate::model;
     pub use crate::processor;
+    #[cfg(feature = "paged-attn")]
+    pub use crate::{
+        AsrBatchScheduler, AsrBatchSchedulerConfig, PagedBatchConfig, PagedBatchState,
+        PagedCacheConfig, PagedCacheStats, PagedDecodeSlot,
+    };
     pub use crate::{
         AsrProcessor, AsrStream, AsrTranscription, AudioInput, Batch, LoadOptions, Qwen3Asr,
         StreamOptions, TranscribeOptions,
     };
-    #[cfg(feature = "paged-attn")]
-    pub use crate::{PagedCacheConfig, PagedCacheStats};
 }
 
 #[derive(Debug)]

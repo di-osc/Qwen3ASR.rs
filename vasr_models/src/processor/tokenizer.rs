@@ -222,7 +222,9 @@ fn build_qwen2_bpe_tokenizer(
         DecoderWrapper,
     >;
     let mut tokenizer: FullTokenizer = TokenizerImpl::new(bpe);
-    tokenizer.with_normalizer(Some(NFC));
+    tokenizer
+        .with_normalizer(Some(NFC))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     tokenizer.with_pre_tokenizer(Some(pre_tokenizer));
     tokenizer.with_decoder(Some(ByteLevelDecoder::new(false, true, true)));
 
@@ -232,7 +234,9 @@ fn build_qwen2_bpe_tokenizer(
     // `<|audio_start|>` are matched as a single token during encoding.
     if !added_tokens.is_empty() {
         let toks: Vec<tokenizers::AddedToken> = added_tokens.into_iter().map(|e| e.token).collect();
-        tokenizer.add_tokens(&toks);
+        tokenizer
+            .add_tokens(toks)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     Ok(tokenizer)

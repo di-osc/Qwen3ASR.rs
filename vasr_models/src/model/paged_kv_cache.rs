@@ -891,6 +891,21 @@ impl PagedKvCache {
             .collect()
     }
 
+    pub fn decode_metadata_for_batch_step(
+        &self,
+        block_tables: &[Vec<usize>],
+        prompt_lens: &[usize],
+        step: usize,
+        device: &Device,
+    ) -> Result<PagedInputMetadata> {
+        self.decode_metadata_for_batch_steps(block_tables, prompt_lens, step + 1, device)?
+            .into_iter()
+            .nth(step)
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!("paged batch decode metadata missing step {step}"))
+            })
+    }
+
     pub fn key_value_cache(&self, layer_idx: usize) -> Result<(&Tensor, &Tensor)> {
         let key = self.key_cache.get(layer_idx).ok_or_else(|| {
             candle_core::Error::Msg(format!("paged kv cache layer out of range: {layer_idx}"))

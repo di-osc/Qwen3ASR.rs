@@ -6,14 +6,20 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "vasr"
-path = "src/main.rs"
+name = "vasr-transcribe"
+path = "src/bin/vasr_transcribe.rs"
+
+[[bin]]
+name = "vasr-realtime"
+path = "src/bin/vasr_realtime.rs"
 
 [dependencies]
 anyhow = "1"
-axum = "0.7"
+axum = "0.8"
+base64 = "0.22"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
 clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
 vasr-models = { path = "../vasr_models" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
@@ -21,6 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt", "time"] }
 vasr-audio = { path = "../vasr_audio" }
 vasr-data = { path = "../vasr_data" }
+vasr-protocol = { path = "../vasr_protocol" }
 vasr-runtime = { path = "../vasr_runtime" }
 vasr-server = { path = "../vasr_server" }
 
@@ -32,7 +39,7 @@ cuda-graph = ["vasr-runtime/cuda-graph"]
 cuda-quant = ["cuda", "vasr-runtime/cuda-quant"]
 flash-attn = ["cuda", "vasr-runtime/flash-attn"]
 metal = ["vasr-runtime/metal"]
-metal-paged-attn = ["metal", "vasr-runtime/metal-paged-attn"]
+metal-paged-attn = ["metal"]
 cuda-paged-attn = ["cuda"]
 timing = ["vasr-runtime/timing"]
 

@@ -13,8 +13,8 @@ use anyhow::Context;
 pub fn decode_path(path: &Path) -> Result<(Vec<f32>, u32)> {
     use std::fs::File;
 
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::probe::Hint;
 
     let file = File::open(path).with_context(|| format!("failed to open audio file {path:?}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -38,8 +38,8 @@ pub fn decode_path(_path: &Path) -> Result<(Vec<f32>, u32)> {
 pub fn decode_url(url: &str) -> Result<(Vec<f32>, u32)> {
     use std::io::Cursor;
 
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::probe::Hint;
 
     let resp = reqwest::blocking::get(url)
         .with_context(|| format!("failed to fetch audio from URL {url:?}"))?;
@@ -76,8 +76,8 @@ pub fn decode_base64(b64: &str) -> Result<(Vec<f32>, u32)> {
     use std::io::Cursor;
 
     use base64::Engine;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::probe::Hint;
 
     let data = if b64.contains(',') && b64.trim().starts_with("data:") {
         b64.split(',')
@@ -106,36 +106,44 @@ pub fn decode_base64(_b64: &str) -> Result<(Vec<f32>, u32)> {
 #[cfg(feature = "audio-loading")]
 fn decode_audio_stream(
     mss: symphonia::core::io::MediaSourceStream,
-    hint: symphonia::core::probe::Hint,
+    hint: symphonia::core::formats::probe::Hint,
 ) -> Result<(Vec<f32>, u32, usize)> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::TrackType;
     use symphonia::core::meta::MetadataOptions;
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| anyhow::anyhow!("failed to probe audio format: {e}"))?;
 
-    let mut format = probed.format;
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| anyhow::anyhow!("no audio tracks found"))?;
 
-    let sample_rate = track
+    let audio_params = track
         .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| anyhow::anyhow!("track has no audio codec parameters"))?;
+
+    let sample_rate = audio_params
         .sample_rate
         .ok_or_else(|| anyhow::anyhow!("unknown sample rate"))?;
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1);
+    let channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .unwrap_or(1);
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
         .map_err(|e| anyhow::anyhow!("failed to create decoder: {e}"))?;
 
     let track_id = track.id;
@@ -143,14 +151,12 @@ fn decode_audio_stream(
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                break;
-            }
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(e) => return Err(anyhow::anyhow!("failed to read audio packet: {e}")),
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -160,11 +166,9 @@ fn decode_audio_stream(
             Err(e) => return Err(anyhow::anyhow!("failed to decode audio packet: {e}")),
         };
 
-        let spec = *decoded.spec();
-        let duration = decoded.capacity() as u64;
-        let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-        samples.extend_from_slice(sample_buf.samples());
+        let mut chunk = Vec::new();
+        decoded.copy_to_vec_interleaved(&mut chunk);
+        samples.extend_from_slice(&chunk);
     }
 
     Ok((samples, sample_rate, channels))

@@ -7,8 +7,10 @@ use anyhow::Context;
 
 #[cfg(feature = "audio-loading")]
 pub fn resample_mono_f32(samples: &[f32], from_hz: u32, to_hz: u32) -> Result<Vec<f32>> {
+    use rubato::audioadapter_buffers::direct::InterleavedSlice;
     use rubato::{
-        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+        WindowFunction,
     };
 
     if from_hz == 0 || to_hz == 0 {
@@ -30,19 +32,31 @@ pub fn resample_mono_f32(samples: &[f32], from_hz: u32, to_hz: u32) -> Result<Ve
     };
 
     let ratio = to_hz as f64 / from_hz as f64;
+    let chunk_size = 1024.min(samples.len().max(1));
     let mut resampler =
-        SincFixedIn::<f32>::new(ratio, 2.0, params, samples.len(), 1).map_err(|e| {
-            anyhow::anyhow!("resampler creation failed for from_hz={from_hz} to_hz={to_hz}: {e}")
-        })?;
+        Async::<f32>::new_sinc(ratio, 2.0, &params, chunk_size, 1, FixedAsync::Input).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "resampler creation failed for from_hz={from_hz} to_hz={to_hz}: {e}"
+                )
+            },
+        )?;
 
-    let waves_in = vec![samples.to_vec()];
-    let mut waves_out = resampler
-        .process(&waves_in, None)
+    let input_frames = samples.len();
+    let input = InterleavedSlice::new(samples, 1, input_frames)
+        .map_err(|e| anyhow::anyhow!("failed to create resampler input buffer: {e}"))?;
+
+    let output_len = resampler.process_all_needed_output_len(input_frames);
+    let mut outdata = vec![0.0f32; output_len];
+    let mut output = InterleavedSlice::new_mut(&mut outdata, 1, output_len)
+        .map_err(|e| anyhow::anyhow!("failed to create resampler output buffer: {e}"))?;
+
+    let (_nbr_in, nbr_out) = resampler
+        .process_all_into_buffer(&input, &mut output, input_frames, None)
         .context("resampling failed")?;
 
-    waves_out
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("resampler returned no output channels"))
+    outdata.truncate(nbr_out);
+    Ok(outdata)
 }
 
 #[cfg(not(feature = "audio-loading"))]

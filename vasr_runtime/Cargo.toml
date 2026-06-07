@@ -9,7 +9,7 @@ repository.workspace = true
 anyhow = "1"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
 candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 kaldi-fbank-rust-kautism = "0.1.0"
 ndarray = "0.17"
 rayon = "1"
@@ -27,8 +27,8 @@ cuda = ["cuda-vad", "vasr-models/cuda"]
 cuda-graph = ["cuda", "vasr-models/cuda-graph"]
 cuda-quant = ["cuda", "vasr-models/cuda-quant"]
 flash-attn = ["cuda", "vasr-models/flash-attn"]
-metal = ["vasr-models/metal"]
-metal-paged-attn = ["vasr-models/metal-paged-attn"]
+metal = ["vasr-models/metal-paged-attn"]
+metal-paged-attn = ["metal"]
 cuda-paged-attn = ["cuda"]
 audio-loading = ["vasr-models/audio-loading"]
 timing = ["vasr-models/timing"]

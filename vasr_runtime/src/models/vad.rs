@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 use ndarray::{Array1, Array2, s};
-use rayon::prelude::*;
 use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
     TimeRange, Timeline, Waveform,
@@ -47,12 +45,6 @@ impl FsmnVadTiming {
         self.pcm_seconds += duration.as_secs_f64();
     }
 
-    fn add_score(&mut self, timing: FsmnVadScoreTiming) {
-        self.frontend_seconds += timing.frontend_seconds;
-        self.forward_seconds += timing.forward_seconds;
-        self.chunks += 1;
-    }
-
     fn add_segmenter(&mut self, duration: Duration) {
         self.segmenter_seconds += duration.as_secs_f64();
     }
@@ -62,12 +54,6 @@ impl FsmnVadTiming {
 pub struct FsmnVadDetection {
     pub segments: Vec<VadSegment>,
     pub timing: FsmnVadTiming,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct FsmnVadScoreTiming {
-    frontend_seconds: f64,
-    forward_seconds: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -333,10 +319,6 @@ impl FsmnVadWeights {
         })
     }
 
-    fn extract_features_from_pcm(&self, pcm: &[i16]) -> Result<Array2<f32>> {
-        self.frontend.extract_features_from_pcm(pcm)
-    }
-
     fn zero_caches(&self) -> Result<Vec<Tensor>> {
         let cache = Tensor::zeros(
             (1usize, FSMN_VAD_PROJ_DIM, FSMN_VAD_CACHE_FRAMES, 1usize),
@@ -346,138 +328,6 @@ impl FsmnVadWeights {
         Ok((0..FSMN_VAD_LAYERS)
             .map(|_| cache.clone())
             .collect::<Vec<_>>())
-    }
-
-    fn score_chunk(
-        &self,
-        caches: &mut [Tensor],
-        chunk: &[i16; FSMN_VAD_CHUNK_SIZE],
-    ) -> Result<(f32, FsmnVadScoreTiming)> {
-        let frontend_start = Instant::now();
-        let feats = self.frontend.extract_features(chunk)?;
-        let frontend_seconds = frontend_start.elapsed().as_secs_f64();
-        let t = feats.shape()[0];
-        let d = feats.shape()[1];
-        if d != 400 {
-            bail!("FSMN VAD expects feature dim 400, got {d}");
-        }
-        if t == 0 {
-            return Ok((
-                0.0,
-                FsmnVadScoreTiming {
-                    frontend_seconds,
-                    forward_seconds: 0.0,
-                },
-            ));
-        }
-
-        let forward_start = Instant::now();
-        let speech = Tensor::from_vec(
-            feats.iter().copied().collect::<Vec<f32>>(),
-            (1usize, t, d),
-            &self.device,
-        )?;
-
-        let mut x = self.in_linear1.forward(&speech)?;
-        x = self.in_linear2.forward(&x)?.relu()?;
-        for (idx, block) in self.fsmn_blocks.iter().enumerate() {
-            let (new_x, new_cache) = block.forward(&x, &caches[idx])?;
-            x = new_x;
-            caches[idx] = new_cache;
-        }
-        x = self.out_linear1.forward(&x)?;
-        x = self.out_linear2.forward(&x)?;
-        let logits = softmax_last_dim(&x)?;
-
-        let dims = logits.dims();
-        if dims.len() != 3 || dims[0] != 1 || dims[2] == 0 {
-            bail!("unexpected FSMN VAD logits shape: {:?}", dims);
-        }
-        let frames = dims[1];
-        let classes = dims[2];
-        if frames == 0 {
-            return Ok((
-                0.0,
-                FsmnVadScoreTiming {
-                    frontend_seconds,
-                    forward_seconds: forward_start.elapsed().as_secs_f64(),
-                },
-            ));
-        }
-
-        let data = logits.flatten_all()?.to_vec1::<f32>()?;
-        let speech_prob_sum = (0..frames)
-            .map(|frame_idx| {
-                let silence_prob = data[frame_idx * classes];
-                (1.0 - silence_prob).clamp(0.0, 1.0)
-            })
-            .sum::<f32>();
-        Ok((
-            speech_prob_sum / frames as f32,
-            FsmnVadScoreTiming {
-                frontend_seconds,
-                forward_seconds: forward_start.elapsed().as_secs_f64(),
-            },
-        ))
-    }
-
-    fn score_chunks_offline(
-        &self,
-        chunks: &[[i16; FSMN_VAD_CHUNK_SIZE]],
-    ) -> Result<(Vec<f32>, FsmnVadTiming)> {
-        let mut timing = FsmnVadTiming::default();
-        if chunks.is_empty() {
-            return Ok((Vec::new(), timing));
-        }
-
-        let mut frame_ranges = Vec::with_capacity(chunks.len());
-        let mut feature_values = Vec::new();
-        let mut total_frames = 0usize;
-        let mut feature_dim = 400usize;
-        let extracted = chunks
-            .par_iter()
-            .map(|chunk| {
-                let frontend_start = Instant::now();
-                let feats = self.frontend.extract_features(chunk)?;
-                Ok::<_, anyhow::Error>((feats, frontend_start.elapsed().as_secs_f64()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        for (feats, frontend_seconds) in extracted {
-            timing.frontend_seconds += frontend_seconds;
-            let frames = feats.shape()[0];
-            let dim = feats.shape()[1];
-            if dim != 400 {
-                bail!("FSMN VAD expects feature dim 400, got {dim}");
-            }
-            feature_dim = dim;
-            frame_ranges.push(total_frames..total_frames + frames);
-            total_frames += frames;
-            feature_values.extend(feats.iter().copied());
-        }
-        timing.chunks = chunks.len();
-
-        if total_frames == 0 {
-            return Ok((vec![0.0; chunks.len()], timing));
-        }
-
-        let feats = Array2::from_shape_vec((total_frames, feature_dim), feature_values)?;
-        let mut caches = self.zero_caches()?;
-        let (frame_probs, forward_seconds) =
-            self.forward_feature_probabilities(&feats, &mut caches)?;
-        timing.forward_seconds += forward_seconds;
-
-        let probabilities = frame_ranges
-            .into_iter()
-            .map(|range| {
-                if range.is_empty() {
-                    0.0
-                } else {
-                    frame_probs[range.clone()].iter().sum::<f32>() / range.len() as f32
-                }
-            })
-            .collect::<Vec<_>>();
-        Ok((probabilities, timing))
     }
 
     fn forward_frame_scores(
@@ -525,58 +375,6 @@ impl FsmnVadWeights {
                     .collect()
             })
             .collect())
-    }
-
-    fn forward_feature_probabilities(
-        &self,
-        feats: &Array2<f32>,
-        caches: &mut [Tensor],
-    ) -> Result<(Vec<f32>, f64)> {
-        let t = feats.shape()[0];
-        let d = feats.shape()[1];
-        if d != 400 {
-            bail!("FSMN VAD expects feature dim 400, got {d}");
-        }
-        if t == 0 {
-            return Ok((Vec::new(), 0.0));
-        }
-
-        let forward_start = Instant::now();
-        let speech = Tensor::from_vec(
-            feats.iter().copied().collect::<Vec<f32>>(),
-            (1usize, t, d),
-            &self.device,
-        )?;
-
-        let mut x = self.in_linear1.forward(&speech)?;
-        x = self.in_linear2.forward(&x)?.relu()?;
-        for (idx, block) in self.fsmn_blocks.iter().enumerate() {
-            let (new_x, new_cache) = block.forward(&x, &caches[idx])?;
-            x = new_x;
-            caches[idx] = new_cache;
-        }
-        x = self.out_linear1.forward(&x)?;
-        x = self.out_linear2.forward(&x)?;
-        let logits = softmax_last_dim(&x)?;
-
-        let dims = logits.dims();
-        if dims.len() != 3 || dims[0] != 1 || dims[2] == 0 {
-            bail!("unexpected FSMN VAD logits shape: {:?}", dims);
-        }
-        let frames = dims[1];
-        let classes = dims[2];
-        if frames == 0 {
-            return Ok((Vec::new(), forward_start.elapsed().as_secs_f64()));
-        }
-
-        let data = logits.flatten_all()?.to_vec1::<f32>()?;
-        let probabilities = (0..frames)
-            .map(|frame_idx| {
-                let silence_prob = data[frame_idx * classes];
-                (1.0 - silence_prob).clamp(0.0, 1.0)
-            })
-            .collect::<Vec<_>>();
-        Ok((probabilities, forward_start.elapsed().as_secs_f64()))
     }
 }
 
@@ -773,24 +571,6 @@ fn split_full_chunks(samples: &[i16]) -> (&[i16], &[i16]) {
     samples.split_at(full_len)
 }
 
-fn collect_padded_chunks(samples: &[i16]) -> (Vec<[i16; FSMN_VAD_CHUNK_SIZE]>, usize) {
-    let (full_chunks, tail) = split_full_chunks(samples);
-    let mut chunks = full_chunks
-        .chunks_exact(FSMN_VAD_CHUNK_SIZE)
-        .map(|chunk_slice| {
-            let mut chunk = [0i16; FSMN_VAD_CHUNK_SIZE];
-            chunk.copy_from_slice(chunk_slice);
-            chunk
-        })
-        .collect::<Vec<_>>();
-    if !tail.is_empty() {
-        let mut chunk = [0i16; FSMN_VAD_CHUNK_SIZE];
-        chunk[..tail.len()].copy_from_slice(tail);
-        chunks.push(chunk);
-    }
-    (chunks, tail.len())
-}
-
 fn samples_f32_to_i16(samples: &[f32]) -> Vec<i16> {
     samples
         .iter()
@@ -871,119 +651,117 @@ impl StreamingVadModel for FsmnVadSession {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VadState {
-    Waiting,
-    Recording,
-}
+#[cfg(test)]
+mod legacy_vad_segmenter {
+    use std::collections::VecDeque;
 
-#[derive(Debug, Clone)]
-struct VadSegmenter {
-    options: VadOptions,
-    state: VadState,
-    history: VecDeque<i16>,
-    speech_start: usize,
-    silence_chunks: usize,
-    current_chunks: usize,
-    chunk_cursor: usize,
-}
+    use super::*;
 
-impl VadSegmenter {
-    fn new(options: VadOptions) -> Self {
-        Self {
-            options,
-            state: VadState::Waiting,
-            history: VecDeque::new(),
-            speech_start: 0,
-            silence_chunks: 0,
-            current_chunks: 0,
-            chunk_cursor: 0,
-        }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum VadState {
+        Waiting,
+        Recording,
     }
 
-    fn push_probability(&mut self, probability: f32) -> Vec<VadSegment> {
-        let chunk_start = self.chunk_cursor * FSMN_VAD_CHUNK_SIZE;
-        self.chunk_cursor += 1;
-        match self.state {
-            VadState::Waiting => {
-                self.push_history_chunk();
-                if probability >= self.options.threshold {
-                    self.state = VadState::Recording;
-                    self.speech_start = chunk_start.saturating_sub(self.history.len());
-                    self.silence_chunks = 0;
-                    self.current_chunks = 1;
-                    self.history.clear();
-                }
-                Vec::new()
+    pub(super) struct VadSegmenter {
+        options: VadOptions,
+        state: VadState,
+        history: VecDeque<i16>,
+        speech_start: usize,
+        silence_chunks: usize,
+        current_chunks: usize,
+        chunk_cursor: usize,
+    }
+
+    impl VadSegmenter {
+        pub(super) fn new(options: VadOptions) -> Self {
+            Self {
+                options,
+                state: VadState::Waiting,
+                history: VecDeque::new(),
+                speech_start: 0,
+                silence_chunks: 0,
+                current_chunks: 0,
+                chunk_cursor: 0,
             }
-            VadState::Recording => {
-                self.current_chunks += 1;
-                if probability >= self.options.threshold {
-                    self.silence_chunks = 0;
-                    if self.current_samples() >= ms_to_samples(9_000) {
-                        return self.finalize(chunk_start + FSMN_VAD_CHUNK_SIZE, false);
+        }
+
+        pub(super) fn push_probability(&mut self, probability: f32) -> Vec<VadSegment> {
+            let chunk_start = self.chunk_cursor * FSMN_VAD_CHUNK_SIZE;
+            self.chunk_cursor += 1;
+            match self.state {
+                VadState::Waiting => {
+                    self.push_history_chunk();
+                    if probability >= self.options.threshold {
+                        self.state = VadState::Recording;
+                        self.speech_start = chunk_start.saturating_sub(self.history.len());
+                        self.silence_chunks = 0;
+                        self.current_chunks = 1;
+                        self.history.clear();
                     }
-                    return Vec::new();
+                    Vec::new()
                 }
-                self.silence_chunks += 1;
-                if self.silence_chunks * FSMN_VAD_CHUNK_SIZE
-                    >= ms_to_samples(self.options.min_silence_ms)
-                {
-                    return self.finalize(chunk_start + FSMN_VAD_CHUNK_SIZE, true);
+                VadState::Recording => {
+                    self.current_chunks += 1;
+                    if probability >= self.options.threshold {
+                        self.silence_chunks = 0;
+                        if self.current_samples() >= ms_to_samples(9_000) {
+                            return self.finalize(chunk_start + FSMN_VAD_CHUNK_SIZE, false);
+                        }
+                        return Vec::new();
+                    }
+                    self.silence_chunks += 1;
+                    if self.silence_chunks * FSMN_VAD_CHUNK_SIZE
+                        >= ms_to_samples(self.options.min_silence_ms)
+                    {
+                        return self.finalize(chunk_start + FSMN_VAD_CHUNK_SIZE, true);
+                    }
+                    Vec::new()
                 }
-                Vec::new()
             }
         }
-    }
 
-    fn finish(&mut self) -> Vec<VadSegment> {
-        let end = self.chunk_cursor * FSMN_VAD_CHUNK_SIZE;
-        self.finalize(end, false)
-    }
-
-    fn finish_with_end(&mut self, valid_tail_samples: usize) -> Vec<VadSegment> {
-        let padded_end = self.chunk_cursor * FSMN_VAD_CHUNK_SIZE;
-        let end = padded_end
-            .saturating_sub(FSMN_VAD_CHUNK_SIZE)
-            .saturating_add(valid_tail_samples);
-        self.finalize(end, false)
-    }
-
-    fn push_history_chunk(&mut self) {
-        let rollback = ms_to_samples(200);
-        self.history
-            .extend(std::iter::repeat_n(0i16, FSMN_VAD_CHUNK_SIZE));
-        while self.history.len() > rollback {
-            self.history.pop_front();
+        pub(super) fn finish(&mut self) -> Vec<VadSegment> {
+            let end = self.chunk_cursor * FSMN_VAD_CHUNK_SIZE;
+            self.finalize(end, false)
         }
-    }
 
-    fn current_samples(&self) -> usize {
-        self.current_chunks * FSMN_VAD_CHUNK_SIZE
-    }
+        fn push_history_chunk(&mut self) {
+            let rollback = ms_to_samples(200);
+            self.history
+                .extend(std::iter::repeat_n(0i16, FSMN_VAD_CHUNK_SIZE));
+            while self.history.len() > rollback {
+                self.history.pop_front();
+            }
+        }
 
-    fn finalize(&mut self, end: usize, trim_tail: bool) -> Vec<VadSegment> {
-        if self.state != VadState::Recording {
-            return Vec::new();
+        fn current_samples(&self) -> usize {
+            self.current_chunks * FSMN_VAD_CHUNK_SIZE
         }
-        let end = if trim_tail {
-            end.saturating_sub(self.silence_chunks * FSMN_VAD_CHUNK_SIZE)
-        } else {
-            end
-        };
-        let start = self.speech_start.min(end);
-        let duration = end.saturating_sub(start);
-        self.state = VadState::Waiting;
-        self.silence_chunks = 0;
-        self.current_chunks = 0;
-        self.history.clear();
-        if duration < ms_to_samples(self.options.min_speech_ms) {
-            return Vec::new();
+
+        fn finalize(&mut self, end: usize, trim_tail: bool) -> Vec<VadSegment> {
+            if self.state != VadState::Recording {
+                return Vec::new();
+            }
+            let end = if trim_tail {
+                end.saturating_sub(self.silence_chunks * FSMN_VAD_CHUNK_SIZE)
+            } else {
+                end
+            };
+            let start = self.speech_start.min(end);
+            let duration = end.saturating_sub(start);
+            self.state = VadState::Waiting;
+            self.silence_chunks = 0;
+            self.current_chunks = 0;
+            self.history.clear();
+            if duration < ms_to_samples(self.options.min_speech_ms) {
+                return Vec::new();
+            }
+            vec![VadSegment {
+                range: sample_range(start, end),
+                probability: self.options.threshold,
+            }]
         }
-        vec![VadSegment {
-            range: sample_range(start, end),
-            probability: self.options.threshold,
-        }]
     }
 }
 
@@ -1189,6 +967,7 @@ fn speech_annotation(start: usize, end: usize, status: AnnotationStatus) -> Anno
 
 #[cfg(test)]
 mod tests {
+    use super::legacy_vad_segmenter::VadSegmenter;
     use super::*;
 
     #[test]
@@ -1263,7 +1042,7 @@ mod tests {
         let cuda = FsmnVadWeights::load_on_device(&model_dir, &Device::new_cuda(0)?)?;
         let waveform = load_pcm16_wav(&wav)?;
         let pcm = samples_f32_to_i16(&waveform.samples);
-        let feats = cpu.extract_features_from_pcm(&pcm)?;
+        let feats = cpu.frontend.extract_features_from_pcm(&pcm)?;
 
         let mut cpu_caches = cpu.zero_caches()?;
         let mut cuda_caches = cuda.zero_caches()?;

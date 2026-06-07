@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::{DurationMs, Timeline, Waveform};
@@ -45,6 +45,7 @@ pub enum AudioAsset {
         sha256: Option<String>,
     },
     Embedded {
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
         format: PersistedAudioFormat,
         duration: Option<DurationMs>,
@@ -101,25 +102,39 @@ impl VasrRecord {
         self
     }
 
+    /// Canonical vASR record id for a zero-based list index.
+    pub fn id_for_index(index: usize) -> String {
+        format!("record-{index}")
+    }
+
+    /// Record id used in benchmark reports and exported audio filenames.
+    pub fn record_id(&self) -> String {
+        let media_id = self.timeline.media_id.trim();
+        if !media_id.is_empty() {
+            return sanitize_record_id(media_id);
+        }
+        sanitize_record_id(&self.timeline.id)
+    }
+
     pub fn to_msgpack(&self) -> Result<Vec<u8>, RecordError> {
-        Ok(rmp_serde::to_vec_named(self)?)
+        to_msgpack_bytes(self).map_err(RecordError::from)
     }
 
     pub fn from_msgpack(bytes: &[u8]) -> Result<Self, RecordError> {
-        Ok(rmp_serde::from_slice(bytes)?)
+        from_msgpack_bytes(bytes).map_err(RecordError::from)
     }
 
     pub fn write_msgpack(&self, path: impl AsRef<Path>) -> Result<(), RecordError> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        self.serialize(&mut rmp_serde::Serializer::new(&mut writer).with_struct_map())?;
+        serialize_msgpack(&mut writer, self)?;
         Ok(())
     }
 
     pub fn read_msgpack(path: impl AsRef<Path>) -> Result<Self, RecordError> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        Ok(rmp_serde::from_read(reader)?)
+        from_msgpack_reader(reader).map_err(RecordError::from)
     }
 }
 
@@ -158,25 +173,76 @@ impl VasrRecordList {
     }
 
     pub fn to_msgpack(&self) -> Result<Vec<u8>, RecordError> {
-        Ok(rmp_serde::to_vec_named(self)?)
+        to_msgpack_bytes(self).map_err(RecordError::from)
     }
 
     pub fn from_msgpack(bytes: &[u8]) -> Result<Self, RecordError> {
-        Ok(rmp_serde::from_slice(bytes)?)
+        from_msgpack_bytes(bytes).map_err(RecordError::from)
     }
 
     pub fn write_msgpack(&self, path: impl AsRef<Path>) -> Result<(), RecordError> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        self.serialize(&mut rmp_serde::Serializer::new(&mut writer).with_struct_map())?;
+        serialize_msgpack(&mut writer, self)?;
         Ok(())
     }
 
     pub fn read_msgpack(path: impl AsRef<Path>) -> Result<Self, RecordError> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        Ok(rmp_serde::from_read(reader)?)
+        from_msgpack_reader(reader).map_err(RecordError::from)
     }
+}
+
+fn serialize_msgpack<W, T>(writer: W, value: &T) -> Result<(), rmp_serde::encode::Error>
+where
+    W: std::io::Write,
+    T: Serialize + ?Sized,
+{
+    use rmp_serde::config::BytesMode;
+
+    value.serialize(
+        &mut rmp_serde::Serializer::new(writer)
+            .with_struct_map()
+            .with_binary()
+            .with_bytes(BytesMode::ForceAll),
+    )
+}
+
+fn to_msgpack_bytes<T>(value: &T) -> Result<Vec<u8>, rmp_serde::encode::Error>
+where
+    T: Serialize + ?Sized,
+{
+    let mut bytes = Vec::new();
+    serialize_msgpack(&mut bytes, value)?;
+    Ok(bytes)
+}
+
+fn from_msgpack_reader<R, T>(reader: R) -> Result<T, rmp_serde::decode::Error>
+where
+    R: std::io::Read,
+    T: DeserializeOwned,
+{
+    T::deserialize(&mut rmp_serde::Deserializer::new(reader))
+}
+
+fn from_msgpack_bytes<T>(bytes: &[u8]) -> Result<T, rmp_serde::decode::Error>
+where
+    T: DeserializeOwned,
+{
+    from_msgpack_reader(bytes)
+}
+
+fn sanitize_record_id(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
 }
 
 impl AudioAsset {

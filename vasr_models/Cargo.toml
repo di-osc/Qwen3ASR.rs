@@ -24,8 +24,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 
-tokenizers = "0.21"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+tokenizers = "0.23"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 safetensors = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 rustfft = "6"
@@ -38,10 +38,10 @@ half = { version = "2.5.0", optional = true }
 intel-mkl-src = { version = "0.8.1", optional = true }
 
 # Audio loading and processing (feature-gated)
-symphonia = { version = "0.5", features = ["all-codecs", "all-formats"], optional = true }
-rubato = { version = "0.16", optional = true }
+symphonia = { version = "0.6", features = ["all-codecs", "all-formats"], optional = true }
+rubato = { version = "3", optional = true }
 base64 = { version = "0.22", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
 lindera = { version = "2.2.0", optional = true }
 lindera-ipadic = { version = "2.2.0", optional = true }
 unicode-general-category = "1.1.0"

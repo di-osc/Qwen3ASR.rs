@@ -96,7 +96,10 @@ impl AsrProcessor {
         &self,
         items: &[(&str, &AudioInput<'_>)],
     ) -> Result<(Vec<PreparedInputs>, PrepareBatchTimings)> {
+        #[cfg(feature = "timing")]
         let mut timings = PrepareBatchTimings::default();
+        #[cfg(not(feature = "timing"))]
+        let timings = PrepareBatchTimings::default();
         if items.is_empty() {
             return Ok((vec![], timings));
         }
