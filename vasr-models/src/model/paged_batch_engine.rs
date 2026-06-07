@@ -11,11 +11,11 @@ use crate::model::generation::{
     argmax_token_ids_from_logits, attention_masks_are_right_padded, count_audio_placeholders_batch,
     gather_last_logits_for_prompt_lens, normalize_batch_for_paged_prefill, position_ids_for_step,
 };
-use crate::model::isq_linear::set_linear_is_prefill;
 use crate::model::paged_cache_runtime::PagedCacheRuntime;
 use crate::model::paged_kv_cache::PagedInputMetadata;
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::model::thinker::get_rope_index;
+use vasr_quant::isq_linear::set_linear_is_prefill;
 
 #[derive(Debug, Clone)]
 pub struct PagedBatchConfig {

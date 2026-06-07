@@ -6,14 +6,14 @@
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
 
-use crate::model::isq_linear::set_linear_is_prefill;
 use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_cache_runtime::SharedPagedCacheRuntime;
-#[cfg(feature = "paged-attn")]
-use crate::model::paged_kv_cache::PagedKvCache;
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::model::thinker::get_rope_index;
+#[cfg(feature = "paged-attn")]
+use vasr_paged_attn::PagedKvCache;
+use vasr_quant::isq_linear::set_linear_is_prefill;
 
 #[cfg(feature = "paged-attn")]
 const PAGED_CACHE_BLOCK_SIZE: usize = 32;
@@ -52,18 +52,16 @@ fn argmax_token_id(logits: &Tensor) -> Result<u32> {
         && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none()
         && matches!(logits.dtype(), DType::F32 | DType::F16 | DType::BF16)
     {
-        return Ok(crate::model::metal_argmax::argmax_token_id(logits)?);
+        return Ok(vasr_quant::argmax_token_id(logits)?);
     }
 
     Ok(logits.argmax(0usize)?.to_scalar::<u32>()?)
 }
 
 #[cfg(feature = "metal-paged-attn")]
-fn metal_argmax_scratch_for_device(
-    device: &Device,
-) -> Option<crate::model::metal_argmax::MetalArgmaxScratch> {
+fn metal_argmax_scratch_for_device(device: &Device) -> Option<vasr_quant::MetalArgmaxScratch> {
     if device.is_metal() && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none() {
-        Some(crate::model::metal_argmax::MetalArgmaxScratch::new())
+        Some(vasr_quant::MetalArgmaxScratch::new())
     } else {
         None
     }
@@ -77,7 +75,7 @@ fn metal_argmax_scratch_for_device(_device: &Device) -> Option<()> {
 #[cfg(feature = "metal-paged-attn")]
 fn argmax_token_id_with_scratch(
     logits: &Tensor,
-    scratch: Option<&mut crate::model::metal_argmax::MetalArgmaxScratch>,
+    scratch: Option<&mut vasr_quant::MetalArgmaxScratch>,
 ) -> Result<u32> {
     if let Some(scratch) = scratch {
         if logits.device().is_metal()

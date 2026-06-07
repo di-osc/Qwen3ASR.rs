@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 pub use audio::input::AudioInput;
 #[cfg(feature = "paged-attn")]
+pub use vasr_paged_attn;
+#[cfg(feature = "paged-attn")]
 pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
 pub use inference::streaming::AsrStream;
 #[cfg(feature = "timing")]
@@ -23,10 +25,11 @@ pub use inference::transcribe::TranscribeTimings;
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
 #[cfg(feature = "paged-attn")]
 pub use model::paged_batch_engine::{PagedBatchConfig, PagedBatchState, PagedDecodeSlot};
-#[cfg(feature = "paged-attn")]
-pub use model::paged_cache_runtime::{PagedCacheConfig, PagedCacheStats};
 pub use model::weights::LoadOptions;
 pub use processor::AsrProcessor;
+#[cfg(feature = "paged-attn")]
+pub use vasr_paged_attn::{PagedCacheConfig, PagedCacheStats};
+pub use vasr_quant;
 
 pub mod qwen3_asr {
     #[cfg(feature = "timing")]
@@ -57,7 +60,7 @@ pub struct Qwen3Asr {
     processor: Arc<AsrProcessor>,
     _model: Arc<model::AsrModel>,
     #[cfg(feature = "paged-attn")]
-    paged_cache: Option<model::paged_cache_runtime::SharedPagedCacheRuntime>,
+    paged_cache: Option<vasr_paged_attn::SharedPagedCacheRuntime>,
 }
 
 impl Qwen3Asr {
@@ -89,7 +92,7 @@ impl Qwen3Asr {
         let paged_cache = if device.is_metal() || device.is_cuda() {
             let (num_layers, num_kv_heads, head_dim) = model.thinker.paged_cache_config();
             Some(Arc::new(std::sync::Mutex::new(
-                model::paged_cache_runtime::PagedCacheRuntime::new(
+                vasr_paged_attn::PagedCacheRuntime::new(
                     num_layers,
                     num_kv_heads,
                     head_dim,

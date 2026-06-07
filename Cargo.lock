@@ -5086,7 +5086,6 @@ dependencies = [
  "bytemuck",
  "candle-core",
  "candle-flash-attn",
- "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
  "cudarc 0.19.7",
@@ -5097,9 +5096,6 @@ dependencies = [
  "intel-mkl-src",
  "lindera",
  "lindera-ipadic",
- "mistralrs-paged-attn",
- "mistralrs-quant",
- "objc2-metal",
  "rayon",
  "reqwest 0.13.4",
  "rubato",
@@ -5112,6 +5108,19 @@ dependencies = [
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
+ "vasr-paged-attn",
+ "vasr-quant",
+]
+
+[[package]]
+name = "vasr-paged-attn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "mistralrs-paged-attn",
+ "tracing",
+ "vasr-quant",
 ]
 
 [[package]]
@@ -5121,6 +5130,20 @@ dependencies = [
  "serde",
  "serde_json",
  "vasr-data",
+]
+
+[[package]]
+name = "vasr-quant"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bindgen_cuda",
+ "candle-core",
+ "candle-metal-kernels",
+ "candle-nn",
+ "mistralrs-quant",
+ "objc2-metal",
+ "tracing",
 ]
 
 [[package]]

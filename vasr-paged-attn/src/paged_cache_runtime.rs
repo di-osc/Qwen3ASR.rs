@@ -8,16 +8,16 @@ use candle_core::Tensor;
 use candle_core::{DType, Device, Result};
 
 #[cfg(feature = "cuda-graph")]
-use crate::model::cuda_graph::{
+use crate::cuda_graph::{
     CUDA_DECODE_GRAPH_MAX_GRAPHS, DecodeCudaGraph, bucket_block_table_cols,
     cuda_graph_batch_bucket, cuda_graph_batch_buckets, cuda_graph_prewarm_batch_limit,
     pad_decode_batch_to_max,
 };
 #[cfg(feature = "cuda-graph")]
-use crate::model::paged_kv_cache::PagedInputMetadata;
-use crate::model::paged_kv_cache::PagedKvCache;
+use crate::decode_forward::PagedCudaDecodeForward;
 #[cfg(feature = "cuda-graph")]
-use crate::model::thinker::ThinkerForConditionalGeneration;
+use crate::paged_kv_cache::PagedInputMetadata;
+use crate::paged_kv_cache::PagedKvCache;
 
 #[derive(Debug, Clone, Copy)]
 pub enum PagedCacheMemory {
@@ -565,9 +565,9 @@ impl PagedCacheRuntime {
     }
 
     #[cfg(feature = "cuda-graph")]
-    pub fn cuda_decode_graph(
+    pub fn cuda_decode_graph<M: PagedCudaDecodeForward>(
         &mut self,
-        thinker: &ThinkerForConditionalGeneration,
+        thinker: &M,
         input_ids: &Tensor,
         position_ids: &Tensor,
         metadata: &PagedInputMetadata,
@@ -652,9 +652,9 @@ impl PagedCacheRuntime {
     }
 
     #[cfg(feature = "cuda-graph")]
-    pub fn prewarm_cuda_decode_graphs(
+    pub fn prewarm_cuda_decode_graphs<M: PagedCudaDecodeForward>(
         &mut self,
-        thinker: &ThinkerForConditionalGeneration,
+        thinker: &M,
         device: &Device,
         max_batch: usize,
     ) -> Result<usize> {
@@ -663,7 +663,7 @@ impl PagedCacheRuntime {
         }
 
         let block_size = self.cache.block_size();
-        let base_block_table_cols = crate::model::cuda_graph::cuda_graph_block_bucket(block_size);
+        let base_block_table_cols = crate::cuda_graph::cuda_graph_block_bucket(block_size);
         let block_table_col_buckets = [base_block_table_cols, base_block_table_cols * 2];
         let limit = cuda_graph_prewarm_batch_limit(max_batch);
         self.cuda_graph_max_batch = limit;

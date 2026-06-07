@@ -1,0 +1,42 @@
+[package]
+name = "vasr-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-situ quantization and platform-specific matmul kernels for VASR"
+
+[dependencies]
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
+mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
+anyhow = "1"
+tracing = "0.1"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = [
+  "candle-core/cuda",
+  "candle-nn/cuda",
+  "dep:bindgen_cuda",
+]
+paged-attn = ["dep:mistralrs-quant"]
+metal-paged-attn = [
+  "metal",
+  "paged-attn",
+  "dep:candle-metal-kernels",
+  "dep:objc2-metal",
+  "mistralrs-quant/metal",
+]
+cuda-quant = ["cuda", "dep:mistralrs-quant", "mistralrs-quant/cuda"]
+cuda-paged-attn = ["cuda", "paged-attn", "mistralrs-quant/cuda"]
+timing = []
+
+[build-dependencies]
+bindgen_cuda = { version = "0.1.5", optional = true }
+
+[lints]
+workspace = true

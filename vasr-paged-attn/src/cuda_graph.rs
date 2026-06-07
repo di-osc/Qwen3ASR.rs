@@ -1,8 +1,7 @@
 //! CUDA graph replay for single-token paged decode.
 
-use crate::model::isq_linear::set_linear_is_prefill;
-use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
-use crate::model::thinker::ThinkerForConditionalGeneration;
+use crate::decode_forward::PagedCudaDecodeForward;
+use crate::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
 use anyhow::{Result, anyhow, bail};
 use candle_core::cuda_backend::CudaDType;
 use candle_core::cuda_backend::cudarc::driver::sys::{
@@ -12,6 +11,7 @@ use candle_core::cuda_backend::cudarc::driver::{CudaGraph as CudarcGraph, CudaSt
 use candle_core::{DType, Device, Storage, Tensor};
 use std::ptr;
 use std::sync::Arc;
+use vasr_quant::isq_linear::set_linear_is_prefill;
 
 /// Context-length bucket for stable CUDA graph keys (matches mistral.rs).
 pub const CUDA_GRAPH_CONTEXT_BUCKET_TOKENS: usize = 256;
@@ -128,8 +128,8 @@ pub struct DecodeCudaGraph {
 
 impl DecodeCudaGraph {
     /// Capture a decode graph for a fixed batch/block-table shape (model-load prewarm).
-    pub fn capture_batch_warmup(
-        thinker: &ThinkerForConditionalGeneration,
+    pub fn capture_batch_warmup<M: PagedCudaDecodeForward>(
+        thinker: &M,
         paged_cache: &PagedKvCache,
         batch: usize,
         block_table_cols: usize,
@@ -163,8 +163,8 @@ impl DecodeCudaGraph {
         Ok(graph)
     }
 
-    pub fn capture_decode(
-        thinker: &ThinkerForConditionalGeneration,
+    pub fn capture_decode<M: PagedCudaDecodeForward>(
+        thinker: &M,
         paged_cache: &PagedKvCache,
         input_ids: &Tensor,
         position_ids: &Tensor,

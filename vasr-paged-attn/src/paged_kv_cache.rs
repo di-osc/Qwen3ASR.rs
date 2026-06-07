@@ -2,7 +2,7 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
-use crate::model::attention::{FlashKMeta, FlashParams};
+use crate::flash::{FlashKMeta, FlashParams};
 
 pub const PAD_SLOT_ID: i64 = -1;
 

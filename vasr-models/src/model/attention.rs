@@ -154,19 +154,7 @@ pub enum AttentionMask {
     Custom(Tensor),
 }
 
-#[derive(Debug, Clone)]
-pub struct FlashKMeta {
-    pub max: u32,
-    pub cumulative_seqlens: Option<Tensor>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FlashParams {
-    pub max_q: u32,
-    pub cumulative_seqlens_q: Option<Tensor>,
-    pub logical_k: FlashKMeta,
-    pub causal: bool,
-}
+pub use vasr_paged_attn::{FlashKMeta, FlashParams};
 
 #[cfg(feature = "flash-attn")]
 fn flash_attn_dispatch(

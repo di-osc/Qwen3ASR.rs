@@ -14,6 +14,8 @@ use crate::model::{attention, rope};
 
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
+#[cfg(feature = "paged-attn")]
+use vasr_paged_attn::mistralrs_paged_attn;
 
 #[cfg(feature = "paged-attn")]
 #[derive(Clone)]

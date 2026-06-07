@@ -4,26 +4,27 @@ use std::path::PathBuf;
 
 pub mod attention;
 pub mod audio_encoder;
-#[cfg(feature = "cuda-graph")]
-pub mod cuda_graph;
 pub mod generation;
-pub mod isq_linear;
 pub mod kv_cache;
-#[cfg(feature = "metal-paged-attn")]
-mod metal_argmax;
 pub mod name_map;
 #[cfg(feature = "paged-attn")]
 pub mod paged_batch_engine;
-#[cfg(feature = "paged-attn")]
-pub mod paged_cache_runtime;
-#[cfg(feature = "paged-attn")]
-pub mod paged_kv_cache;
-#[cfg(feature = "cuda")]
-mod q8_mmvq;
 pub mod rope;
 pub mod thinker;
 pub mod thinker_text;
 pub mod weights;
+
+pub use vasr_quant::isq_linear;
+
+#[cfg(feature = "paged-attn")]
+pub mod paged_kv_cache {
+    pub use vasr_paged_attn::paged_kv_cache::*;
+}
+
+#[cfg(feature = "paged-attn")]
+pub mod paged_cache_runtime {
+    pub use vasr_paged_attn::paged_cache_runtime::*;
+}
 
 #[derive(Debug)]
 pub struct AsrModel {

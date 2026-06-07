@@ -1,0 +1,31 @@
+[package]
+name = "vasr-paged-attn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PagedAttention KV cache and batch runtime for VASR"
+
+[dependencies]
+anyhow = "1"
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+mistralrs-paged-attn = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
+tracing = "0.1"
+vasr-quant = { path = "../vasr-quant", default-features = false }
+
+[features]
+default = []
+paged-attn = ["dep:mistralrs-paged-attn"]
+metal = ["candle-core/metal"]
+cuda = ["candle-core/cuda"]
+cuda-graph = ["cuda", "vasr-quant/cuda"]
+cuda-paged-attn = ["cuda", "paged-attn", "vasr-quant/cuda-paged-attn", "mistralrs-paged-attn/cuda"]
+metal-paged-attn = [
+  "metal",
+  "paged-attn",
+  "vasr-quant/metal-paged-attn",
+  "mistralrs-paged-attn/metal",
+]
+
+[lints]
+workspace = true

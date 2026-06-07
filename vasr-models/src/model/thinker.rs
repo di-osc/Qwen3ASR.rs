@@ -617,3 +617,22 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(feature = "paged-attn")]
+impl vasr_paged_attn::PagedCudaDecodeForward for ThinkerForConditionalGeneration {
+    fn forward_input_ids_with_paged_cache(
+        &self,
+        input_ids: &Tensor,
+        position_ids: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+    ) -> Result<Tensor> {
+        ThinkerForConditionalGeneration::forward_input_ids_with_paged_cache(
+            self,
+            input_ids,
+            position_ids,
+            paged_cache,
+            input_metadata,
+        )
+    }
+}

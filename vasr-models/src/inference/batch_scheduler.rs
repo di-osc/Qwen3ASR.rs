@@ -11,11 +11,9 @@ use crate::model::paged_batch_engine::{
     PagedBatchConfig, PagedDecodeSlot, paged_batch_decode_slots_at_step, paged_batch_free_slots,
     paged_batch_prefill, paged_batch_run,
 };
-use crate::model::paged_cache_runtime::{
-    PagedBlockManager, PagedCacheRuntime, SharedPagedCacheRuntime,
-};
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::asr_processor::PreparedInputs;
+use vasr_paged_attn::{PagedBlockManager, PagedCacheRuntime, SharedPagedCacheRuntime};
 
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {

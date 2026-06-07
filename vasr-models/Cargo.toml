@@ -12,11 +12,6 @@ candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.
 candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
 candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
 candle-flash-attn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
-objc2-metal = { version = "0.3.2", optional = true }
-mistralrs-paged-attn = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
-mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
-# Keep in sync with Candle/cudarc constraints (mirrors qwen3-tts-rs).
 float8 = "0.7"
 
 anyhow = "1"
@@ -37,7 +32,9 @@ cudarc = { version = "0.19.0", optional = true }
 half = { version = "2.5.0", optional = true }
 intel-mkl-src = { version = "0.8.1", optional = true }
 
-# Audio loading and processing (feature-gated)
+vasr-paged-attn = { path = "../vasr-paged-attn", default-features = false }
+vasr-quant = { path = "../vasr-quant", default-features = false }
+
 symphonia = { version = "0.6", features = ["all-codecs", "all-formats"], optional = true }
 rubato = { version = "3", optional = true }
 base64 = { version = "0.22", optional = true }
@@ -63,9 +60,10 @@ cuda-base = [
   "candle-transformers/cuda",
   "dep:bindgen_cuda",
   "dep:half",
+  "vasr-quant/cuda",
 ]
-cuda-graph = ["cuda-paged-attn"]
-cuda-quant = ["cuda-base", "dep:mistralrs-quant", "mistralrs-quant/cuda"]
+cuda-graph = ["cuda-paged-attn", "vasr-paged-attn/cuda-graph"]
+cuda-quant = ["cuda-base", "vasr-quant/cuda-quant"]
 cudnn = ["cuda-base", "candle-core/cudnn"]
 flash-attn = ["cuda-base", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
 mkl = [
@@ -75,15 +73,24 @@ mkl = [
   "candle-transformers/mkl",
 ]
 nccl = ["cuda-base", "cudarc/nccl", "dep:half"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-paged-attn = ["dep:mistralrs-paged-attn"]
-metal-paged-attn = ["metal", "paged-attn", "dep:candle-metal-kernels", "dep:objc2-metal", "dep:mistralrs-quant", "mistralrs-paged-attn/metal", "mistralrs-quant/metal"]
-cuda-paged-attn = ["cuda-base", "paged-attn", "dep:mistralrs-quant", "mistralrs-paged-attn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "vasr-quant/metal"]
+paged-attn = ["vasr-paged-attn/paged-attn", "vasr-quant/paged-attn"]
+metal-paged-attn = [
+  "metal",
+  "paged-attn",
+  "vasr-paged-attn/metal-paged-attn",
+  "vasr-quant/metal-paged-attn",
+]
+cuda-paged-attn = [
+  "cuda-base",
+  "paged-attn",
+  "vasr-paged-attn/cuda-paged-attn",
+  "vasr-quant/cuda-paged-attn",
+]
 cudarc = ["dep:cudarc"]
 
 audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64", "dep:reqwest"]
 
-# Force aligner (model + language-specific tokenization) lives behind a feature.
 forced-aligner = [
   "dep:lindera",
   "dep:lindera-ipadic",
@@ -91,24 +98,15 @@ forced-aligner = [
   "lindera-ipadic/embed-ipadic",
 ]
 
-# Testing feature - enables integration tests that download models from HuggingFace.
 integration-tests = []
+timing = ["vasr-quant/timing"]
 
-# Performance timing instrumentation.
-timing = []
-
-# Run all platform-independent tests.
 test-all = ["integration-tests"]
-
-# Platform-specific test features (use these explicitly when on that platform).
 test-all-macos = ["test-all", "metal", "audio-loading"]
 test-all-cuda = ["test-all", "cuda", "audio-loading"]
 
 [dev-dependencies]
 fs2 = "0.4"
-
-[build-dependencies]
-bindgen_cuda = { version = "0.1.5", optional = true }
 
 [[example]]
 name = "bench_transcribe"

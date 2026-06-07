@@ -377,12 +377,10 @@ pub fn try_fused_q8_silu_gate_up(
     else {
         return Ok(None);
     };
-    if !crate::model::q8_mmvq::can_run_fused_glu(gate_q, up_q, x) {
+    if !crate::q8_mmvq::can_run_fused_glu(gate_q, up_q, x) {
         return Ok(None);
     }
-    Ok(Some(crate::model::q8_mmvq::fused_glu_silu(
-        gate_q, up_q, x,
-    )?))
+    Ok(Some(crate::q8_mmvq::fused_glu_silu(gate_q, up_q, x)?))
 }
 
 #[cfg(feature = "metal-paged-attn")]
@@ -409,8 +407,8 @@ impl candle_core::Module for QLinear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let QMatMul::QTensor(qtensor) = self.matmul.as_ref() {
-            if crate::model::q8_mmvq::can_run(qtensor, x) {
-                let mut ys = crate::model::q8_mmvq::plain(qtensor, x)?;
+            if crate::q8_mmvq::can_run(qtensor, x) {
+                let mut ys = crate::q8_mmvq::plain(qtensor, x)?;
                 if let Some(bias) = &self.bias {
                     ys = ys.broadcast_add(&bias.to_dtype(ys.dtype())?.to_device(x.device())?)?;
                 }

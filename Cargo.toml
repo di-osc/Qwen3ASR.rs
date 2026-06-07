@@ -7,6 +7,8 @@ members = [
   "vasr-protocol",
   "vasr-runtime",
   "vasr-server",
+  "vasr-paged-attn",
+  "vasr-quant",
 ]
 resolver = "3"
 
