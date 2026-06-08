@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use vasr_models::qwen3_asr::model::isq_linear::{isq_quantize_time_us, reset_isq_quantize_time};
 use vasr_models::qwen3_asr::{AudioInput, Batch, LoadOptions, Qwen3Asr, TranscribeOptions};
+#[cfg(feature = "paged-attn")]
+use vasr_paged_attn::{PagedCacheConfig, PagedCacheMemory};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -65,7 +67,7 @@ fn main() -> Result<()> {
             use_flash_attn,
             isq,
             #[cfg(feature = "paged-attn")]
-            paged_cache: None,
+            paged_cache: default_paged_cache_config(&device),
         },
     )
     .context("failed to load model")?;
@@ -107,10 +109,34 @@ fn main() -> Result<()> {
         let (out, timings) = model.transcribe_timed(inputs, opts.clone())?;
         let wall = start.elapsed();
         let decode_s = timings.generation.decode_us as f64 / 1_000_000.0;
-        let batch_tokens_per_s = if decode_s == 0.0 {
-            0.0
+        let text_decode_tokens = out
+            .iter()
+            .map(|o| {
+                model
+                    .processor()
+                    .tokenizer
+                    .encode(o.text.as_str())
+                    .map(|ids| ids.len())
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum::<usize>();
+        let timed_tokens = if timings.generation.tokens_generated > 0 {
+            timings.generation.tokens_generated
         } else {
-            timings.generation.tokens_generated as f64 / decode_s
+            text_decode_tokens
+        };
+        let batch_tokens_per_s = if decode_s > 0.0 {
+            timed_tokens as f64 / decode_s
+        } else {
+            let decode_ms = wall.as_secs_f64() * 1000.0
+                - timings.audio_encoder_us as f64 / 1000.0
+                - timings.generation.prefill_us as f64 / 1000.0;
+            if decode_ms <= 0.0 {
+                0.0
+            } else {
+                text_decode_tokens as f64 / (decode_ms / 1000.0)
+            }
         };
         let per_sequence_tokens_per_s = batch_tokens_per_s / batch_size as f64;
         let first_text = out.first().map(|o| o.text.as_str()).unwrap_or("");
@@ -125,7 +151,7 @@ fn main() -> Result<()> {
             timings.generation.prefill_us as f64 / 1000.0,
             timings.generation.decode_us as f64 / 1000.0,
             timings.generation.steps,
-            timings.generation.tokens_generated,
+            timed_tokens,
             batch_tokens_per_s,
             per_sequence_tokens_per_s,
             first_text,
@@ -143,6 +169,18 @@ fn parse_dtype(value: &str) -> Result<DType> {
         "bf16" => Ok(DType::BF16),
         other => anyhow::bail!("unknown dtype {other:?}; expected f32, f16, or bf16"),
     }
+}
+
+#[cfg(feature = "paged-attn")]
+fn default_paged_cache_config(device: &Device) -> Option<PagedCacheConfig> {
+    Some(PagedCacheConfig {
+        block_size: 32,
+        memory: if device.is_cuda() {
+            PagedCacheMemory::GpuMemoryFraction(0.8)
+        } else {
+            PagedCacheMemory::ContextSize(100_000)
+        },
+    })
 }
 
 fn default_gpu_device() -> Result<Device> {

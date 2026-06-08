@@ -79,7 +79,19 @@ impl AsrProcessor {
     }
 
     pub fn prepare_batch(&self, items: &[(&str, &AudioInput<'_>)]) -> Result<Vec<PreparedInputs>> {
-        self.prepare_batch_inner(items)
+        self.prepare_batch_inner(items, true)
+            .map(|(prepared, _)| prepared)
+    }
+
+    /// Prepare VAD segments without cross-row token padding.
+    ///
+    /// The continuous batch scheduler right-pads only within each admit wave so prefill can use
+    /// per-row `query_lens` / flash varlen metadata.
+    pub fn prepare_batch_varlen(
+        &self,
+        items: &[(&str, &AudioInput<'_>)],
+    ) -> Result<Vec<PreparedInputs>> {
+        self.prepare_batch_inner(items, false)
             .map(|(prepared, _)| prepared)
     }
 
@@ -88,13 +100,23 @@ impl AsrProcessor {
         &self,
         items: &[(&str, &AudioInput<'_>)],
     ) -> Result<(Vec<PreparedInputs>, PrepareBatchTimings)> {
-        let (prepared, timings) = self.prepare_batch_inner(items)?;
+        let (prepared, timings) = self.prepare_batch_inner(items, true)?;
+        Ok((prepared, timings))
+    }
+
+    #[cfg(feature = "timing")]
+    pub fn prepare_batch_varlen_timed(
+        &self,
+        items: &[(&str, &AudioInput<'_>)],
+    ) -> Result<(Vec<PreparedInputs>, PrepareBatchTimings)> {
+        let (prepared, timings) = self.prepare_batch_inner(items, false)?;
         Ok((prepared, timings))
     }
 
     fn prepare_batch_inner(
         &self,
         items: &[(&str, &AudioInput<'_>)],
+        pad_to_batch_max: bool,
     ) -> Result<(Vec<PreparedInputs>, PrepareBatchTimings)> {
         #[cfg(feature = "timing")]
         let mut timings = PrepareBatchTimings::default();
@@ -129,10 +151,21 @@ impl AsrProcessor {
         // zero-padded waveform boundary behavior; feature mode is an opt-in experiment.
         #[cfg(feature = "timing")]
         let start_feature_extract = std::time::Instant::now();
-        let feats = match feature_padding_mode_from_env()? {
-            FeaturePaddingMode::Feature => extract_features_with_feature_padding(&wavs)?,
-            FeaturePaddingMode::Waveform => extract_features_with_waveform_padding(&wavs)?,
-            FeaturePaddingMode::WaveformFull => extract_features_with_full_waveform_padding(&wavs)?,
+        let feats = if pad_to_batch_max {
+            match feature_padding_mode_from_env()? {
+                FeaturePaddingMode::Feature => extract_features_with_feature_padding(&wavs)?,
+                FeaturePaddingMode::Waveform => extract_features_with_waveform_padding(&wavs)?,
+                FeaturePaddingMode::WaveformFull => {
+                    extract_features_with_full_waveform_padding(&wavs)?
+                }
+            }
+        } else {
+            let mut feats: Vec<feature_extractor::Features> = wavs
+                .par_iter()
+                .map(|wav| feature_extractor::extract_features(wav))
+                .collect::<Result<Vec<_>>>()?;
+            pad_feature_batch_to_max_frames(feats.as_mut_slice())?;
+            feats
         };
         #[cfg(feature = "timing")]
         {
@@ -156,37 +189,49 @@ impl AsrProcessor {
             timings.tokenize_expand_us = duration_to_us(start_tokenize_expand.elapsed());
         }
 
-        // Right-pad batched prompts so paged prefill can consume them directly.
         #[cfg(feature = "timing")]
         let start_pad = std::time::Instant::now();
-        let max_tokens = input_ids.iter().map(Vec::len).max().unwrap_or(0);
         let mut out: Vec<PreparedInputs> = Vec::with_capacity(items.len());
 
-        for (ids, f) in input_ids.into_iter().zip(feats) {
-            let len = ids.len();
-            if len > max_tokens {
-                bail!(
-                    "internal error: sequence len {} > max_tokens {}",
-                    len,
-                    max_tokens
-                );
+        if pad_to_batch_max {
+            // Right-pad batched prompts so static micro-batch prefill can consume them directly.
+            let max_tokens = input_ids.iter().map(Vec::len).max().unwrap_or(0);
+            for (ids, f) in input_ids.into_iter().zip(feats) {
+                let len = ids.len();
+                if len > max_tokens {
+                    bail!(
+                        "internal error: sequence len {} > max_tokens {}",
+                        len,
+                        max_tokens
+                    );
+                }
+                let pad = max_tokens - len;
+
+                let mut padded_ids: Vec<u32> = Vec::with_capacity(max_tokens);
+                padded_ids.extend(ids);
+                padded_ids.extend(std::iter::repeat_n(pad_id, pad));
+
+                let mut attn: Vec<u32> = Vec::with_capacity(max_tokens);
+                attn.extend(std::iter::repeat_n(1u32, len));
+                attn.extend(std::iter::repeat_n(0u32, pad));
+
+                out.push(PreparedInputs {
+                    input_ids: padded_ids,
+                    attention_mask: attn,
+                    input_features: f.input_features,
+                    feature_attention_mask: f.feature_attention_mask,
+                });
             }
-            let pad = max_tokens - len;
-
-            let mut padded_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-            padded_ids.extend(ids);
-            padded_ids.extend(std::iter::repeat_n(pad_id, pad));
-
-            let mut attn: Vec<u32> = Vec::with_capacity(max_tokens);
-            attn.extend(std::iter::repeat_n(1u32, len));
-            attn.extend(std::iter::repeat_n(0u32, pad));
-
-            out.push(PreparedInputs {
-                input_ids: padded_ids,
-                attention_mask: attn,
-                input_features: f.input_features,
-                feature_attention_mask: f.feature_attention_mask,
-            });
+        } else {
+            for (ids, f) in input_ids.into_iter().zip(feats) {
+                let len = ids.len();
+                out.push(PreparedInputs {
+                    input_ids: ids,
+                    attention_mask: vec![1u32; len],
+                    input_features: f.input_features,
+                    feature_attention_mask: f.feature_attention_mask,
+                });
+            }
         }
 
         #[cfg(feature = "timing")]

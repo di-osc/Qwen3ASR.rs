@@ -984,6 +984,7 @@ checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.11.1",
  "block2",
+ "libc",
  "objc2",
 ]
 
@@ -5118,7 +5119,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-metal-kernels",
+ "dispatch2",
  "mistralrs-paged-attn",
+ "objc2-metal",
+ "thiserror 2.0.18",
  "tracing",
  "vasr-quant",
 ]

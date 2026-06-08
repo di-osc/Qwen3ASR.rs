@@ -36,7 +36,13 @@ pub(crate) fn use_paged_attn_on_device(device: &Device) -> bool {
     if device.is_metal() {
         #[cfg(feature = "metal-paged-attn")]
         {
-            return true;
+            // Metal defaults to eager KV-cache decode (SDPA) for best single-stream
+            // throughput; paged-attn is opt-in via VASR_FORCE_PAGED_ATTN=1.
+            // See docs/performance/qwen3-asr-metal-isq8-optimization-notes.md Pass 9.
+            if std::env::var_os("VASR_FORCE_PAGED_ATTN").is_some() {
+                return true;
+            }
+            return false;
         }
         #[cfg(not(feature = "metal-paged-attn"))]
         {
@@ -47,22 +53,8 @@ pub(crate) fn use_paged_attn_on_device(device: &Device) -> bool {
 }
 
 #[cfg(feature = "paged-attn")]
-fn force_metal_single_sequence_paged_attn() -> bool {
-    std::env::var_os("VASR_FORCE_PAGED_ATTN").is_some()
-}
-
-#[cfg(feature = "paged-attn")]
-fn should_use_metal_eager_for_batch1() -> bool {
-    std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_none()
-        && !force_metal_single_sequence_paged_attn()
-}
-
-#[cfg(feature = "paged-attn")]
-fn should_use_paged_attention(device: &Device, batch: usize) -> bool {
+fn should_use_paged_attention(device: &Device, _batch: usize) -> bool {
     if std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some() {
-        return false;
-    }
-    if batch == 1 && device.is_metal() && should_use_metal_eager_for_batch1() {
         return false;
     }
     use_paged_attn_on_device(device)

@@ -156,6 +156,251 @@ pub enum AttentionMask {
 
 pub use vasr_paged_attn::{FlashKMeta, FlashParams};
 
+const SDPA_HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
+
+fn valid_sdpa_head_dim(head_dim: usize) -> bool {
+    SDPA_HEAD_DIMS.contains(&head_dim)
+}
+
+fn sequence_lengths_from_cu(cu: &Tensor) -> Result<Vec<usize>> {
+    let cu = cu.to_vec1::<u32>()?;
+    if cu.len() < 2 {
+        candle_core::bail!(
+            "cumulative seqlens must contain at least two entries, got {}",
+            cu.len()
+        );
+    }
+    Ok(cu
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]) as usize)
+        .collect())
+}
+
+fn run_single_sequence_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    softmax_scale: f32,
+    causal: bool,
+    n_kv_groups: usize,
+) -> Result<Tensor> {
+    if let Some(out) = accelerated_sdpa(q, k, v, mask, softmax_scale, causal)? {
+        return Ok(out);
+    }
+
+    let (k, v) = if n_kv_groups > 1 {
+        (repeat_kv(k, n_kv_groups)?, repeat_kv(v, n_kv_groups)?)
+    } else {
+        (k.clone(), v.clone())
+    };
+
+    let q = if q.device().is_metal() || q.device().is_cuda() {
+        q.contiguous()?
+    } else {
+        q.clone()
+    };
+    let v = if v.device().is_metal() || v.device().is_cuda() {
+        v.contiguous()?
+    } else {
+        v.clone()
+    };
+    let k_t = if k.device().is_metal() || k.device().is_cuda() {
+        k.transpose(2, 3)?.contiguous()?
+    } else {
+        k.transpose(2, 3)?
+    };
+    let mut attn_weights = q.matmul(&k_t)?.affine(softmax_scale.into(), 0.0)?;
+    if let Some(mask) = mask {
+        attn_weights = attn_weights.broadcast_add(mask)?;
+    } else if causal && q.dim(2)? > 1 {
+        let causal_mask = make_causal_mask(None, q.dim(0)?, q.dim(2)?, q.dtype(), q.device())?;
+        attn_weights = attn_weights.broadcast_add(&causal_mask)?;
+    }
+    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+    attn_weights.matmul(&v)
+}
+
+/// Packed varlen attention for gathered paged K/V: `(1, kv_heads, total_kv, dim)`.
+///
+/// Right-padded query batches use valid tokens at the start of each row. On Metal this
+/// avoids `unpack_gathered_kv_for_attention` pad/cat by slicing packed K/V per sequence
+/// and running native GQA SDPA.
+fn packed_varlen_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &AttentionMask,
+    flash_params: &FlashParams,
+    softmax_scale: f32,
+    causal: bool,
+    n_kv_groups: usize,
+) -> Result<Option<Tensor>> {
+    let (batch, _num_heads, seq_len, head_dim) = q.dims4()?;
+    if !valid_sdpa_head_dim(head_dim) {
+        return Ok(None);
+    }
+    if !(q.device().is_metal() || q.device().is_cpu()) {
+        return Ok(None);
+    }
+
+    let (kb, _num_kv_heads, total_kv, kv_head_dim) = k.dims4()?;
+    let (vb, _, _, v_head_dim) = v.dims4()?;
+    if kb != 1 || vb != 1 || head_dim != kv_head_dim || head_dim != v_head_dim {
+        return Ok(None);
+    }
+
+    let cu_q = flash_params
+        .cumulative_seqlens_q
+        .as_ref()
+        .ok_or_else(|| candle_core::Error::Msg("packed varlen missing cu_seqlens_q".into()))?;
+    let cu_k = flash_params
+        .logical_k
+        .cumulative_seqlens
+        .as_ref()
+        .ok_or_else(|| candle_core::Error::Msg("packed varlen missing cu_seqlens_k".into()))?;
+    let query_lens = sequence_lengths_from_cu(cu_q)?;
+    let kv_lens = sequence_lengths_from_cu(cu_k)?;
+    if query_lens.len() != batch || kv_lens.len() != batch {
+        candle_core::bail!(
+            "packed varlen length mismatch: batch={batch} query_lens={} kv_lens={}",
+            query_lens.len(),
+            kv_lens.len()
+        );
+    }
+
+    let mask_tensor = match mask {
+        AttentionMask::None => None,
+        AttentionMask::Custom(mask) => Some(mask),
+    };
+
+    if query_lens.iter().all(|&len| len == query_lens[0])
+        && kv_lens.iter().all(|&len| len == kv_lens[0])
+    {
+        let q_len = query_lens[0];
+        let kv_len = kv_lens[0];
+        let total = batch
+            .checked_mul(kv_len)
+            .ok_or_else(|| candle_core::Error::Msg("packed kv token count overflow".into()))?;
+        if total > total_kv {
+            candle_core::bail!(
+                "packed kv length exceeds gathered cache: total={total} gathered={total_kv}"
+            );
+        }
+
+        let q_active = if q_len == seq_len {
+            q.clone()
+        } else {
+            q.narrow(2, 0, q_len)?
+        };
+        let k_batched = k
+            .narrow(2, 0, total)?
+            .reshape((batch, kv_len, k.dim(1)?, head_dim))?
+            .transpose(1, 2)?;
+        let v_batched = v
+            .narrow(2, 0, total)?
+            .reshape((batch, kv_len, v.dim(1)?, head_dim))?
+            .transpose(1, 2)?;
+        let mask = match mask_tensor {
+            Some(mask) => {
+                let mask = if q_len < seq_len {
+                    mask.narrow(2, 0, q_len)?
+                } else {
+                    mask.clone()
+                };
+                Some(mask.narrow(3, 0, kv_len)?)
+            }
+            None => None,
+        };
+        let out = run_single_sequence_attention(
+            &q_active,
+            &k_batched,
+            &v_batched,
+            mask.as_ref(),
+            softmax_scale,
+            causal,
+            n_kv_groups,
+        )?;
+        let out = if q_len < seq_len {
+            let pad = Tensor::zeros(
+                (batch, out.dim(1)?, seq_len - q_len, head_dim),
+                out.dtype(),
+                out.device(),
+            )?;
+            Tensor::cat(&[&out, &pad], 2)?
+        } else {
+            out
+        };
+        return Ok(Some(out));
+    }
+
+    let mut kv_offset = 0usize;
+    let mut rows = Vec::with_capacity(batch);
+    for row in 0..batch {
+        let q_len = query_lens[row];
+        let kv_len = kv_lens[row];
+        let kv_end = kv_offset
+            .checked_add(kv_len)
+            .ok_or_else(|| candle_core::Error::Msg("packed kv offset overflow".into()))?;
+        if kv_end > total_kv {
+            candle_core::bail!(
+                "packed kv slice exceeds gathered cache: end={kv_end} gathered={total_kv}"
+            );
+        }
+
+        let q_row = q.narrow(0, row, 1)?.narrow(2, 0, q_len)?;
+        let k_row = k.narrow(2, kv_offset, kv_len)?;
+        let v_row = v.narrow(2, kv_offset, kv_len)?;
+        let mask_row = match mask_tensor {
+            Some(mask) => Some(
+                mask.narrow(0, row, 1)?
+                    .narrow(2, 0, q_len)?
+                    .narrow(3, 0, kv_len)?,
+            ),
+            None => None,
+        };
+        let out_row = run_single_sequence_attention(
+            &q_row,
+            &k_row,
+            &v_row,
+            mask_row.as_ref(),
+            softmax_scale,
+            causal,
+            n_kv_groups,
+        )?;
+        let out_row = if q_len < seq_len {
+            let pad = Tensor::zeros(
+                (1usize, out_row.dim(1)?, seq_len - q_len, head_dim),
+                out_row.dtype(),
+                out_row.device(),
+            )?;
+            Tensor::cat(&[&out_row, &pad], 2)?
+        } else {
+            out_row
+        };
+        rows.push(out_row);
+        kv_offset = kv_end;
+    }
+
+    Ok(Some(Tensor::cat(rows.as_slice(), 0)?))
+}
+
+fn should_use_packed_varlen(q: &Tensor, k: &Tensor, flash_params: Option<&FlashParams>) -> bool {
+    let Some(params) = flash_params else {
+        return false;
+    };
+    if params.cumulative_seqlens_q.is_none() || params.logical_k.cumulative_seqlens.is_none() {
+        return false;
+    }
+    let Ok((batch, _, seq_len, _)) = q.dims4() else {
+        return false;
+    };
+    let Ok((kb, _, total_kv, _)) = k.dims4() else {
+        return false;
+    };
+    kb == 1 && (batch > 1 || seq_len != total_kv)
+}
+
 #[cfg(feature = "flash-attn")]
 fn flash_attn_dispatch(
     q: &Tensor,
@@ -216,8 +461,19 @@ fn flash_attn_dispatch(
 }
 
 pub fn supports_packed_varlen_sdpa(query: &Tensor) -> bool {
-    query.device().is_cpu()
-        || (query.device().is_cuda() && cfg!(feature = "flash-attn") && query.dtype() != DType::F32)
+    if std::env::var_os("VASR_DISABLE_PACKED_VARLEN").is_some() {
+        return false;
+    }
+    if query.dtype() == DType::F32 {
+        return false;
+    }
+    if query.device().is_cpu() {
+        return true;
+    }
+    if query.device().is_cuda() && cfg!(feature = "flash-attn") {
+        return true;
+    }
+    query.device().is_metal() && query.dim(3).is_ok_and(valid_sdpa_head_dim)
 }
 
 pub fn run_attention(
@@ -230,6 +486,7 @@ pub fn run_attention(
     causal_default: bool,
     n_kv_groups: usize,
 ) -> Result<Tensor> {
+    let causal = flash_params.map_or(causal_default, |p| p.causal);
     let can_try_flash = !matches!(mask, AttentionMask::Custom(_))
         && (q.device().is_cuda() || q.device().is_cpu() && cfg!(feature = "flash-attn"));
     if can_try_flash {
@@ -248,51 +505,25 @@ pub fn run_attention(
         }
     }
 
+    if should_use_packed_varlen(q, k, flash_params) {
+        if let Some(params) = flash_params {
+            if let Some(out) =
+                packed_varlen_attention(q, k, v, mask, params, softmax_scale, causal, n_kv_groups)?
+            {
+                return Ok(out);
+            }
+        }
+    }
+
     let mask_tensor = match mask {
         AttentionMask::None => None,
         AttentionMask::Custom(mask) => Some(mask),
     };
-    if let Some(out) = accelerated_sdpa(
-        q,
-        k,
-        v,
-        mask_tensor,
-        softmax_scale,
-        flash_params.map_or(causal_default, |p| p.causal),
-    )? {
+    if let Some(out) = accelerated_sdpa(q, k, v, mask_tensor, softmax_scale, causal)? {
         return Ok(out);
     }
 
-    let (k, v) = if n_kv_groups > 1 {
-        (repeat_kv(k, n_kv_groups)?, repeat_kv(v, n_kv_groups)?)
-    } else {
-        (k.clone(), v.clone())
-    };
-
-    let q = if q.device().is_metal() || q.device().is_cuda() {
-        q.contiguous()?
-    } else {
-        q.clone()
-    };
-    let v = if v.device().is_metal() || v.device().is_cuda() {
-        v.contiguous()?
-    } else {
-        v.clone()
-    };
-    let k_t = if k.device().is_metal() || k.device().is_cuda() {
-        k.transpose(2, 3)?.contiguous()?
-    } else {
-        k.transpose(2, 3)?
-    };
-    let mut attn_weights = q.matmul(&k_t)?.affine(softmax_scale.into(), 0.0)?;
-    if let Some(mask) = mask_tensor {
-        attn_weights = attn_weights.broadcast_add(mask)?;
-    } else if flash_params.map_or(causal_default, |p| p.causal) && q.dim(2)? > 1 {
-        let causal_mask = make_causal_mask(None, q.dim(0)?, q.dim(2)?, q.dtype(), q.device())?;
-        attn_weights = attn_weights.broadcast_add(&causal_mask)?;
-    }
-    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-    attn_weights.matmul(&v)
+    run_single_sequence_attention(q, k, v, mask_tensor, softmax_scale, causal, n_kv_groups)
 }
 
 /// Narrow an attention mask to the trailing `kv_seq_len` key positions.
@@ -357,7 +588,11 @@ pub fn accelerated_sdpa(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_causal_mask, make_causal_mask_cached, repeat_kv};
+    use super::{
+        AttentionMask, FlashKMeta, FlashParams, make_causal_mask, make_causal_mask_cached,
+        packed_varlen_attention, repeat_kv,
+    };
+    use candle_core::{DType, Device, Tensor};
 
     #[test]
     fn test_repeat_kv_repeats_heads() -> anyhow::Result<()> {
@@ -471,6 +706,112 @@ mod tests {
         let adjusted = super::adjust_kv_mask(&mask, 4)?;
         if adjusted.dims() != [1, 1, 4, 4] {
             anyhow::bail!("unexpected adjusted mask dims: {:?}", adjusted.dims());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_packed_varlen_attention_matches_unpacked_reference() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let batch = 2usize;
+        let seq_len = 4usize;
+        let head_dim = 32usize;
+        let num_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let softmax_scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q = Tensor::from_vec(
+            (0..batch * num_heads * seq_len * head_dim)
+                .map(|i| i as f32 * 0.01)
+                .collect::<Vec<_>>(),
+            (batch, num_heads, seq_len, head_dim),
+            &device,
+        )?;
+        let query_lens = vec![3usize, 2usize];
+        let kv_lens = vec![3usize, 2usize];
+        let total_kv: usize = kv_lens.iter().sum();
+        let packed = Tensor::from_vec(
+            (0..total_kv * num_kv_heads * head_dim)
+                .map(|i| (i as f32 * 0.02) + 1.0)
+                .collect::<Vec<_>>(),
+            (total_kv, num_kv_heads, head_dim),
+            &device,
+        )?;
+        let k = packed.unsqueeze(0)?.transpose(1, 2)?;
+        let v = k.clone();
+
+        let cu_q = Tensor::from_vec(vec![0u32, 3, 5], (3,), &device)?;
+        let cu_k = Tensor::from_vec(vec![0u32, 3, 5], (3,), &device)?;
+        let flash_params = FlashParams {
+            max_q: 3,
+            cumulative_seqlens_q: Some(cu_q),
+            logical_k: FlashKMeta {
+                max: 3,
+                cumulative_seqlens: Some(cu_k),
+            },
+            causal: true,
+        };
+
+        let packed_out = packed_varlen_attention(
+            &q,
+            &k,
+            &v,
+            &AttentionMask::None,
+            &flash_params,
+            softmax_scale,
+            true,
+            2,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("packed varlen returned None"))?;
+
+        let mut unpacked_rows = Vec::with_capacity(batch);
+        let mut start = 0usize;
+        for (&q_len, &kv_len) in query_lens.iter().zip(kv_lens.iter()) {
+            let q_row = q.narrow(0, unpacked_rows.len(), 1)?.narrow(2, 0, q_len)?;
+            let k_row = packed
+                .narrow(0, start, kv_len)?
+                .reshape((1, kv_len, num_kv_heads, head_dim))?
+                .transpose(1, 2)?;
+            let v_row = k_row.clone();
+            let k_expanded = repeat_kv(&k_row, 2)?;
+            let v_expanded = repeat_kv(&v_row, 2)?;
+            let k_t = k_expanded.transpose(2, 3)?;
+            let weights = q_row.matmul(&k_t)?.affine(softmax_scale.into(), 0.0)?;
+            let causal = super::make_causal_mask(None, 1, q_len, DType::F32, &device)?;
+            let weights = weights.broadcast_add(&causal)?;
+            let weights = candle_nn::ops::softmax_last_dim(&weights)?;
+            let out_row = weights.matmul(&v_expanded)?;
+            let pad = Tensor::zeros(
+                (1, num_heads, seq_len - q_len, head_dim),
+                DType::F32,
+                &device,
+            )?;
+            unpacked_rows.push(Tensor::cat(&[&out_row, &pad], 2)?);
+            start += kv_len;
+        }
+        let unpacked_out = Tensor::cat(unpacked_rows.as_slice(), 0)?;
+
+        let got = packed_out.flatten_all()?.to_vec1::<f32>()?;
+        let expected = unpacked_out.flatten_all()?.to_vec1::<f32>()?;
+        if got.len() != expected.len() {
+            anyhow::bail!("length mismatch: {} vs {}", got.len(), expected.len());
+        }
+        for (idx, (&lhs, &rhs)) in got.iter().zip(expected.iter()).enumerate() {
+            if (lhs - rhs).abs() > 1e-4 {
+                anyhow::bail!("packed/unpacked mismatch at {idx}: {lhs} vs {rhs}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_supports_packed_varlen_sdpa_on_metal_head_dim() -> anyhow::Result<()> {
+        let device = Device::Cpu;
+        let q = Tensor::zeros((2, 8, 4, 128), DType::BF16, &device)?;
+        assert!(super::supports_packed_varlen_sdpa(&q) || !device.is_metal());
+        let q_bad = Tensor::zeros((2, 8, 4, 48), DType::BF16, &device)?;
+        if device.is_metal() {
+            assert!(!super::supports_packed_varlen_sdpa(&q_bad));
         }
         Ok(())
     }

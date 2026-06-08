@@ -39,11 +39,13 @@ fn cast_input_features_to_weight_dtype(
         return Ok(input_features.clone());
     }
 
+    // On Metal, avoid GPU→CPU→GPU round-trips for BF16 conversions.
+    // Instead, convert via F32 as an intermediate (two on-device casts are
+    // much cheaper than one CPU transfer because the GPU pipeline stays intact).
     if input_features.device().is_metal() && want_dtype == DType::BF16 {
         return input_features
-            .to_device(&Device::Cpu)?
-            .to_dtype(want_dtype)?
-            .to_device(input_features.device());
+            .to_dtype(DType::F32)?
+            .to_dtype(want_dtype);
     }
 
     input_features.to_dtype(want_dtype)
@@ -51,11 +53,12 @@ fn cast_input_features_to_weight_dtype(
 
 fn pad_audio_chunk(chunk: &Tensor, dim: usize, left: usize, right: usize) -> Result<Tensor> {
     if chunk.device().is_metal() && chunk.dtype() == DType::BF16 && (left != 0 || right != 0) {
+        // Convert to F32 for padding (Metal has full F32 support), then back to BF16.
         return chunk
-            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
             .contiguous()?
             .pad_with_zeros(dim, left, right)?
-            .to_device(chunk.device());
+            .to_dtype(chunk.dtype());
     }
 
     chunk.pad_with_zeros(dim, left, right)
@@ -67,12 +70,15 @@ fn stack_audio_chunks(chunks: &[Tensor]) -> Result<Tensor> {
         .ok_or_else(|| candle_core::Error::Msg("missing audio chunks".to_string()))?;
 
     if first.device().is_metal() && first.dtype() == DType::BF16 {
-        let cpu_chunks = chunks
+        // Convert each chunk to F32 for stacking, stack, then convert back.
+        // Keeps all work on-device instead of GPU→CPU→GPU round-trip.
+        let f32_chunks: Vec<Tensor> = chunks
             .iter()
-            .map(|chunk| chunk.to_device(&Device::Cpu)?.contiguous())
+            .map(|chunk| chunk.to_dtype(DType::F32)?.contiguous())
             .collect::<Result<Vec<_>>>()?;
-        let stacked = Tensor::stack(&cpu_chunks.iter().collect::<Vec<_>>(), 0)?;
-        return stacked.to_device(first.device());
+        let f32_refs: Vec<&Tensor> = f32_chunks.iter().collect();
+        let stacked = Tensor::stack(&f32_refs, 0)?;
+        return stacked.to_dtype(first.dtype());
     }
 
     Tensor::stack(&chunks.iter().collect::<Vec<_>>(), 0)

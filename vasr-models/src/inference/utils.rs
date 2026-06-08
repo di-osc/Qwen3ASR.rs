@@ -5,6 +5,11 @@
 
 use anyhow::{Result, bail};
 
+/// Whether continuous paged batching is enabled (can be disabled via `VASR_DISABLE_CONTINUOUS_BATCH`).
+pub fn continuous_paged_batch_enabled() -> bool {
+    std::env::var_os("VASR_DISABLE_CONTINUOUS_BATCH").is_none()
+}
+
 /// Canonical list of languages supported by the official Qwen3-ASR Python stack.
 pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "Chinese",

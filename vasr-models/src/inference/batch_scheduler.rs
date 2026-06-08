@@ -1,6 +1,10 @@
 //! ASR batch scheduler: waiting/running queues and continuous paged-attention batching.
 //!
 //! GPU task serialization remains in `vasr_server::InferenceScheduler`.
+//!
+//! `waiting` holds segment indices (typically one VAD slice each). Upstream code prepares
+//! segments with [`AsrProcessor::prepare_batch_varlen`] so admit waves can pad locally and
+//! prefill with per-row `query_lens` / flash varlen metadata.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -48,6 +52,10 @@ fn compact_batch_enabled() -> bool {
 
 fn continuous_batch_enabled() -> bool {
     std::env::var_os("VASR_DISABLE_CONTINUOUS_BATCH").is_none()
+}
+
+pub(crate) fn continuous_paged_batch_enabled() -> bool {
+    crate::inference::utils::continuous_paged_batch_enabled()
 }
 
 #[derive(Debug)]
@@ -117,6 +125,50 @@ fn free_finished_running(
         freed = true;
     }
     freed
+}
+
+/// Right-pad selected rows to the max effective prompt length within the admit wave.
+fn pad_prepared_wave_for_prefill(
+    prepared: &[PreparedInputs],
+    wave_indices: &[usize],
+    pad_id: u32,
+) -> Result<(Vec<Vec<u32>>, Vec<Vec<u32>>)> {
+    if wave_indices.is_empty() {
+        bail!("pad_prepared_wave_for_prefill requires at least one row");
+    }
+    let max_prompt_len = wave_indices
+        .iter()
+        .map(|&idx| prepared_prompt_len(&prepared[idx]))
+        .max()
+        .unwrap_or(0);
+    if max_prompt_len == 0 {
+        bail!("admit wave contains zero-length prompts");
+    }
+
+    let mut ids_rows = Vec::with_capacity(wave_indices.len());
+    let mut attn_rows = Vec::with_capacity(wave_indices.len());
+    for &idx in wave_indices {
+        let row = prepared
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("missing prepared row {idx}"))?;
+        let prompt_len = prepared_prompt_len(row);
+        if prompt_len > row.input_ids.len() || prompt_len > row.attention_mask.len() {
+            bail!(
+                "prepared[{idx}] effective prompt len {prompt_len} exceeds row capacity: ids={} mask={}",
+                row.input_ids.len(),
+                row.attention_mask.len()
+            );
+        }
+        let mut ids = row.input_ids[..prompt_len].to_vec();
+        let mut attn = row.attention_mask[..prompt_len].to_vec();
+        if prompt_len < max_prompt_len {
+            ids.extend(std::iter::repeat_n(pad_id, max_prompt_len - prompt_len));
+            attn.extend(std::iter::repeat_n(0u32, max_prompt_len - prompt_len));
+        }
+        ids_rows.push(ids);
+        attn_rows.push(attn);
+    }
+    Ok((ids_rows, attn_rows))
 }
 
 fn concat_prepared_audio(
@@ -206,7 +258,10 @@ impl AsrBatchScheduler {
         )
     }
 
-    /// Continuous batching for a prepared slice: refill KV slots as sequences finish.
+    /// Continuous batching for variable-length prepared segments (VAD slices).
+    ///
+    /// `waiting` starts as all segment indices; each admit wave is right-padded locally and
+    /// prefilled with per-row `query_lens` for flash varlen metadata.
     pub fn run_continuous_prepared(
         &mut self,
         thinker: &ThinkerForConditionalGeneration,
@@ -216,6 +271,7 @@ impl AsrBatchScheduler {
         audio_features: &Tensor,
         max_new_tokens: usize,
         eos_token_ids: &[u32],
+        pad_id: u32,
     ) -> Result<Vec<Vec<u32>>> {
         let batch = prepared.len();
         if batch == 0 {
@@ -223,17 +279,6 @@ impl AsrBatchScheduler {
         }
         if max_new_tokens == 0 {
             return Ok(vec![vec![]; batch]);
-        }
-
-        let seq_len = prepared[0].input_ids.len();
-        for (i, row) in prepared.iter().enumerate() {
-            if row.input_ids.len() != seq_len || row.attention_mask.len() != seq_len {
-                bail!(
-                    "continuous batch requires uniform seq_len at index {i}: expected={seq_len}, ids={}, mask={}",
-                    row.input_ids.len(),
-                    row.attention_mask.len()
-                );
-            }
         }
 
         let max_slots = self.config.max_num_seqs.max(1).min(batch);
@@ -374,14 +419,13 @@ impl AsrBatchScheduler {
                     let wave = wave_client_indices.len();
                     let request_id_base = self.next_request_id;
                     self.next_request_id = self.next_request_id.saturating_add(wave);
-                    let ids_rows: Vec<&[u32]> = wave_client_indices
-                        .iter()
-                        .map(|&client_index| prepared[client_index].input_ids.as_slice())
-                        .collect();
-                    let attn_rows: Vec<&[u32]> = wave_client_indices
-                        .iter()
-                        .map(|&client_index| prepared[client_index].attention_mask.as_slice())
-                        .collect();
+                    let (wave_ids, wave_masks) = pad_prepared_wave_for_prefill(
+                        prepared,
+                        wave_client_indices.as_slice(),
+                        pad_id,
+                    )?;
+                    let ids_rows: Vec<&[u32]> = wave_ids.iter().map(Vec::as_slice).collect();
+                    let attn_rows: Vec<&[u32]> = wave_masks.iter().map(Vec::as_slice).collect();
                     let wave_audio = concat_prepared_audio(
                         audio_features,
                         audio_offsets.as_slice(),
@@ -482,6 +526,7 @@ pub fn run_paged_prepared_batch(
     max_new_tokens: usize,
     eos_token_ids: &[u32],
     max_batch_size: usize,
+    pad_id: u32,
 ) -> Result<Vec<Vec<u32>>> {
     let config = AsrBatchSchedulerConfig::from_max_batch_size(max_batch_size);
     let mut scheduler = AsrBatchScheduler::new(config);
@@ -494,6 +539,7 @@ pub fn run_paged_prepared_batch(
             audio_features,
             max_new_tokens,
             eos_token_ids,
+            pad_id,
         )
     } else {
         let ids_rows: Vec<&[u32]> = prepared.iter().map(|p| p.input_ids.as_slice()).collect();
@@ -519,7 +565,9 @@ mod tests {
     use super::{
         AsrBatchSchedulerConfig, PagedBlockManager, can_admit_with_projected_kv,
         compact_batch_enabled, continuous_batch_enabled, group_running_by_decode_step,
+        pad_prepared_wave_for_prefill,
     };
+    use crate::processor::asr_processor::PreparedInputs;
 
     #[test]
     fn compact_batch_defaults_on() {
@@ -556,5 +604,28 @@ mod tests {
         assert_eq!(capacity, 4);
         assert!(can_admit_with_projected_kv(&manager, capacity, 32, 0, 1));
         assert!(!can_admit_with_projected_kv(&manager, capacity, 128, 3, 1));
+    }
+
+    #[test]
+    fn pad_prepared_wave_for_prefill_builds_varlen_masks() {
+        let prepared = vec![
+            PreparedInputs {
+                input_ids: vec![1, 2, 3],
+                attention_mask: vec![1, 1, 1],
+                input_features: vec![],
+                feature_attention_mask: vec![],
+            },
+            PreparedInputs {
+                input_ids: vec![4, 5, 6, 7, 8],
+                attention_mask: vec![1, 1, 1, 1, 1],
+                input_features: vec![],
+                feature_attention_mask: vec![],
+            },
+        ];
+        let (ids, masks) = pad_prepared_wave_for_prefill(prepared.as_slice(), &[0, 1], 0).unwrap();
+        assert_eq!(ids[0].len(), 5);
+        assert_eq!(ids[1].len(), 5);
+        assert_eq!(masks[0], vec![1, 1, 1, 0, 0]);
+        assert_eq!(masks[1], vec![1, 1, 1, 1, 1]);
     }
 }

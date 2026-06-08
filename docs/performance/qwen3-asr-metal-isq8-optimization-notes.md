@@ -1,6 +1,74 @@
 # Qwen3-ASR Metal ISQ8 Optimization Notes
 
-Date: 2026-06-03
+Date: 2026-06-08
+
+## Update: 2026-06-08 (Pass 14 — Metal RoPE Fast Path + Eager Routing)
+
+Latest on-this-machine baseline for `Qwen/Qwen3-ASR-0.6B` text decode after the
+Pass 14 optimizations, ISQ 8 (AFQ), single sequence:
+
+```bash
+cargo run --release -p vasr-models --example bench_text_decode \
+  --features "metal,metal-paged-attn,paged-attn,timing" \
+  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
+```
+
+Observed on macOS Metal:
+
+- **`tokens/s`: `~236-238 tok/s`** (3–5 runs, 64-step decode)
+- `decode_forward` ≈ 281 ms (was 1555 ms)
+- `decode_argmax` ≈ 522 ms (was 454 ms, now reflects GPU sync after faster forward)
+
+Control checks:
+
+- `VASR_DISABLE_PAGED_ATTN=1` → ~237 tok/s (same path, confirms eager routing)
+- `VASR_FORCE_PAGED_ATTN=1` → ~170–175 tok/s (paged single-seq, now opt-in)
+
+For direct reference, on the same machine:
+
+```bash
+/Users/wangmengdi/.cargo/bin/mistralrs bench \
+  -m Qwen/Qwen3-0.6B \
+  --isq 8 \
+  --prompt-len 0 \
+  --depth 214 \
+  --gen-len 64 \
+  --iterations 3 \
+  --warmup 1
+```
+
+→ `253.0 ± 2.0 T/s` (latency 3.95 ms/T).
+
+### Batch decode (concurrent sequences)
+
+```bash
+cargo run --release -p vasr-models --example bench_text_decode \
+  --features "metal,metal-paged-attn,paged-attn,timing" \
+  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --batch <N> --warmup 1
+```
+
+| batch | batch tok/s | per-seq tok/s | scaling |
+|-------|-------------|---------------|---------|
+| 1 | **238** | 238 | 1.00× |
+| 2 | **450** | 225 | 1.89× |
+| 4 | **658** | 165 | 2.77× |
+
+Batch throughput scales near-linearly because Metal GPU parallelises matmul,
+SDPA, and RoPE across the batch dimension within each decode step.
+
+### 结论（Pass 14 之后）
+
+- **单序列 ISQ8 已基本追平 mistral.rs**（238 vs 253 tok/s，差距 ~6%）。
+- 剩余差距主要来自 Q/K norm 未与 mRoPE 融合（`forward_qk_norm` 需要适配 3D
+  mRoPE positions），以及 benchmark 测试方式差异（vasr 包含 prompt prefill
+  设置，mistralrs `--prompt-len 0` 跳过 prefill）。
+- **并发 batch decode** 总吞吐远超 mistralrs 单序列（batch=2 → 450 tok/s）。
+
+### Pass 14 优化记录
+
+见下文新增的 [Pass 14](#2026-06-08-pass-14-metal-rope-fast-path--eager-routing) 小节。
+
+Historical notes below (from earlier passes): 2026-06-03
 
 This document records the recent Metal decode optimization work against
 `mistral.rs`, with separate notes for changes that helped, changes that did not
@@ -1821,3 +1889,288 @@ Takeaways:
    streaming API is wired in.
 2. Metal command-buffer pipelining where paged-attn remains required (CUDA / forced).
 3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-08 Pass 14: Metal RoPE Fast Path + Eager Routing
+
+Date: 2026-06-08
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit (`8` → AFQ8 on Metal)
+
+### What Changed
+
+#### 1. Metal batch=1/2/4 default eager KV-cache routing
+
+Files:
+
+- `vasr_models/src/model/generation.rs`
+
+Behavior:
+
+- `use_paged_attn_on_device` and `should_use_paged_attention`: Metal now defaults
+  to `false` (eager), paged-attn is opt-in via `VASR_FORCE_PAGED_ATTN=1`.
+- Batch=1 decode on Metal routes to `forward_decode_one_without_padding` (Metal
+  SDPA + preallocated KV cache), matching the Pass 9 design but actually
+  implemented now.
+- Batch>1 on Metal routes to the eager batch path with `forward_decode_one_without_padding`.
+
+Why:
+
+- The paged-attn `reshape_and_cache` + `paged_attention` kernel path is
+  optimized for batched/memory-pooled workloads, not single-stream Metal decode.
+- Eager dense KV + Metal SDPA is the default in mistral.rs and gives faster
+  single-sequence throughput.
+- This was documented as a Pass 9 change but the code still unconditionally
+  returned `true` for Metal, so the eager routing was never actually active.
+
+#### 2. Metal-accelerated RoPE for seq_len==1 via `mistralrs_quant::rotary`
+
+Files:
+
+- `vasr_models/src/model/rope/mrope.rs`
+- `vasr_models/src/model/thinker_text.rs`
+- `vasr_quant/src/lib.rs`
+
+Behavior:
+
+- Added `use_accelerated_rotary()` helper: true when device is Metal/CUDA and
+  `VASR_DISABLE_ACCEL_ROPE` is unset.
+- `apply_multimodal_rotary_pos_emb` now dispatches seq_len==1 to
+  `apply_multimodal_rotary_pos_emb_seq_one`, which extracts the first (temporal)
+  mRoPE modality cos/sin and calls `mistralrs_quant::rotary::apply_rotary_qk`
+  (a Metal-optimized kernel from the same dependency used by mistral.rs).
+- Added `MultimodalRotaryEmbedding::forward_first_modality` that computes only
+  the temporal modality's `(cos, sin)` for seq_len==1, avoiding wasted work on
+  the unused height/width modalities.
+- `ThinkerTextRotaryEmbedding` exposes `forward_first_modality`.
+- `ThinkerTextModel::forward_decode_one_without_padding` now calls
+  `forward_first_modality` instead of `forward` (which built all 3 modalities).
+- Re-exported `mistralrs_quant::rotary::apply_rotary_qk` from `vasr_quant` so
+  downstream crates don't need a direct `mistralrs-quant` dependency.
+
+Why:
+
+- The old `apply_rope_batched` function is a pure Candle tensor-op
+  implementation: it does `cat`, `narrow`, `unsqueeze`, `rotate_half` (split +
+  negate + cat), `broadcast_mul` × 2, `add`, and `contiguous` for every layer
+  on every decode step. On Metal each of these is a separate kernel launch and
+  intermediate allocation.
+- `apply_rotary_qk` is a single Metal `CustomOp3` kernel that does all RoPE
+  math in one dispatch, cutting per-layer overhead from ~8 tensor ops to 1
+  kernel.
+- This mirrors exactly what mistral.rs does for Qwen3 decode via
+  `RotaryEmbedding::forward_qk_norm`.
+
+Observed effect:
+
+- **`decode_forward` dropped from ~1555 ms to ~281 ms** (5.5× faster) for 64
+  tokens of single-sequence decode.
+- Aggregate throughput jumped from **~95 tok/s to ~238 tok/s** (2.5×).
+
+#### 3. Batch decode benchmark support
+
+Files:
+
+- `vasr_models/examples/bench_text_decode.rs`
+- `vasr_models/src/lib.rs`
+
+Behavior:
+
+- Added `--batch <N>` flag to `bench_text_decode` example.
+- When `--batch > 1`, replicates the same prompt N times and uses
+  `greedy_generate_cached_batch_timed_with_paged_runtime` to measure concurrent
+  decode throughput.
+- Added `Qwen3Asr::inner_model()` accessor for benchmarks.
+
+### Measured Results (this pass)
+
+Single-sequence (`Qwen/Qwen3-ASR-0.6B`, ISQ 8, 5 runs):
+
+| Run | `decode_tokens_per_s` | `decode_forward_ms` | `decode_argmax_ms` |
+| --- | ---: | ---: | ---: |
+| 1 | 241.1 | — | — |
+| 2 | 242.2 | — | — |
+| 3 | 241.5 | — | — |
+| 4 | 234.5 | — | — |
+| 5 | 232.1 | — | — |
+| **Aggregate** | **238.2** | **462** (5 runs) | **875** (5 runs) |
+
+Reference mistral.rs (same machine, ISQ 8, 5 iterations): **253.0 ± 2.0 tok/s**.
+
+Gap: ~6% (238 vs 253 tok/s).
+
+Batch decode scaling (same model, ISQ 8, 3 runs each):
+
+| batch | batch tok/s | per-seq tok/s | forward_ms | argmax_ms |
+|-------|-------------|---------------|------------|-----------|
+| 1 | 236.7 | 236.7 | 281 | 526 |
+| 2 | 450.3 | 225.2 | 291 | 557 |
+| 4 | 658.3 | 164.6 | 295 | 867 |
+
+Forward time stays essentially flat (281→295 ms) as batch grows, confirming GPU
+parallelism. Argmax grows with batch because more rows need synchronisation +
+readback.
+
+### Remaining Gap Analysis
+
+The ~6% gap vs mistral.rs likely comes from:
+
+1. **Q/K norm not fused with mRoPE** — mistral.rs `RotaryEmbedding::forward_qk_norm`
+   combines RMS norm on Q, RMS norm on K, and RoPE into a single Metal kernel.
+   Our path still does `q_norm.forward()`, `k_norm.forward()`, then
+   `apply_rotary_qk` (3 kernel launches vs 1). Adapting this fusion for 3D
+   mRoPE positions requires a custom kernel.
+
+2. **Benchmark methodology** — our benchmark includes prompt tokenisation +
+   prefill setup in the same pipeline, while mistral.rs `--prompt-len 0` runs
+   pure decode with a pre-populated cache.
+
+3. **Model weight layout** — Qwen3-ASR-0.6B safetensors may have slightly
+   different memory layout than Qwen3-0.6B GGUF, affecting ISQ matmul
+   efficiency.
+
+### Verification Commands
+
+```bash
+# Single-sequence decode
+cargo run --release -p vasr-models --example bench_text_decode \
+  --features "metal,metal-paged-attn,paged-attn,timing" \
+  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 5 64 bf16 8 --warmup 1
+
+# Batch decode (N concurrent sequences)
+cargo run --release -p vasr-models --example bench_text_decode \
+  --features "metal,metal-paged-attn,paged-attn,timing" \
+  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --batch 2 --warmup 1
+
+# Force paged-attn (opt-in regression test)
+VASR_FORCE_PAGED_ATTN=1 cargo run --release -p vasr-models --example bench_text_decode \
+  --features "metal,metal-paged-attn,paged-attn,timing" \
+  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
+
+# Disable accelerated RoPE (fallback regression test)
+VASR_DISABLE_ACCEL_ROPE=1 cargo run --release -p vasr-models --example bench_text_decode \
+  --features "metal,metal-paged-attn,paged-attn,timing" \
+  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
+
+# Unit tests
+cargo test -p vasr-models --features metal-paged-attn -- kv_cache isq_linear rope
+cargo fmt --all -- --check
+git diff --check
+```
+
+### Next Steps
+
+1. Fuse Q/K norm with mRoPE for seq_len==1 (Metal kernel or mistral.rs-style
+   `forward_qk_norm` adaptation).
+2. Evaluate `apply_rotary_qk_positions` variant if mRoPE position-aware RoPE is
+   needed.
+3. Revisit CUDA packed-varlen prefill when a CUDA machine is available.
+
+## 2026-06-08 Pass 15: Audio Encoder BF16 Workaround + PagedCache Metal Default
+
+Date: 2026-06-08
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit
+
+### What Changed
+
+#### 1. Audio encoder Metal BF16 GPU→CPU→GPU round-trip removal
+
+Files:
+
+- `vasr_models/src/model/audio_encoder.rs`
+
+Behavior:
+
+- Replaced three GPU→CPU→GPU round-trip workarounds with on-device F32
+  intermediate conversions:
+  - `cast_input_features_to_weight_dtype`: `to_device(Cpu) → to_dtype → to_device(Metal)`
+    replaced with `to_dtype(F32) → to_dtype(BF16)` (both on-device).
+  - `pad_audio_chunk`: `to_device(Cpu) → contiguous → pad → to_device(Metal)`
+    replaced with `to_dtype(F32) → contiguous → pad → to_dtype(BF16)` (all on-device).
+  - `stack_audio_chunks`: per-chunk `to_device(Cpu) → contiguous → stack → to_device(Metal)`
+    replaced with per-chunk `to_dtype(F32) → contiguous → stack → to_dtype(BF16)`.
+
+Why:
+
+- Candle's Metal backend has incomplete BF16 support for `pad_with_zeros`,
+  `Tensor::stack`, and `to_dtype(BF16)`. The original workaround moved data to
+  CPU and back, which:
+  - Drains the GPU command buffer (synchronisation point)
+  - Copies data over PCI/Thunderbolt (bandwidth bottleneck)
+  - Prevents GPU/CPU overlap
+- Converting BF16→F32→(do work)→BF16 keeps all operations on the Metal device.
+  Two on-device casts are orders of magnitude cheaper than one GPU↔CPU transfer.
+- This mirrors the approach used in other Candle Metal workarounds.
+
+Observed effect:
+
+- Modest wall-time improvement in end-to-end ASR (38.5× → 39.4× speedup on
+  the 2-file `raw_audios` benchmark).
+- The audio encoder is only ~16% of total ASR time, so this is a hygiene win
+  rather than a dramatic speedup.
+
+#### 2. PagedCacheConfig Metal default fix
+
+Files:
+
+- `vasr_models/src/lib.rs` (model constructor)
+
+Behavior:
+
+- When `paged_cache: None` is passed in `LoadOptions`, the constructor now
+  creates a device-aware default:
+  - CUDA: `PagedCacheMemory::GpuMemoryFraction(0.8)` (existing behavior)
+  - Metal/non-CUDA: `PagedCacheMemory::ContextSize(100_000)` (new, avoids
+    "requires the `cuda` feature" error).
+
+Why:
+
+- `PagedCacheConfig::default()` unconditionally uses `GpuMemoryFraction(0.8)`,
+  which panics on Metal because GPU memory fraction queries require the `cuda`
+  feature.
+- The constructor used `unwrap_or_default()` which picked up this CUDA-only
+  default even on Metal.
+- This prevented `bench_transcribe` and other examples that pass
+  `paged_cache: None` from running on Metal.
+
+#### 3. Audio encoder ISQ attempt (rolled back)
+
+Files:
+
+- `vasr_models/src/model/audio_encoder.rs`
+- `vasr_models/src/model/thinker.rs`
+
+What was tried:
+
+- Replaced all `Linear` layers in the audio encoder (attention QKVO, fc1/fc2,
+  conv_out, proj1, proj2) with `IsqLinear` so they benefit from AFQ 8-bit
+  quantization.
+
+Why it was rolled back:
+
+- The audio encoder's linear layers are relatively small (d_model=512,
+  encoder_ffn_dim=2048 for Qwen3-ASR-0.6B). For small matrices, the AfqLayer
+  quantize/dequantize overhead exceeds the matmul speedup.
+- Measured regression: `audio_encoder_ms` increased from ~72 ms to ~330 ms
+  (4.6× slower).
+- **Rule of thumb**: ISQ is only beneficial for matrices above a minimum size
+  threshold (roughly ≥1024 inner dimension). The text decoder's 1024→3072 MLP
+  benefits; the audio encoder's 512→2048 FFN does not.
+
+### Next Steps
+
+1. Fuse Q/K norm with mRoPE for seq_len==1 to close the remaining ~6% gap vs
+   mistral.rs.
+2. Profile and reduce prefill time (second-largest bottleneck after decode).
+3. Evaluate selective ISQ application: only quantize layers above a size
+   threshold rather than all-or-nothing.

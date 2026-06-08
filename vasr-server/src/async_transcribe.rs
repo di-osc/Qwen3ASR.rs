@@ -1,18 +1,18 @@
 //! Async parallel transcribe: loader, VAD, and ASR stages overlap via channels.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use vasr_audio::{AudioLoadOptions, AudioLoader};
-use vasr_data::{AudioSource, Timeline, Waveform};
+use vasr_data::{Annotation, AudioSource, DurationMs, Timeline, Waveform};
 use vasr_runtime::pipeline::{OfflinePipeline, VadPreparation, VadPrepared, offset_annotations};
 use vasr_runtime::{AsrOptions, ParallelTranscribeOptions, VadOptions};
 
@@ -354,6 +354,76 @@ struct AsrJob {
     waveform: Waveform,
 }
 
+/// One VAD speech segment enqueued for ASR continuous micro-batching.
+#[derive(Debug, Clone)]
+struct AsrSegmentJob {
+    job_index: usize,
+    job_audio_seconds: f64,
+    speech_annotations: Vec<Annotation>,
+    segment_index: usize,
+    segment_count: usize,
+    offset: DurationMs,
+    waveform: Waveform,
+}
+
+#[derive(Debug)]
+enum AsrPipelineMessage {
+    Job(AsrJob),
+    Segment(AsrSegmentJob),
+}
+
+#[derive(Debug)]
+struct SegmentJobState {
+    index: usize,
+    audio_seconds: f64,
+    speech_annotations: Vec<Annotation>,
+    timeline: Timeline,
+    segment_count: usize,
+    segments_done: usize,
+}
+
+#[derive(Default)]
+struct SegmentAsrState {
+    jobs: HashMap<usize, SegmentJobState>,
+}
+
+fn speech_job_to_segments(job: AsrJob) -> Result<Vec<AsrSegmentJob>> {
+    let VadPreparation::Speech(prepared) = job.prepared else {
+        bail!("speech_job_to_segments requires Speech preparation");
+    };
+    let VadPrepared {
+        speech_annotations,
+        segments,
+        slices,
+    } = prepared;
+    if segments.len() != slices.len() {
+        bail!(
+            "VAD prepared mismatch: segments={} slices={}",
+            segments.len(),
+            slices.len()
+        );
+    }
+    let segment_count = segments.len();
+    Ok(segments
+        .into_iter()
+        .zip(slices)
+        .enumerate()
+        .map(|(segment_index, (segment, waveform))| AsrSegmentJob {
+            job_index: job.index,
+            job_audio_seconds: job.waveform.duration_seconds(),
+            speech_annotations: if segment_index == 0 {
+                speech_annotations.clone()
+            } else {
+                Vec::new()
+            },
+            segment_index,
+            segment_count,
+            offset: segment.range.start,
+            waveform,
+        })
+        .collect())
+}
+
 fn spawn_loader_worker(
     inputs: Vec<TranscribeInput>,
     loader: AudioLoader,
@@ -444,7 +514,7 @@ fn spawn_vad_worker(
     vad_options: VadOptions,
     max_in_flight: usize,
     mut loaded_rx: mpsc::Receiver<Result<LoadedJob, TranscribeItemOutcome>>,
-    asr_tx: mpsc::Sender<Result<AsrJob, TranscribeItemOutcome>>,
+    asr_tx: mpsc::Sender<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let max_in_flight = max_in_flight.max(1);
@@ -452,9 +522,15 @@ fn spawn_vad_worker(
         while let Some(message) = loaded_rx.recv().await {
             match message {
                 Ok(job) => {
-                    spawn_vad_task(&mut tasks, Arc::clone(&offline), vad_options.clone(), job);
+                    spawn_vad_task(
+                        &mut tasks,
+                        Arc::clone(&offline),
+                        vad_options.clone(),
+                        asr_tx.clone(),
+                        job,
+                    );
                     if tasks.len() >= max_in_flight {
-                        let _ = send_next_asr_job(&mut tasks, &asr_tx).await;
+                        let _ = send_next_vad_task(&mut tasks).await;
                     }
                 }
                 Err(outcome) => {
@@ -463,19 +539,22 @@ fn spawn_vad_worker(
             }
         }
         while !tasks.is_empty() {
-            let _ = send_next_asr_job(&mut tasks, &asr_tx).await;
+            let _ = send_next_vad_task(&mut tasks).await;
         }
     })
 }
 
 fn spawn_vad_task(
-    tasks: &mut JoinSet<Result<AsrJob, TranscribeItemOutcome>>,
+    tasks: &mut JoinSet<Result<(), TranscribeItemOutcome>>,
     offline: Arc<OfflinePipeline>,
     vad_options: VadOptions,
+    asr_tx: mpsc::Sender<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
     job: LoadedJob,
 ) {
     tasks.spawn(async move {
         let stage_start = Instant::now();
+        let job_index = job.index;
+        let audio_seconds = job.waveform.duration_seconds();
         let prepared = tokio::task::spawn_blocking({
             let offline = Arc::clone(&offline);
             let waveform = job.waveform.clone();
@@ -484,115 +563,215 @@ fn spawn_vad_task(
         })
         .await;
 
+        let send_message = |message: Result<AsrPipelineMessage, TranscribeItemOutcome>| {
+            let asr_tx = asr_tx.clone();
+            async move {
+                asr_tx
+                    .send(message)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("ASR stage channel closed"))
+            }
+        };
+
         match prepared {
             Ok(Ok(prepared)) => {
                 let (segments, speech_seconds) = vad_preparation_stats(&prepared);
                 log_vad(
-                    job.index,
-                    job.waveform.duration_seconds(),
+                    job_index,
+                    audio_seconds,
                     segments,
                     speech_seconds,
                     stage_start.elapsed().as_secs_f64(),
                 );
-                Ok(AsrJob {
-                    index: job.index,
+                let asr_job = AsrJob {
+                    index: job_index,
                     prepared,
                     waveform: job.waveform,
-                })
+                };
+                match asr_job.prepared {
+                    VadPreparation::Speech(_) => {
+                        let segments = match speech_job_to_segments(asr_job) {
+                            Ok(segments) => segments,
+                            Err(error) => {
+                                send_message(Err(TranscribeItemOutcome {
+                                    index: job_index,
+                                    result: Err(error),
+                                    audio_seconds,
+                                    bad_component: Some("vad"),
+                                }))
+                                .await
+                                .map_err(|error| {
+                                    TranscribeItemOutcome {
+                                        index: job_index,
+                                        result: Err(error),
+                                        audio_seconds,
+                                        bad_component: Some("vad"),
+                                    }
+                                })?;
+                                return Ok(());
+                            }
+                        };
+                        for segment in segments {
+                            send_message(Ok(AsrPipelineMessage::Segment(segment)))
+                                .await
+                                .map_err(|error| TranscribeItemOutcome {
+                                    index: job_index,
+                                    result: Err(error),
+                                    audio_seconds,
+                                    bad_component: Some("asr"),
+                                })?;
+                        }
+                    }
+                    _ => {
+                        send_message(Ok(AsrPipelineMessage::Job(asr_job)))
+                            .await
+                            .map_err(|error| TranscribeItemOutcome {
+                                index: job_index,
+                                result: Err(error),
+                                audio_seconds,
+                                bad_component: Some("asr"),
+                            })?;
+                    }
+                }
+                Ok(())
             }
-            Ok(Err(error)) => Err(TranscribeItemOutcome {
-                index: job.index,
-                result: Err(error),
-                audio_seconds: job.waveform.duration_seconds(),
-                bad_component: Some("vad"),
-            }),
-            Err(error) => Err(TranscribeItemOutcome {
-                index: job.index,
-                result: Err(anyhow::anyhow!("VAD join error: {error}")),
-                audio_seconds: job.waveform.duration_seconds(),
-                bad_component: Some("vad"),
-            }),
+            Ok(Err(error)) => {
+                send_message(Err(TranscribeItemOutcome {
+                    index: job_index,
+                    result: Err(error),
+                    audio_seconds,
+                    bad_component: Some("vad"),
+                }))
+                .await
+                .map_err(|error| TranscribeItemOutcome {
+                    index: job_index,
+                    result: Err(error),
+                    audio_seconds,
+                    bad_component: Some("vad"),
+                })?;
+                Ok(())
+            }
+            Err(error) => {
+                send_message(Err(TranscribeItemOutcome {
+                    index: job_index,
+                    result: Err(anyhow::anyhow!("VAD join error: {error}")),
+                    audio_seconds,
+                    bad_component: Some("vad"),
+                }))
+                .await
+                .map_err(|error| TranscribeItemOutcome {
+                    index: job_index,
+                    result: Err(error),
+                    audio_seconds,
+                    bad_component: Some("vad"),
+                })?;
+                Ok(())
+            }
         }
     });
 }
 
-async fn send_next_asr_job(
-    tasks: &mut JoinSet<Result<AsrJob, TranscribeItemOutcome>>,
-    asr_tx: &mpsc::Sender<Result<AsrJob, TranscribeItemOutcome>>,
-) -> Result<()> {
-    let message = match tasks.join_next().await {
-        Some(Ok(message)) => message,
+async fn send_next_vad_task(
+    tasks: &mut JoinSet<Result<(), TranscribeItemOutcome>>,
+) -> Result<(), TranscribeItemOutcome> {
+    match tasks.join_next().await {
+        Some(Ok(result)) => result,
         Some(Err(error)) => Err(TranscribeItemOutcome {
             index: 0,
             result: Err(anyhow::anyhow!("VAD task join error: {error}")),
             audio_seconds: 0.0,
             bad_component: Some("vad"),
         }),
-        None => return Ok(()),
-    };
-    asr_tx
-        .send(message)
-        .await
-        .map_err(|_| anyhow::anyhow!("ASR stage channel closed"))
+        None => Ok(()),
+    }
 }
 
 fn spawn_asr_worker(
     offline: Arc<OfflinePipeline>,
     asr_options: AsrOptions,
     max_batch_size: usize,
-    mut asr_rx: mpsc::Receiver<Result<AsrJob, TranscribeItemOutcome>>,
+    mut asr_rx: mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
     result_tx: mpsc::Sender<TranscribeItemOutcome>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut segment_state = SegmentAsrState::default();
         while let Some(message) = asr_rx.recv().await {
-            let messages =
-                collect_asr_microbatch(message, max_batch_size.max(1), &mut asr_rx).await;
-
-            let mut jobs = Vec::new();
-            for message in messages {
-                match message {
-                    Ok(job) => jobs.push(job),
-                    Err(outcome) => {
+            match message {
+                Err(outcome) => {
+                    let _ = result_tx.send(outcome).await;
+                }
+                Ok(AsrPipelineMessage::Job(job)) => {
+                    let messages =
+                        collect_job_microbatch(job, max_batch_size.max(1), &mut asr_rx).await;
+                    let mut jobs = Vec::new();
+                    for message in messages {
+                        match message {
+                            Err(outcome) => {
+                                let _ = result_tx.send(outcome).await;
+                            }
+                            Ok(AsrPipelineMessage::Job(job)) => jobs.push(job),
+                            Ok(AsrPipelineMessage::Segment(_)) => {
+                                tracing::warn!(
+                                    "ASR worker received segment while collecting job micro-batch"
+                                );
+                            }
+                        }
+                    }
+                    if jobs.is_empty() {
+                        continue;
+                    }
+                    let outcomes = tokio::task::spawn_blocking({
+                        let offline = Arc::clone(&offline);
+                        let asr_options = asr_options.clone();
+                        move || run_asr_jobs_batch(&offline, jobs, &asr_options)
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        vec![TranscribeItemOutcome {
+                            index: 0,
+                            result: Err(anyhow::anyhow!("ASR join error: {error}")),
+                            audio_seconds: 0.0,
+                            bad_component: Some("recognizer"),
+                        }]
+                    });
+                    for outcome in outcomes {
                         let _ = result_tx.send(outcome).await;
                     }
                 }
-            }
-            if jobs.is_empty() {
-                continue;
-            }
-
-            let outcomes = tokio::task::spawn_blocking({
-                let offline = Arc::clone(&offline);
-                let asr_options = asr_options.clone();
-                move || run_asr_jobs_batch(&offline, jobs, &asr_options)
-            })
-            .await
-            .unwrap_or_else(|error| {
-                vec![TranscribeItemOutcome {
-                    index: 0,
-                    result: Err(anyhow::anyhow!("ASR join error: {error}")),
-                    audio_seconds: 0.0,
-                    bad_component: Some("recognizer"),
-                }]
-            });
-
-            for outcome in outcomes {
-                let _ = result_tx.send(outcome).await;
+                Ok(AsrPipelineMessage::Segment(segment)) => {
+                    let segments =
+                        collect_segment_microbatch(segment, max_batch_size.max(1), &mut asr_rx)
+                            .await;
+                    prepare_segment_job_state(&mut segment_state, &segments);
+                    let stage_start = Instant::now();
+                    let batch = tokio::task::spawn_blocking({
+                        let offline = Arc::clone(&offline);
+                        let asr_options = asr_options.clone();
+                        let segments = segments.clone();
+                        move || run_segment_asr_inference(&offline, &segments, &asr_options)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(anyhow::anyhow!("ASR join error: {error}")));
+                    let outcomes =
+                        finish_segment_asr_batch(&mut segment_state, &segments, stage_start, batch);
+                    for outcome in outcomes {
+                        let _ = result_tx.send(outcome).await;
+                    }
+                }
             }
         }
     })
 }
 
-async fn collect_asr_microbatch(
-    first: Result<AsrJob, TranscribeItemOutcome>,
+async fn collect_job_microbatch(
+    first: AsrJob,
     max_batch_size: usize,
-    asr_rx: &mut mpsc::Receiver<Result<AsrJob, TranscribeItemOutcome>>,
-) -> Vec<Result<AsrJob, TranscribeItemOutcome>> {
-    let mut messages = vec![first];
+    asr_rx: &mut mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+) -> Vec<Result<AsrPipelineMessage, TranscribeItemOutcome>> {
+    let mut messages = vec![Ok(AsrPipelineMessage::Job(first))];
     if max_batch_size <= 1 {
         return messages;
     }
-
     while messages.len() < max_batch_size {
         match asr_rx.try_recv() {
             Ok(message) => messages.push(message),
@@ -603,7 +782,6 @@ async fn collect_asr_microbatch(
     if messages.len() >= max_batch_size {
         return messages;
     }
-
     while messages.len() < max_batch_size {
         match asr_rx.recv().await {
             Some(message) => messages.push(message),
@@ -611,6 +789,204 @@ async fn collect_asr_microbatch(
         }
     }
     messages
+}
+
+async fn collect_segment_microbatch(
+    first: AsrSegmentJob,
+    max_batch_size: usize,
+    asr_rx: &mut mpsc::Receiver<Result<AsrPipelineMessage, TranscribeItemOutcome>>,
+) -> Vec<AsrSegmentJob> {
+    let mut segments = vec![first];
+    if max_batch_size <= 1 {
+        return segments;
+    }
+    while segments.len() < max_batch_size {
+        match asr_rx.try_recv() {
+            Ok(Ok(AsrPipelineMessage::Segment(segment))) => segments.push(segment),
+            Ok(Ok(AsrPipelineMessage::Job(_))) => break,
+            Ok(Err(_)) => break,
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => return segments,
+        }
+    }
+    if segments.len() >= max_batch_size {
+        return segments;
+    }
+    while segments.len() < max_batch_size {
+        match asr_rx.recv().await {
+            Some(Ok(AsrPipelineMessage::Segment(segment))) => segments.push(segment),
+            Some(Ok(AsrPipelineMessage::Job(_))) | Some(Err(_)) | None => break,
+        }
+    }
+    segments
+}
+
+fn prepare_segment_job_state(state: &mut SegmentAsrState, segments: &[AsrSegmentJob]) {
+    for segment in segments {
+        let entry = state
+            .jobs
+            .entry(segment.job_index)
+            .or_insert_with(|| SegmentJobState {
+                index: segment.job_index,
+                audio_seconds: segment.job_audio_seconds,
+                speech_annotations: segment.speech_annotations.clone(),
+                timeline: Timeline::new("offline_audio"),
+                segment_count: segment.segment_count,
+                segments_done: 0,
+            });
+        if !segment.speech_annotations.is_empty() {
+            entry.speech_annotations = segment.speech_annotations.clone();
+        }
+        if entry.timeline.annotations.is_empty() && !entry.speech_annotations.is_empty() {
+            entry
+                .timeline
+                .annotations
+                .extend(entry.speech_annotations.clone());
+        }
+        entry.segment_count = segment.segment_count;
+    }
+}
+
+#[derive(Debug)]
+struct SegmentAsrInference {
+    targets: Vec<(usize, DurationMs)>,
+    segment_audio_seconds: f64,
+    original_audio_seconds: f64,
+    active_job_count: usize,
+}
+
+fn run_segment_asr_inference(
+    offline: &OfflinePipeline,
+    segments: &[AsrSegmentJob],
+    asr_options: &AsrOptions,
+) -> Result<(SegmentAsrInference, Vec<Timeline>)> {
+    let slices: Vec<Waveform> = segments
+        .iter()
+        .map(|segment| segment.waveform.clone())
+        .collect();
+    let targets: Vec<(usize, DurationMs)> = segments
+        .iter()
+        .map(|segment| (segment.job_index, segment.offset))
+        .collect();
+    let mut seen_jobs = HashSet::new();
+    let original_audio_seconds: f64 = segments
+        .iter()
+        .filter_map(|segment| {
+            seen_jobs
+                .insert(segment.job_index)
+                .then_some(segment.job_audio_seconds)
+        })
+        .sum();
+    let segment_audio_seconds: f64 = slices.iter().map(Waveform::duration_seconds).sum();
+    let active_job_count = seen_jobs.len();
+    let timelines = offline
+        .asr
+        .transcribe_batch(slices.as_slice(), asr_options)?;
+    Ok((
+        SegmentAsrInference {
+            targets,
+            segment_audio_seconds,
+            original_audio_seconds,
+            active_job_count,
+        },
+        timelines,
+    ))
+}
+
+fn finish_segment_asr_batch(
+    state: &mut SegmentAsrState,
+    segments: &[AsrSegmentJob],
+    stage_start: Instant,
+    batch: Result<(SegmentAsrInference, Vec<Timeline>)>,
+) -> Vec<TranscribeItemOutcome> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut completed = Vec::new();
+    match batch {
+        Ok((inference, timelines)) => {
+            log_asr(
+                "vad-segment",
+                inference.active_job_count,
+                segments.len(),
+                inference.segment_audio_seconds,
+                inference.original_audio_seconds,
+                stage_start.elapsed().as_secs_f64(),
+            );
+            if timelines.len() == inference.targets.len() {
+                for ((job_index, offset), asr_timeline) in
+                    inference.targets.into_iter().zip(timelines)
+                {
+                    if let Some(job) = state.jobs.get_mut(&job_index) {
+                        job.timeline
+                            .annotations
+                            .extend(offset_annotations(asr_timeline.annotations, offset));
+                        job.segments_done = job.segments_done.saturating_add(1);
+                        if job.segments_done >= job.segment_count {
+                            if let Some(job) = state.jobs.remove(&job_index) {
+                                completed.push(TranscribeItemOutcome {
+                                    index: job.index,
+                                    result: Ok(job.timeline),
+                                    audio_seconds: job.audio_seconds,
+                                    bad_component: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                let err = format!(
+                    "ASR segment batch returned {} timelines for {} segments",
+                    timelines.len(),
+                    segments.len()
+                );
+                let affected: HashSet<usize> =
+                    segments.iter().map(|segment| segment.job_index).collect();
+                for job_index in affected {
+                    if let Some(job) = state.jobs.remove(&job_index) {
+                        completed.push(outcome_from_result(
+                            job.index,
+                            job.audio_seconds,
+                            Err(anyhow::anyhow!(err.clone())),
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            let affected: HashSet<usize> =
+                segments.iter().map(|segment| segment.job_index).collect();
+            for job_index in affected {
+                if let Some(job) = state.jobs.remove(&job_index) {
+                    completed.push(outcome_from_result(
+                        job.index,
+                        job.audio_seconds,
+                        Err(anyhow::anyhow!(reason.clone())),
+                    ));
+                }
+            }
+        }
+    }
+
+    completed
+}
+
+fn run_segment_microbatch(
+    offline: &OfflinePipeline,
+    segments: Vec<AsrSegmentJob>,
+    asr_options: &AsrOptions,
+    state: &mut SegmentAsrState,
+) -> Vec<TranscribeItemOutcome> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    prepare_segment_job_state(state, &segments);
+    let stage_start = Instant::now();
+    let batch = run_segment_asr_inference(offline, &segments, asr_options);
+    finish_segment_asr_batch(state, &segments, stage_start, batch)
 }
 
 fn run_asr_jobs_batch(
@@ -694,137 +1070,28 @@ fn run_asr_jobs_batch(
     }
 
     if !prepared_jobs.is_empty() {
-        outcomes.extend(run_prepared_asr_jobs_batch(
+        let mut segment_state = SegmentAsrState::default();
+        let mut segment_jobs = Vec::new();
+        for job in prepared_jobs {
+            match speech_job_to_segments(job) {
+                Ok(mut segments) => segment_jobs.append(&mut segments),
+                Err(error) => outcomes.push(TranscribeItemOutcome {
+                    index: 0,
+                    result: Err(error),
+                    audio_seconds: 0.0,
+                    bad_component: Some("vad"),
+                }),
+            }
+        }
+        outcomes.extend(run_segment_microbatch(
             offline,
-            prepared_jobs,
+            segment_jobs,
             asr_options,
+            &mut segment_state,
         ));
     }
 
     outcomes.sort_unstable_by_key(|outcome| outcome.index);
-    outcomes
-}
-
-struct PreparedJobState {
-    index: usize,
-    audio_seconds: f64,
-    timeline: Timeline,
-}
-
-fn run_prepared_asr_jobs_batch(
-    offline: &OfflinePipeline,
-    jobs: Vec<AsrJob>,
-    asr_options: &AsrOptions,
-) -> Vec<TranscribeItemOutcome> {
-    let mut outcomes = Vec::new();
-    let mut states = Vec::new();
-    let mut slices = Vec::new();
-    let mut segment_targets = Vec::new();
-
-    for job in jobs {
-        let index = job.index;
-        let audio_seconds = job.waveform.duration_seconds();
-        let VadPreparation::Speech(prepared) = job.prepared else {
-            continue;
-        };
-        let VadPrepared {
-            speech_annotations,
-            segments,
-            slices: job_slices,
-        } = prepared;
-        if segments.len() != job_slices.len() {
-            outcomes.push(outcome_from_result(
-                index,
-                audio_seconds,
-                Err(anyhow::anyhow!(
-                    "VAD prepared mismatch: segments={} slices={}",
-                    segments.len(),
-                    job_slices.len()
-                )),
-            ));
-            continue;
-        }
-
-        let state_idx = states.len();
-        let mut timeline = Timeline::new("offline_audio");
-        timeline.annotations.extend(speech_annotations);
-        states.push(PreparedJobState {
-            index,
-            audio_seconds,
-            timeline,
-        });
-
-        for (segment, slice) in segments.into_iter().zip(job_slices) {
-            segment_targets.push((state_idx, segment.range.start));
-            slices.push(slice);
-        }
-    }
-
-    if slices.is_empty() {
-        outcomes.extend(states.into_iter().map(|state| TranscribeItemOutcome {
-            index: state.index,
-            result: Ok(state.timeline),
-            audio_seconds: state.audio_seconds,
-            bad_component: None,
-        }));
-        return outcomes;
-    }
-
-    let original_audio_seconds: f64 = states.iter().map(|state| state.audio_seconds).sum();
-    let segment_audio_seconds: f64 = slices.iter().map(Waveform::duration_seconds).sum();
-    let batch_size = states.len();
-    let segment_count = slices.len();
-    let stage_start = Instant::now();
-    let result = offline.asr.transcribe_batch(&slices, asr_options);
-    log_asr(
-        "vad",
-        batch_size,
-        segment_count,
-        segment_audio_seconds,
-        original_audio_seconds,
-        stage_start.elapsed().as_secs_f64(),
-    );
-    match result {
-        Ok(timelines) if timelines.len() == segment_targets.len() => {
-            for ((state_idx, offset), asr_timeline) in segment_targets.into_iter().zip(timelines) {
-                states[state_idx]
-                    .timeline
-                    .annotations
-                    .extend(offset_annotations(asr_timeline.annotations, offset));
-            }
-            outcomes.extend(states.into_iter().map(|state| TranscribeItemOutcome {
-                index: state.index,
-                result: Ok(state.timeline),
-                audio_seconds: state.audio_seconds,
-                bad_component: None,
-            }));
-        }
-        Ok(timelines) => {
-            let err = format!(
-                "ASR segment batch returned {} timelines for {} segments",
-                timelines.len(),
-                segment_targets.len()
-            );
-            outcomes.extend(states.into_iter().map(|state| {
-                outcome_from_result(
-                    state.index,
-                    state.audio_seconds,
-                    Err(anyhow::anyhow!(err.clone())),
-                )
-            }));
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            outcomes.extend(states.into_iter().map(|state| {
-                outcome_from_result(
-                    state.index,
-                    state.audio_seconds,
-                    Err(anyhow::anyhow!(reason.clone())),
-                )
-            }));
-        }
-    }
-
     outcomes
 }
 
@@ -1123,11 +1390,11 @@ mod tests {
 
         for index in 0..3usize {
             asr_tx
-                .send(Ok(AsrJob {
+                .send(Ok(AsrPipelineMessage::Job(AsrJob {
                     index,
                     prepared: VadPreparation::Disabled,
                     waveform: Waveform::new(vec![index as f32; 160], 16_000),
-                }))
+                })))
                 .await?;
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }

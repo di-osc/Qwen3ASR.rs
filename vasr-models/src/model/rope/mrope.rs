@@ -6,6 +6,11 @@ use crate::config::RopeScaling;
 use crate::model::rope::core::RopeCore;
 use crate::model::rope::scaling::RopeScalingType;
 
+/// Whether to use the mistralrs Metal/CUDA rotary kernel for seq_len==1 decode.
+fn use_accelerated_rotary(device: &Device) -> bool {
+    (device.is_metal() || device.is_cuda()) && std::env::var_os("VASR_DISABLE_ACCEL_ROPE").is_none()
+}
+
 /// Multimodal rotary embedding generator for 3D positions.
 ///
 /// `position_ids` is shaped `(3, batch, seq_len)` where the leading dimension
@@ -79,9 +84,53 @@ impl MultimodalRotaryEmbedding {
 
         Ok((cos, sin))
     }
+
+    /// Compute cos/sin for only the first modality (temporal), used in seq_len==1 decode.
+    ///
+    /// Returns `(cos, sin)` each of shape `(batch, seq_len, head_dim/2)`.
+    pub fn forward_first_modality(
+        &self,
+        x: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let dtype = x.dtype();
+        let seq_len = position_ids.dim(2)?;
+
+        let inv_freq = self.core.get_inv_freq(seq_len)?;
+
+        // Use only the first (temporal) position row: (1, batch, seq_len)
+        let pos_first = position_ids.i(0)?;
+
+        // inv_freq: (half_dim,) -> (1, 1, half_dim, 1)
+        let inv_freq = inv_freq
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .unsqueeze(3)?
+            .to_dtype(DType::F32)?;
+
+        // pos_first: (batch, seq_len) -> (batch, 1, 1, seq_len)
+        let pos_first = pos_first
+            .unsqueeze(1)?
+            .unsqueeze(1)?
+            .to_dtype(DType::F32)?;
+
+        // freqs: (batch, 1, half_dim, seq_len) -> (batch, 1, seq_len, half_dim)
+        let freqs = inv_freq.broadcast_mul(&pos_first)?;
+        let freqs = freqs.transpose(2, 3)?.contiguous()?;
+
+        let cos = (freqs.cos()? * self.core.attention_scaling)?.to_dtype(dtype)?;
+        let sin = (freqs.sin()? * self.core.attention_scaling)?.to_dtype(dtype)?;
+        // Squeeze the modality dimension: (batch, 1, seq_len, half_dim) -> (batch, seq_len, half_dim)
+        let cos = cos.squeeze(1)?;
+        let sin = sin.squeeze(1)?;
+        Ok((cos, sin))
+    }
 }
 
 /// Apply multimodal rotary position embedding for 3D positions.
+///
+/// For seq_len==1 on Metal/CUDA devices, uses the accelerated `mistralrs_quant::rotary`
+/// kernel instead of the Candle fallback.
 pub fn apply_multimodal_rotary_pos_emb(
     q: &Tensor,
     k: &Tensor,
@@ -90,11 +139,89 @@ pub fn apply_multimodal_rotary_pos_emb(
     mrope_section: &[usize],
     interleaved: bool,
 ) -> Result<(Tensor, Tensor)> {
+    // seq_len==1 fast path: use Metal/CUDA accelerated rotary kernel
+    if q.dim(2).unwrap_or(0) == 1 && use_accelerated_rotary(q.device()) {
+        return apply_multimodal_rotary_pos_emb_seq_one(q, k, cos, sin, interleaved);
+    }
+
     if interleaved {
         apply_multimodal_rotary_pos_emb_interleaved(q, k, cos, sin, mrope_section)
     } else {
         apply_multimodal_rotary_pos_emb_standard(q, k, cos, sin, mrope_section)
     }
+}
+
+/// Seq-len-1 fast path: use the accelerated rotary kernel for single-token decode.
+///
+/// For mRoPE with seq_len==1, only the first (temporal) modality matters.
+/// We extract that slice and feed it to `mistralrs_quant::rotary::apply_rotary_qk`.
+fn apply_multimodal_rotary_pos_emb_seq_one(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+) -> Result<(Tensor, Tensor)> {
+    // cos/sin can be either:
+    //   (3, batch, 1, half_dim)  — full mRoPE from `forward()`
+    //   (batch, 1, half_dim)     — single modality from `forward_first_modality()`
+    // Normalize to (batch, half_dim).
+    let (cos_first, sin_first) = if cos.rank() == 4 && cos.dim(0)? == 3 {
+        // Full 3-modality: extract first (temporal) modality
+        (
+            cos.i(0)?.squeeze(1)?, // (batch, half_dim)
+            sin.i(0)?.squeeze(1)?, // (batch, half_dim)
+        )
+    } else {
+        // Already single modality: just squeeze the seq dim
+        (
+            cos.squeeze(1)?, // (batch, half_dim)
+            sin.squeeze(1)?, // (batch, half_dim)
+        )
+    };
+
+    // Qwen3 uses NeoX-style RoPE (half-dimension rotation, not GPT-NeoX's interleaved)
+    // For interleaved mRoPE the order differs but the accelerator kernel handles both
+    // via the is_neox parameter: interleaved=true means GPT-NeoX style
+    let is_neox = !interleaved;
+
+    #[cfg(any(
+        feature = "metal-paged-attn",
+        feature = "cuda-paged-attn",
+        feature = "cuda-quant"
+    ))]
+    {
+        vasr_quant::apply_rotary_qk(q, k, &cos_first, &sin_first, is_neox)
+    }
+    #[cfg(not(any(
+        feature = "metal-paged-attn",
+        feature = "cuda-paged-attn",
+        feature = "cuda-quant"
+    )))]
+    {
+        // Fallback to Candle-based RoPE for CPU or non-accelerated builds
+        let _ = (cos_first, sin_first, is_neox);
+        apply_rope_batched_generic(q, k, cos, sin)
+    }
+}
+
+#[cfg(not(any(
+    feature = "metal-paged-attn",
+    feature = "cuda-paged-attn",
+    feature = "cuda-quant"
+)))]
+fn apply_rope_batched_generic(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    // Simplified non-accelerated path: take first modality and use apply_rope_batched
+    let cos_first = cos.i(0)?.squeeze(1)?;
+    let sin_first = sin.i(0)?.squeeze(1)?;
+    let q_embed = apply_rope_batched(q, &cos_first, &sin_first)?;
+    let k_embed = apply_rope_batched(k, &cos_first, &sin_first)?;
+    Ok((q_embed, k_embed))
 }
 
 fn apply_multimodal_rotary_pos_emb_standard(

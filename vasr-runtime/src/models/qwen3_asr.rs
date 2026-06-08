@@ -4,6 +4,7 @@ use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSegment, TimeRange,
     Timeline, Token, Waveform,
 };
+use vasr_models::inference::utils::continuous_paged_batch_enabled;
 #[cfg(feature = "timing")]
 use vasr_models::qwen3_asr::TranscribeTimings;
 use vasr_models::qwen3_asr::{
@@ -54,7 +55,7 @@ impl AsrModel for Qwen3AsrModel {
             max_batch_size: options.max_batch_size,
             max_batch_audio_sec: options.max_batch_audio_sec,
             chunk_max_sec: options.chunk_max_sec,
-            bucket_by_length: true,
+            bucket_by_length: !continuous_paged_batch_enabled(),
         };
         let audio = waveforms
             .iter()

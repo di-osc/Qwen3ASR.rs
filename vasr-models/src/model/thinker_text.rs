@@ -14,7 +14,10 @@ use crate::model::{attention, rope};
 
 #[cfg(feature = "paged-attn")]
 use crate::model::paged_kv_cache::{PagedInputMetadata, PagedKvCache};
-#[cfg(feature = "paged-attn")]
+#[cfg(all(
+    feature = "paged-attn",
+    any(feature = "cuda-paged-attn", feature = "metal-paged-attn")
+))]
 use vasr_paged_attn::mistralrs_paged_attn;
 
 #[cfg(feature = "paged-attn")]
@@ -157,6 +160,112 @@ fn paged_prefill_attention_mask(
     Ok(attention::AttentionMask::Custom(attention::adjust_kv_mask(
         &mask, max_kv,
     )?))
+}
+
+#[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
+fn run_paged_prefill_attention_fallback(
+    q: &Tensor,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    input_metadata: &PagedInputMetadata,
+    kv_lens: &[usize],
+    paged_attn: &PagedAttentionHandle,
+    batch: usize,
+    seq_len: usize,
+    hidden_states: &Tensor,
+    scaling: f32,
+    num_key_value_heads: usize,
+    num_key_value_groups: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let cu_kv = input_metadata
+        .cu_seqlens_kv
+        .as_ref()
+        .ok_or_else(|| candle_core::Error::Msg("paged metadata missing cu_seqlens_kv".into()))?;
+    let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+        key_cache,
+        value_cache,
+        Some(&paged_attn.k_scale),
+        Some(&paged_attn.v_scale),
+        &input_metadata.block_tables,
+        cu_kv,
+        hidden_states.dtype(),
+    )?;
+    let mask = paged_prefill_attention_mask(
+        input_metadata,
+        kv_lens,
+        batch,
+        seq_len,
+        q.dtype(),
+        q.device(),
+    )?;
+    let flash_params = input_metadata.flash_params(seq_len > 1);
+    if attention::supports_packed_varlen_sdpa(q) {
+        let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
+        let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
+        attention::run_attention(
+            q,
+            &k_4d,
+            &v_4d,
+            &mask,
+            flash_params.as_ref(),
+            scaling,
+            true,
+            num_key_value_groups,
+        )
+    } else {
+        let k = unpack_gathered_kv_for_attention(
+            &k_gathered,
+            kv_lens,
+            num_key_value_heads,
+            num_key_value_groups,
+            head_dim,
+            hidden_states.device(),
+        )?;
+        let v = unpack_gathered_kv_for_attention(
+            &v_gathered,
+            kv_lens,
+            num_key_value_heads,
+            num_key_value_groups,
+            head_dim,
+            hidden_states.device(),
+        )?;
+        attention::run_attention(
+            q,
+            &k,
+            &v,
+            &mask,
+            flash_params.as_ref(),
+            scaling,
+            true,
+            num_key_value_groups,
+        )
+    }
+}
+
+#[cfg(feature = "paged-attn")]
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(any(feature = "cuda-paged-attn", feature = "metal-paged-attn")))]
+fn run_paged_prefill_attention_fallback(
+    _q: &Tensor,
+    _key_cache: &Tensor,
+    _value_cache: &Tensor,
+    _input_metadata: &PagedInputMetadata,
+    _kv_lens: &[usize],
+    _paged_attn: &PagedAttentionHandle,
+    _batch: usize,
+    _seq_len: usize,
+    _hidden_states: &Tensor,
+    _scaling: f32,
+    _num_key_value_heads: usize,
+    _num_key_value_groups: usize,
+    _head_dim: usize,
+) -> Result<Tensor> {
+    candle_core::bail!(
+        "paged-attn backend not enabled: build with cuda-paged-attn or metal-paged-attn"
+    )
 }
 
 #[cfg(feature = "flash-attn")]
@@ -316,6 +425,14 @@ impl ThinkerTextRotaryEmbedding {
 
     fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         self.rope.forward(x, position_ids)
+    }
+
+    fn forward_first_modality(
+        &self,
+        x: &Tensor,
+        position_ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        self.rope.forward_first_modality(x, position_ids)
     }
 }
 
@@ -938,102 +1055,147 @@ impl ThinkerTextAttention {
                 self.head_dim,
             ))?)?
         };
-        mistralrs_paged_attn::reshape_and_cache(
-            &k_flat,
-            &v_flat,
-            Some(&paged_attn.k_scale),
-            Some(&paged_attn.v_scale),
-            key_cache,
-            value_cache,
-            &input_metadata.slot_mapping,
-        )?;
-
-        let attn = if seq_len == 1 {
-            let q_flat = maybe_contiguous_for_accelerator(q.reshape((
-                batch,
-                self.num_attention_heads,
-                self.head_dim,
-            ))?)?;
-            mistralrs_paged_attn::paged_attention(
-                &q_flat,
+        #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
+        {
+            mistralrs_paged_attn::reshape_and_cache(
+                &k_flat,
+                &v_flat,
                 Some(&paged_attn.k_scale),
                 Some(&paged_attn.v_scale),
                 key_cache,
                 value_cache,
-                &input_metadata.block_tables,
-                &input_metadata.context_lens,
-                None,
-                input_metadata.max_context_len,
-                self.scaling as f32,
-                1.0,
-                None,
-            )?
+                &input_metadata.slot_mapping,
+            )?;
+        }
+        #[cfg(not(any(feature = "cuda-paged-attn", feature = "metal-paged-attn")))]
+        {
+            return candle_core::bail!(
+                "paged-attn backend not enabled: build with cuda-paged-attn or metal-paged-attn"
+            );
+        }
+
+        let attn = if seq_len == 1 {
+            #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
+            {
+                let q_flat = maybe_contiguous_for_accelerator(q.reshape((
+                    batch,
+                    self.num_attention_heads,
+                    self.head_dim,
+                ))?)?;
+                mistralrs_paged_attn::paged_attention(
+                    &q_flat,
+                    Some(&paged_attn.k_scale),
+                    Some(&paged_attn.v_scale),
+                    key_cache,
+                    value_cache,
+                    &input_metadata.block_tables,
+                    &input_metadata.context_lens,
+                    None,
+                    input_metadata.max_context_len,
+                    self.scaling as f32,
+                    1.0,
+                    None,
+                )?
+            }
+            #[cfg(not(any(feature = "cuda-paged-attn", feature = "metal-paged-attn")))]
+            {
+                return candle_core::bail!(
+                    "paged-attn backend not enabled: build with cuda-paged-attn or metal-paged-attn"
+                );
+            }
         } else {
             let kv_lens = input_metadata
                 .kv_lens
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::Msg("paged metadata missing kv_lens".into()))?;
-            let cu_kv = input_metadata.cu_seqlens_kv.as_ref().ok_or_else(|| {
-                candle_core::Error::Msg("paged metadata missing cu_seqlens_kv".into())
-            })?;
-            let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
-                key_cache,
-                value_cache,
-                Some(&paged_attn.k_scale),
-                Some(&paged_attn.v_scale),
-                &input_metadata.block_tables,
-                &cu_kv,
-                hidden_states.dtype(),
-            )?;
-            let mask = paged_prefill_attention_mask(
-                input_metadata,
-                kv_lens.as_slice(),
-                batch,
-                seq_len,
-                q.dtype(),
-                q.device(),
-            )?;
-            let flash_params = input_metadata.flash_params(seq_len > 1);
-            let attn_output = if attention::supports_packed_varlen_sdpa(&q) {
-                let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
-                let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
-                attention::run_attention(
-                    &q,
-                    &k_4d,
-                    &v_4d,
-                    &mask,
-                    flash_params.as_ref(),
-                    self.scaling as f32,
-                    true,
-                    self.num_key_value_groups,
-                )?
-            } else {
-                let k = unpack_gathered_kv_for_attention(
-                    &k_gathered,
-                    kv_lens.as_slice(),
-                    self.num_key_value_heads,
-                    self.num_key_value_groups,
-                    self.head_dim,
-                    hidden_states.device(),
-                )?;
-                let v = unpack_gathered_kv_for_attention(
-                    &v_gathered,
-                    kv_lens.as_slice(),
-                    self.num_key_value_heads,
-                    self.num_key_value_groups,
-                    self.head_dim,
-                    hidden_states.device(),
-                )?;
-                attention::run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    &mask,
-                    flash_params.as_ref(),
-                    self.scaling as f32,
-                    true,
-                    self.num_key_value_groups,
-                )?
+            let attn_output = {
+                #[cfg(feature = "metal-paged-attn")]
+                {
+                    let block_size = key_cache.dim(3)?;
+                    if vasr_paged_attn::supports_metal_varlen_prefill(
+                        q.device(),
+                        self.head_dim,
+                        block_size,
+                    ) {
+                        if let (Some(cu_q), Some(query_lens)) = (
+                            input_metadata.cu_seqlens_q.as_ref(),
+                            input_metadata.query_lens.as_ref(),
+                        ) {
+                            let q_contig = maybe_contiguous_for_accelerator(q.clone())?;
+                            let q_packed = vasr_paged_attn::pack_query_for_varlen_prefill(
+                                &q_contig, query_lens,
+                            )?;
+                            let attn_packed = vasr_paged_attn::paged_attention_varlen_prefill(
+                                &q_packed,
+                                key_cache,
+                                value_cache,
+                                &input_metadata.block_tables,
+                                &input_metadata.context_lens,
+                                cu_q,
+                                Some(&paged_attn.k_scale),
+                                Some(&paged_attn.v_scale),
+                                self.scaling as f32,
+                                1.0,
+                            )?;
+                            vasr_paged_attn::unpack_varlen_attn_to_batched(
+                                &attn_packed,
+                                query_lens,
+                                batch,
+                                seq_len,
+                            )?
+                        } else {
+                            run_paged_prefill_attention_fallback(
+                                &q,
+                                key_cache,
+                                value_cache,
+                                input_metadata,
+                                kv_lens.as_slice(),
+                                &paged_attn,
+                                batch,
+                                seq_len,
+                                hidden_states,
+                                self.scaling as f32,
+                                self.num_key_value_heads,
+                                self.num_key_value_groups,
+                                self.head_dim,
+                            )?
+                        }
+                    } else {
+                        run_paged_prefill_attention_fallback(
+                            &q,
+                            key_cache,
+                            value_cache,
+                            input_metadata,
+                            kv_lens.as_slice(),
+                            &paged_attn,
+                            batch,
+                            seq_len,
+                            hidden_states,
+                            self.scaling as f32,
+                            self.num_key_value_heads,
+                            self.num_key_value_groups,
+                            self.head_dim,
+                        )?
+                    }
+                }
+                #[cfg(not(feature = "metal-paged-attn"))]
+                {
+                    run_paged_prefill_attention_fallback(
+                        &q,
+                        key_cache,
+                        value_cache,
+                        input_metadata,
+                        kv_lens.as_slice(),
+                        &paged_attn,
+                        batch,
+                        seq_len,
+                        hidden_states,
+                        self.scaling as f32,
+                        self.num_key_value_heads,
+                        self.num_key_value_groups,
+                        self.head_dim,
+                    )?
+                }
             };
             attn_output.transpose(1, 2)?.reshape((
                 batch,
@@ -1407,7 +1569,8 @@ impl ThinkerTextModel {
             None
         };
 
-        let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
+        // seq_len==1: only the first (temporal) modality is needed for mRoPE
+        let (cos, sin) = self.rotary_emb.forward_first_modality(inputs_embeds, position_ids)?;
         let position_embeddings = (&cos, &sin);
 
         let mut hidden_states = inputs_embeds.clone();

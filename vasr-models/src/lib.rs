@@ -16,22 +16,26 @@ use std::sync::Arc;
 
 pub use audio::input::AudioInput;
 #[cfg(feature = "paged-attn")]
-pub use vasr_paged_attn;
-#[cfg(feature = "paged-attn")]
 pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
 pub use inference::streaming::AsrStream;
 #[cfg(feature = "timing")]
 pub use inference::transcribe::TranscribeTimings;
 pub use inference::types::{AsrTranscription, Batch, StreamOptions, TranscribeOptions};
+#[cfg(feature = "timing")]
+pub use model::generation::GenerationTimings;
 #[cfg(feature = "paged-attn")]
 pub use model::paged_batch_engine::{PagedBatchConfig, PagedBatchState, PagedDecodeSlot};
 pub use model::weights::LoadOptions;
 pub use processor::AsrProcessor;
 #[cfg(feature = "paged-attn")]
+pub use vasr_paged_attn;
+#[cfg(feature = "paged-attn")]
 pub use vasr_paged_attn::{PagedCacheConfig, PagedCacheStats};
 pub use vasr_quant;
 
 pub mod qwen3_asr {
+    #[cfg(feature = "timing")]
+    pub use crate::GenerationTimings;
     #[cfg(feature = "timing")]
     pub use crate::TranscribeTimings;
     pub use crate::audio;
@@ -91,6 +95,14 @@ impl Qwen3Asr {
         #[cfg(feature = "paged-attn")]
         let paged_cache = if device.is_metal() || device.is_cuda() {
             let (num_layers, num_kv_heads, head_dim) = model.thinker.paged_cache_config();
+            let config = opts.paged_cache.unwrap_or_else(|| vasr_paged_attn::PagedCacheConfig {
+                block_size: 32,
+                memory: if device.is_cuda() {
+                    vasr_paged_attn::PagedCacheMemory::GpuMemoryFraction(0.8)
+                } else {
+                    vasr_paged_attn::PagedCacheMemory::ContextSize(100_000)
+                },
+            });
             Some(Arc::new(std::sync::Mutex::new(
                 vasr_paged_attn::PagedCacheRuntime::new(
                     num_layers,
@@ -98,7 +110,7 @@ impl Qwen3Asr {
                     head_dim,
                     opts.dtype,
                     device,
-                    opts.paged_cache.unwrap_or_default(),
+                    config,
                 )?,
             )))
         } else {
@@ -124,6 +136,10 @@ impl Qwen3Asr {
 
     pub fn processor(&self) -> &AsrProcessor {
         self.processor.as_ref()
+    }
+
+    pub fn inner_model(&self) -> &model::AsrModel {
+        &self._model
     }
 
     #[cfg(feature = "paged-attn")]
@@ -180,6 +196,97 @@ impl Qwen3Asr {
             &audio,
             &opts,
         )
+    }
+
+    #[cfg(feature = "timing")]
+    pub fn decode_text_timed(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<(String, u64, usize, usize)> {
+        let (text, timings) = self.decode_text_timed_with_metrics(prompt, max_new_tokens, true)?;
+        Ok((
+            text,
+            timings.decode_us,
+            timings.steps,
+            timings.tokens_generated,
+        ))
+    }
+
+    #[cfg(feature = "timing")]
+    pub fn decode_text_timed_with_metrics(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        stop_at_eos: bool,
+    ) -> Result<(String, GenerationTimings)> {
+        if prompt.is_empty() {
+            return Ok((String::new(), GenerationTimings::default()));
+        }
+
+        let prompt = if max_new_tokens == 0 {
+            format!("{prompt} ")
+        } else {
+            prompt.to_string()
+        };
+        let input_ids = self.processor.tokenizer.encode(&prompt)?;
+        if input_ids.is_empty() {
+            return Ok((String::new(), GenerationTimings::default()));
+        }
+
+        let attention_mask = vec![1u32; input_ids.len()];
+
+        let eos_token_ids = if stop_at_eos {
+            vec![
+                self.processor
+                    .tokenizer
+                    .token_to_id(crate::processor::chat_template::IM_END)?,
+                self.processor.tokenizer.token_to_id("<|endoftext|>")?,
+            ]
+        } else {
+            vec![u32::MAX]
+        };
+        let eos_token_ids = {
+            let mut ids = eos_token_ids;
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        let input_rows: [&[u32]; 1] = [input_ids.as_slice()];
+        let attention_rows: [&[u32]; 1] = [attention_mask.as_slice()];
+
+        let (generated, timings) = {
+            #[cfg(feature = "paged-attn")]
+            {
+                crate::model::generation::greedy_generate_cached_batch_timed_with_paged_runtime(
+                    &self._model.thinker,
+                    self.device.as_ref(),
+                    input_rows.as_slice(),
+                    attention_rows.as_slice(),
+                    None,
+                    max_new_tokens,
+                    eos_token_ids.as_slice(),
+                    self.paged_cache.as_ref(),
+                )?
+            }
+            #[cfg(not(feature = "paged-attn"))]
+            {
+                crate::model::generation::greedy_generate_cached_batch_timed(
+                    &self._model.thinker,
+                    self.device.as_ref(),
+                    input_rows.as_slice(),
+                    attention_rows.as_slice(),
+                    None,
+                    max_new_tokens,
+                    eos_token_ids.as_slice(),
+                )?
+            }
+        };
+
+        let gen_ids = generated.into_iter().next().unwrap_or_default();
+        let text = self.processor.tokenizer.decode(gen_ids.as_slice())?;
+        Ok((text, timings))
     }
 
     #[cfg(feature = "forced-aligner")]
