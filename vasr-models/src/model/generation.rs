@@ -46,6 +46,28 @@ pub(crate) fn use_paged_attn_on_device(device: &Device) -> bool {
     device.is_cuda()
 }
 
+#[cfg(feature = "paged-attn")]
+fn force_metal_single_sequence_paged_attn() -> bool {
+    std::env::var_os("VASR_FORCE_PAGED_ATTN").is_some()
+}
+
+#[cfg(feature = "paged-attn")]
+fn should_use_metal_eager_for_batch1() -> bool {
+    std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_none()
+        && !force_metal_single_sequence_paged_attn()
+}
+
+#[cfg(feature = "paged-attn")]
+fn should_use_paged_attention(device: &Device, batch: usize) -> bool {
+    if std::env::var_os("VASR_DISABLE_PAGED_ATTN").is_some() {
+        return false;
+    }
+    if batch == 1 && device.is_metal() && should_use_metal_eager_for_batch1() {
+        return false;
+    }
+    use_paged_attn_on_device(device)
+}
+
 fn argmax_token_id(logits: &Tensor) -> Result<u32> {
     #[cfg(feature = "metal-paged-attn")]
     if logits.device().is_metal()
@@ -319,12 +341,16 @@ pub fn greedy_generate_cached(
 
     let dense_attention = attention_mask_is_dense(attention_mask);
     let prompt_len = prompt_len_from_left_padded_mask(attention_mask, seq_len)?;
+    let decode_position_ids = position_ids_for_decode_steps(prompt_len, max_new_tokens, device)?;
     let ones_col = if dense_attention {
         None
     } else {
         Some(Tensor::ones((1usize, 1usize), DType::U32, device)?)
     };
     let mut attention_mask_total = attention_mask_t;
+    #[cfg(feature = "metal-paged-attn")]
+    let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
+    let _linear_decode_guard = set_linear_is_prefill(false);
 
     for step in 0..max_new_tokens {
         if eos_token_ids.contains(&next_id) {
@@ -337,10 +363,14 @@ pub fn greedy_generate_cached(
         let input_ids_new = Tensor::from_vec(vec![next_id], (1usize, 1usize), device)?;
         let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
 
-        let position_ids_new = position_ids_for_step(&[prompt_len], step, device)?;
+        let position_ids_new = decode_position_ids
+            .get(step)
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing single-seq decode position ids for step {step}")
+            })?
+            .clone();
 
         let logits_new = {
-            let _linear_decode_guard = set_linear_is_prefill(false);
             if dense_attention {
                 thinker.forward_decode_one_without_padding(
                     &position_ids_new,
@@ -360,7 +390,14 @@ pub fn greedy_generate_cached(
                 )?
             }
         };
-        next_id = argmax_token_id(&logits_new.i((0usize, 0usize))?)?;
+        next_id = {
+            let step_logits = logits_new.i((0usize, 0usize))?;
+            #[cfg(feature = "metal-paged-attn")]
+            let next = argmax_token_id_with_scratch(&step_logits, metal_argmax_scratch.as_mut())?;
+            #[cfg(not(feature = "metal-paged-attn"))]
+            let next = argmax_token_id(&step_logits)?;
+            next
+        };
     }
 
     Ok(generated)
@@ -537,7 +574,7 @@ fn greedy_generate_cached_batch_impl(
     }
 
     #[cfg(feature = "paged-attn")]
-    let use_paged_attn = use_paged_attn_on_device(device);
+    let use_paged_attn = should_use_paged_attention(device, batch);
 
     #[cfg(all(feature = "paged-attn", feature = "timing"))]
     if batch == 1 && use_paged_attn && attention_masks_are_dense(attention_mask) {
@@ -685,6 +722,17 @@ fn greedy_generate_cached_batch_impl(
 
     #[cfg(feature = "timing")]
     let start_decode = std::time::Instant::now();
+    #[cfg(feature = "timing")]
+    let mut decode_token_tensor_us = 0u64;
+    #[cfg(feature = "timing")]
+    let mut decode_embed_us = 0u64;
+    #[cfg(feature = "timing")]
+    let mut decode_forward_us = 0u64;
+    #[cfg(feature = "timing")]
+    let mut decode_argmax_us = 0u64;
+    #[cfg(feature = "metal-paged-attn")]
+    let mut metal_argmax_scratch = metal_argmax_scratch_for_device(device);
+    let _linear_decode_guard = set_linear_is_prefill(false);
     for step in 0..opts.max_new_tokens {
         if finished.iter().all(|&x| x) {
             break;
@@ -694,6 +742,8 @@ fn greedy_generate_cached_batch_impl(
             t.steps = t.steps.saturating_add(1);
         }
 
+        #[cfg(feature = "timing")]
+        let start_token_tensor = std::time::Instant::now();
         let mut tokens_in: Vec<u32> = Vec::with_capacity(batch);
         for i in 0..batch {
             if finished.get(i).copied().unwrap_or(true) {
@@ -714,8 +764,19 @@ fn greedy_generate_cached_batch_impl(
             }
         }
 
+        #[cfg(feature = "timing")]
+        {
+            decode_token_tensor_us =
+                decode_token_tensor_us.saturating_add(duration_to_us(start_token_tensor.elapsed()));
+        }
         let input_ids_new = Tensor::from_vec(tokens_in, (batch, 1usize), device)?;
+        #[cfg(feature = "timing")]
+        let start_embed = std::time::Instant::now();
         let inputs_embeds_new = thinker.embed_tokens(&input_ids_new)?;
+        #[cfg(feature = "timing")]
+        {
+            decode_embed_us = decode_embed_us.saturating_add(duration_to_us(start_embed.elapsed()));
+        }
 
         let position_ids_new = decode_position_ids
             .get(step)
@@ -724,8 +785,9 @@ fn greedy_generate_cached_batch_impl(
             })?
             .clone();
 
+        #[cfg(feature = "timing")]
+        let start_forward = std::time::Instant::now();
         let logits_new = {
-            let _linear_decode_guard = set_linear_is_prefill(false);
             if dense_attention {
                 thinker.forward_decode_one_without_padding(
                     &position_ids_new,
@@ -745,7 +807,35 @@ fn greedy_generate_cached_batch_impl(
                 )?
             }
         };
-        let next = argmax_token_ids_from_logits(&logits_new.squeeze(1)?, batch)?;
+        #[cfg(feature = "timing")]
+        {
+            decode_forward_us =
+                decode_forward_us.saturating_add(duration_to_us(start_forward.elapsed()));
+        }
+
+        #[cfg(feature = "timing")]
+        let start_argmax = std::time::Instant::now();
+        let next = if batch == 1 {
+            let step_logits = logits_new.i((0usize, 0usize))?;
+            let next = {
+                #[cfg(feature = "metal-paged-attn")]
+                {
+                    argmax_token_id_with_scratch(&step_logits, metal_argmax_scratch.as_mut())?
+                }
+                #[cfg(not(feature = "metal-paged-attn"))]
+                {
+                    argmax_token_id(&step_logits)?
+                }
+            };
+            vec![next]
+        } else {
+            argmax_token_ids_from_logits(&logits_new.squeeze(1)?, batch)?
+        };
+        #[cfg(feature = "timing")]
+        {
+            decode_argmax_us =
+                decode_argmax_us.saturating_add(duration_to_us(start_argmax.elapsed()));
+        }
         next_ids = next;
     }
     #[cfg(feature = "timing")]
@@ -753,6 +843,12 @@ fn greedy_generate_cached_batch_impl(
         t.decode_us = t
             .decode_us
             .saturating_add(duration_to_us(start_decode.elapsed()));
+        t.decode_token_tensor_us = t
+            .decode_token_tensor_us
+            .saturating_add(decode_token_tensor_us);
+        t.decode_embed_us = t.decode_embed_us.saturating_add(decode_embed_us);
+        t.decode_forward_us = t.decode_forward_us.saturating_add(decode_forward_us);
+        t.decode_argmax_us = t.decode_argmax_us.saturating_add(decode_argmax_us);
     }
 
     Ok(generated)
