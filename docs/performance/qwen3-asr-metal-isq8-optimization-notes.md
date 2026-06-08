@@ -2174,3 +2174,133 @@ Why it was rolled back:
 2. Profile and reduce prefill time (second-largest bottleneck after decode).
 3. Evaluate selective ISQ application: only quantize layers above a size
    threshold rather than all-or-nothing.
+
+## 2026-06-08 Pass 16: Per-Batch Timing + Prefill Substages + Causal Mask Skip
+
+Date: 2026-06-08
+
+Platform:
+
+- Model: `Qwen/Qwen3-ASR-0.6B`
+- Device: Apple Metal
+- Runtime dtype: BF16
+- Quantization: ISQ 8-bit
+
+### What Changed
+
+#### 1. Per-batch verbose timing for `vasr-transcribe run`
+
+Files:
+
+- `vasr-cli/Cargo.toml`
+- `vasr-models/src/inference/transcribe.rs`
+- `vasr-models/src/model/generation.rs`
+
+Behavior:
+
+- `metal-paged-attn` 和 `cuda-paged-attn` feature 默认启用 `timing`，无需
+  手动传 `--features timing`。
+- `run_asr_on_chunks_batched_timed` 的每个 ASR batch 现在通过 `eprintln!`
+  打印 stderr 耗时分解，无需 `RUST_LOG` 即可看到。
+- 输出格式：
+  ```
+  [vasr batch 1/3] items=1 | prepare=113ms | audio_enc=36ms |
+    prefill=718ms (inputs=1.6 rope=0.3 fwd=503 other=213) |
+    decode=622ms (fwd=199) | steps=128 tokens=128
+  ```
+- 修复了 varlen paged 路径的计时遗漏：原先 `run_paged_prepared_batch`
+  不返回任何 timing，现在改为走 `greedy_generate_cached_batch_timed_with_paged_runtime`
+  带计时路径。
+- Eager prefill 路径新增 `prefill_inputs_us`、`prefill_rope_us`、
+  `prefill_forward_us` 子阶段计时（原先只在 paged 路径有）。
+
+Why:
+
+- 之前无法看到每个 batch 的耗时分解，排查性能瓶颈困难。
+- prefill/decode 细分帮助快速定位瓶颈是 forward、RoPE 还是 mask 构建。
+
+#### 2. Metal causal prefill mask skip
+
+Files:
+
+- `vasr-models/src/model/attention.rs`
+
+Behavior:
+
+- `run_attention` 中：Metal 设备上，当 `causal=true` 且 `q_len == k_len`
+  （纯 causal prefill，无 padding）时，跳过显式 attention mask 张量，
+  直接将 `mask=None + causal=true` 传给 MPS SDPA。
+- MPS 内部 causal kernel 比显式 mask 路径更高效。
+
+Observed effect:
+
+- Prefill 时间无明显变化（O(n²) attention 是主要限制）。
+- Decode 时间 ~6% 改善（622→582ms），因为 decode 侧也会经过此路径。
+
+#### 3. Prefill bottleneck analysis
+
+Files:
+
+- `vasr-models/src/inference/transcribe.rs`（计时采集）
+- `vasr-models/src/model/generation.rs`（计时采集）
+
+Findings from per-batch output (114s audio, 128 decode tokens):
+
+| substage | time | share |
+|----------|------|-------|
+| prefill inputs (embed + audio merge) | 1.6ms | <1% |
+| prefill rope (mRoPE 3D positions) | 0.3ms | <1% |
+| **prefill forward (28-layer causal attn)** | **503ms** | **70%** |
+| other (mask/metadata/gather/argmax) | 213ms | 30% |
+| **total prefill** | **718ms** | — |
+
+Prefill 的 **70% 时间在 forward**，即 28 层 causal attention O(n²)。
+Prompt 长度约 1435 tokens（16 base + 1419 audio frames），causal
+attention 矩阵约 1435² = 2M 元素/head/层。
+
+Metal MPS SDPA 已在使用，这是 Apple GPU 上最快的 attention 内核。
+进一步优化需减小 prompt 长度（`--max-batch-audio-sec 30` 可让
+prefill 减半）或复用跨 segment 的 KV cache。
+
+#### 4. Metal paged attention varlen prefill kernel
+
+Files:
+
+- `vasr-paged-attn/build.rs`
+- `vasr-paged-attn/src/metal/mod.rs`
+- `vasr-paged-attn/src/metal/varlen_prefill.rs`
+- `vasr-paged-attn/src/metal/kernels/mod.rs`
+- `vasr-paged-attn/src/metal/kernels/prefill_paged_attn.metal`
+- `vasr-paged-attn/src/metal/kernels/utils.rs`
+
+Behavior:
+
+- 新增 Metal shader `prefill_paged_attn.metal`：varlen paged prefill 的
+  GPU kernel，在 batch 内处理不等长序列的 paged attention。
+- `build.rs` 在构建时用 `metal` 命令编译 `.metal` → `.metallib`。
+- Rust 封装层通过 `objc2-metal` 调用编译好的 metallib。
+- 当前 Metal 默认 eager 路由不使用 paged attention，此 kernel 在
+  `VASR_FORCE_PAGED_ATTN=1` 或 CUDA 部署时生效。
+
+### Verification Commands
+
+```bash
+# Per-batch verbose timing
+cargo build --release --features metal-paged-attn -p vasr-cli --bin vasr-transcribe
+./target/release/vasr-transcribe run \
+  --input raw_audios \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --output results --isq 8 \
+  --max-batch-audio-sec 60 --max-new-tokens 128 --limit 2 --no-vad
+
+# Full aggregate timing (RUST_LOG=info)
+RUST_LOG=vasr_runtime::models::qwen3_asr=info ./target/release/vasr-transcribe run ...
+# Outputs: qwen3_asr_timing | items=N | prefill=X.Xs | prefill_forward=Y.Ys | ...
+```
+
+### Next Steps
+
+1. **减小 audio chunk**：`--max-batch-audio-sec 30` 让 prefill 约减半。
+2. KV cache 跨 segment 复用：同一 system prompt 避免重复 prefill。
+3. Fuse Q/K norm + mRoPE：关闭 text decode 剩余 ~6% 差距。
+4. CUDA flash-attn：评估 CUDA 部署时的 prefill 加速。
