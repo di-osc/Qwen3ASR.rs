@@ -671,12 +671,30 @@ fn greedy_generate_cached_batch_impl(
     } else {
         0
     };
+    #[cfg(feature = "timing")]
+    let start_inputs = std::time::Instant::now();
     let inputs_embeds = thinker.inputs_embeds_with_audio_features(
         &input_ids_t,
         opts.audio_features,
         audio_placeholder_count,
     )?;
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.prefill_inputs_us = t
+            .prefill_inputs_us
+            .saturating_add(duration_to_us(start_inputs.elapsed()));
+    }
+    #[cfg(feature = "timing")]
+    let start_rope = std::time::Instant::now();
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.prefill_rope_us = t
+            .prefill_rope_us
+            .saturating_add(duration_to_us(start_rope.elapsed()));
+    }
+    #[cfg(feature = "timing")]
+    let start_forward = std::time::Instant::now();
     let logits = {
         let _linear_prefill_guard = set_linear_is_prefill(true);
         thinker.forward_embeds_with_kv_cache(
@@ -686,6 +704,12 @@ fn greedy_generate_cached_batch_impl(
             &mut kv_cache,
         )?
     };
+    #[cfg(feature = "timing")]
+    if let Some(t) = timings.as_mut() {
+        t.prefill_forward_us = t
+            .prefill_forward_us
+            .saturating_add(duration_to_us(start_forward.elapsed()));
+    }
 
     let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
     let last_logits = gather_last_logits_for_prompt_lens(&logits, prompt_lens.as_slice())?;

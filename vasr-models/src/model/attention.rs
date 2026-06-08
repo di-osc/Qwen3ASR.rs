@@ -517,7 +517,16 @@ pub fn run_attention(
 
     let mask_tensor = match mask {
         AttentionMask::None => None,
-        AttentionMask::Custom(mask) => Some(mask),
+        AttentionMask::Custom(mask) => {
+            // For pure causal prefill (q_len == k_len, no padding) on Metal,
+            // pass mask=None + causal=true so MPS SDPA uses the faster
+            // internal causal kernel instead of an explicit mask tensor.
+            if q.device().is_metal() && causal && q.dim(2)? == k.dim(2)? {
+                None
+            } else {
+                Some(mask)
+            }
+        }
     };
     if let Some(out) = accelerated_sdpa(q, k, v, mask_tensor, softmax_scale, causal)? {
         return Ok(out);

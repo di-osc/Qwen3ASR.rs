@@ -1064,7 +1064,11 @@ fn run_asr_on_chunks_batched_timed(
             // Snapshot aggregate timings before this batch
             let pre_ae = timings.audio_encoder_us;
             let pre_prefill = timings.generation.prefill_us;
+            let pre_prefill_inputs = timings.generation.prefill_inputs_us;
+            let pre_prefill_rope = timings.generation.prefill_rope_us;
+            let pre_prefill_forward = timings.generation.prefill_forward_us;
             let pre_decode = timings.generation.decode_us;
+            let pre_decode_forward = timings.generation.decode_forward_us;
             let pre_steps = timings.generation.steps;
             let pre_tokens = timings.generation.tokens_generated;
 
@@ -1083,18 +1087,28 @@ fn run_asr_on_chunks_batched_timed(
             // Per-batch verbose timing
             let batch_ae_ms = (timings.audio_encoder_us - pre_ae) as f64 / 1000.0;
             let batch_prefill_ms = (timings.generation.prefill_us - pre_prefill) as f64 / 1000.0;
+            let batch_prefill_inputs_ms = (timings.generation.prefill_inputs_us - pre_prefill_inputs) as f64 / 1000.0;
+            let batch_prefill_rope_ms = (timings.generation.prefill_rope_us - pre_prefill_rope) as f64 / 1000.0;
+            let batch_prefill_fwd_ms = (timings.generation.prefill_forward_us - pre_prefill_forward) as f64 / 1000.0;
+            let batch_prefill_other_ms = batch_prefill_ms - batch_prefill_inputs_ms - batch_prefill_rope_ms - batch_prefill_fwd_ms;
             let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
+            let batch_decode_fwd_ms = (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
             let batch_steps = timings.generation.steps - pre_steps;
             let batch_tokens = timings.generation.tokens_generated - pre_tokens;
             eprintln!(
-                "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms | decode={:.1}ms | decode_steps={} | tokens={}",
+                "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms (inputs={:.1} rope={:.1} fwd={:.1} other={:.1}) | decode={:.1}ms (fwd={:.1}) | steps={} tokens={}",
                 timings.batches,
                 batch.chunks.len(),
                 chunk_batch.len(),
                 prepare_us as f64 / 1000.0,
                 batch_ae_ms,
                 batch_prefill_ms,
+                batch_prefill_inputs_ms,
+                batch_prefill_rope_ms,
+                batch_prefill_fwd_ms,
+                batch_prefill_other_ms,
                 batch_decode_ms,
+                batch_decode_fwd_ms,
                 batch_steps,
                 batch_tokens,
             );
@@ -1184,7 +1198,11 @@ fn run_asr_on_chunks_batched_timed(
         // Snapshot aggregate timings before this batch
         let pre_ae = timings.audio_encoder_us;
         let pre_prefill = timings.generation.prefill_us;
+        let pre_prefill_inputs = timings.generation.prefill_inputs_us;
+        let pre_prefill_rope = timings.generation.prefill_rope_us;
+        let pre_prefill_forward = timings.generation.prefill_forward_us;
         let pre_decode = timings.generation.decode_us;
+        let pre_decode_forward = timings.generation.decode_forward_us;
         let pre_steps = timings.generation.steps;
         let pre_tokens = timings.generation.tokens_generated;
 
@@ -1203,18 +1221,28 @@ fn run_asr_on_chunks_batched_timed(
         // Per-batch verbose timing
         let batch_ae_ms = (timings.audio_encoder_us - pre_ae) as f64 / 1000.0;
         let batch_prefill_ms = (timings.generation.prefill_us - pre_prefill) as f64 / 1000.0;
+        let batch_prefill_inputs_ms = (timings.generation.prefill_inputs_us - pre_prefill_inputs) as f64 / 1000.0;
+        let batch_prefill_rope_ms = (timings.generation.prefill_rope_us - pre_prefill_rope) as f64 / 1000.0;
+        let batch_prefill_fwd_ms = (timings.generation.prefill_forward_us - pre_prefill_forward) as f64 / 1000.0;
+        let batch_prefill_other_ms = batch_prefill_ms - batch_prefill_inputs_ms - batch_prefill_rope_ms - batch_prefill_fwd_ms;
         let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
+        let batch_decode_fwd_ms = (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
         let batch_steps = timings.generation.steps - pre_steps;
         let batch_tokens = timings.generation.tokens_generated - pre_tokens;
         eprintln!(
-            "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms | decode={:.1}ms | decode_steps={} | tokens={}",
+            "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms (inputs={:.1} rope={:.1} fwd={:.1} other={:.1}) | decode={:.1}ms (fwd={:.1}) | steps={} tokens={}",
             timings.batches,
             batch.chunks.len(),
             batch_chunk_idx.len(),
             prepare_us as f64 / 1000.0,
             batch_ae_ms,
             batch_prefill_ms,
+            batch_prefill_inputs_ms,
+            batch_prefill_rope_ms,
+            batch_prefill_fwd_ms,
+            batch_prefill_other_ms,
             batch_decode_ms,
+            batch_decode_fwd_ms,
             batch_steps,
             batch_tokens,
         );
