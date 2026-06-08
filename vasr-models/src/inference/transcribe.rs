@@ -693,20 +693,102 @@ fn generate_raw_prepared_batch_timed(
 
     #[cfg(feature = "paged-attn")]
     let gen_ids = if use_varlen_paged_prepare(paged_runtime) {
-        let pad_id = paged_token_pad_id(processor)?;
-        let effective_max_batch = prepared.len().max(1);
-        use crate::inference::batch_scheduler::run_paged_prepared_batch;
-        run_paged_prepared_batch(
+        // varlen paged path: wrap with timing via the timed generate function
+        let (ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
             thinker,
             device,
-            paged_runtime.ok_or_else(|| anyhow::anyhow!("varlen paged batch requires runtime"))?,
-            prepared,
-            &audio_features,
+            ids_rows.as_slice(),
+            attn_rows.as_slice(),
+            Some(&audio_features),
             max_new_tokens,
             eos_token_ids,
-            effective_max_batch,
-            pad_id,
-        )?
+            paged_runtime,
+        )?;
+        timings.generation.prompt_tensors_us = timings
+            .generation
+            .prompt_tensors_us
+            .saturating_add(gen_timings.prompt_tensors_us);
+        timings.generation.prefill_us = timings
+            .generation
+            .prefill_us
+            .saturating_add(gen_timings.prefill_us);
+        timings.generation.prefill_inputs_us = timings
+            .generation
+            .prefill_inputs_us
+            .saturating_add(gen_timings.prefill_inputs_us);
+        timings.generation.prefill_rope_us = timings
+            .generation
+            .prefill_rope_us
+            .saturating_add(gen_timings.prefill_rope_us);
+        timings.generation.prefill_metadata_us = timings
+            .generation
+            .prefill_metadata_us
+            .saturating_add(gen_timings.prefill_metadata_us);
+        timings.generation.prefill_mask_us = timings
+            .generation
+            .prefill_mask_us
+            .saturating_add(gen_timings.prefill_mask_us);
+        timings.generation.prefill_forward_us = timings
+            .generation
+            .prefill_forward_us
+            .saturating_add(gen_timings.prefill_forward_us);
+        timings.generation.prefill_gather_us = timings
+            .generation
+            .prefill_gather_us
+            .saturating_add(gen_timings.prefill_gather_us);
+        timings.generation.prefill_decode_setup_us = timings
+            .generation
+            .prefill_decode_setup_us
+            .saturating_add(gen_timings.prefill_decode_setup_us);
+        timings.generation.prefill_argmax_us = timings
+            .generation
+            .prefill_argmax_us
+            .saturating_add(gen_timings.prefill_argmax_us);
+        timings.generation.decode_us = timings
+            .generation
+            .decode_us
+            .saturating_add(gen_timings.decode_us);
+        timings.generation.decode_token_tensor_us = timings
+            .generation
+            .decode_token_tensor_us
+            .saturating_add(gen_timings.decode_token_tensor_us);
+        timings.generation.decode_embed_us = timings
+            .generation
+            .decode_embed_us
+            .saturating_add(gen_timings.decode_embed_us);
+        timings.generation.decode_position_us = timings
+            .generation
+            .decode_position_us
+            .saturating_add(gen_timings.decode_position_us);
+        timings.generation.decode_metadata_us = timings
+            .generation
+            .decode_metadata_us
+            .saturating_add(gen_timings.decode_metadata_us);
+        timings.generation.decode_graph_replay_us = timings
+            .generation
+            .decode_graph_replay_us
+            .saturating_add(gen_timings.decode_graph_replay_us);
+        timings.generation.decode_forward_us = timings
+            .generation
+            .decode_forward_us
+            .saturating_add(gen_timings.decode_forward_us);
+        timings.generation.decode_pre_argmax_sync_us = timings
+            .generation
+            .decode_pre_argmax_sync_us
+            .saturating_add(gen_timings.decode_pre_argmax_sync_us);
+        timings.generation.decode_argmax_us = timings
+            .generation
+            .decode_argmax_us
+            .saturating_add(gen_timings.decode_argmax_us);
+        timings.generation.tokens_generated = timings
+            .generation
+            .tokens_generated
+            .saturating_add(gen_timings.tokens_generated);
+        timings.generation.steps = timings
+            .generation
+            .steps
+            .saturating_add(gen_timings.steps);
+        ids
     } else {
         let (ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
             thinker,
@@ -973,10 +1055,18 @@ fn run_asr_on_chunks_batched_timed(
 
             let start_prepare = std::time::Instant::now();
             let (prepared, prepare_timings) = batch.prepare_items_timed(items.as_slice())?;
+            let prepare_us = start_prepare.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             timings.processor_prepare_batch_us = timings
                 .processor_prepare_batch_us
-                .saturating_add(duration_to_us(start_prepare.elapsed()));
+                .saturating_add(prepare_us);
             add_prepare_batch_timings(timings, &prepare_timings);
+
+            // Snapshot aggregate timings before this batch
+            let pre_ae = timings.audio_encoder_us;
+            let pre_prefill = timings.generation.prefill_us;
+            let pre_decode = timings.generation.decode_us;
+            let pre_steps = timings.generation.steps;
+            let pre_tokens = timings.generation.tokens_generated;
 
             let raws = generate_raw_prepared_batch_timed(
                 batch.thinker,
@@ -989,6 +1079,25 @@ fn run_asr_on_chunks_batched_timed(
                 batch.eos_token_ids,
                 timings,
             )?;
+
+            // Per-batch verbose timing
+            let batch_ae_ms = (timings.audio_encoder_us - pre_ae) as f64 / 1000.0;
+            let batch_prefill_ms = (timings.generation.prefill_us - pre_prefill) as f64 / 1000.0;
+            let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
+            let batch_steps = timings.generation.steps - pre_steps;
+            let batch_tokens = timings.generation.tokens_generated - pre_tokens;
+            eprintln!(
+                "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms | decode={:.1}ms | decode_steps={} | tokens={}",
+                timings.batches,
+                batch.chunks.len(),
+                chunk_batch.len(),
+                prepare_us as f64 / 1000.0,
+                batch_ae_ms,
+                batch_prefill_ms,
+                batch_decode_ms,
+                batch_steps,
+                batch_tokens,
+            );
 
             if raws.len() != chunk_batch.len() {
                 bail!(
@@ -1059,9 +1168,10 @@ fn run_asr_on_chunks_batched_timed(
 
         let start_prepare = std::time::Instant::now();
         let (prepared, prepare_timings) = batch.prepare_items_timed(items.as_slice())?;
+        let prepare_us = start_prepare.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         timings.processor_prepare_batch_us = timings
             .processor_prepare_batch_us
-            .saturating_add(duration_to_us(start_prepare.elapsed()));
+            .saturating_add(prepare_us);
         add_prepare_batch_timings(timings, &prepare_timings);
         if prepared.len() != batch_chunk_idx.len() {
             bail!(
@@ -1070,6 +1180,13 @@ fn run_asr_on_chunks_batched_timed(
                 prepared.len()
             );
         }
+
+        // Snapshot aggregate timings before this batch
+        let pre_ae = timings.audio_encoder_us;
+        let pre_prefill = timings.generation.prefill_us;
+        let pre_decode = timings.generation.decode_us;
+        let pre_steps = timings.generation.steps;
+        let pre_tokens = timings.generation.tokens_generated;
 
         let raws = generate_raw_prepared_batch_timed(
             batch.thinker,
@@ -1082,6 +1199,25 @@ fn run_asr_on_chunks_batched_timed(
             batch.eos_token_ids,
             timings,
         )?;
+
+        // Per-batch verbose timing
+        let batch_ae_ms = (timings.audio_encoder_us - pre_ae) as f64 / 1000.0;
+        let batch_prefill_ms = (timings.generation.prefill_us - pre_prefill) as f64 / 1000.0;
+        let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
+        let batch_steps = timings.generation.steps - pre_steps;
+        let batch_tokens = timings.generation.tokens_generated - pre_tokens;
+        eprintln!(
+            "[vasr batch {}/{}] items={} | prepare={:.1}ms | audio_enc={:.1}ms | prefill={:.1}ms | decode={:.1}ms | decode_steps={} | tokens={}",
+            timings.batches,
+            batch.chunks.len(),
+            batch_chunk_idx.len(),
+            prepare_us as f64 / 1000.0,
+            batch_ae_ms,
+            batch_prefill_ms,
+            batch_decode_ms,
+            batch_steps,
+            batch_tokens,
+        );
         if raws.len() != batch_chunk_idx.len() {
             bail!(
                 "internal error: raw output batch size mismatch: expected={}, got={}",
