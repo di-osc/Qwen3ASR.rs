@@ -207,6 +207,56 @@ impl KVCache {
         self.seq_len = 0;
     }
 
+    pub fn replicate_batch(&self, batch: usize) -> Result<Self> {
+        if batch == 0 {
+            candle_core::bail!("replicate_batch requires batch > 0");
+        }
+        if batch == 1 {
+            return Ok(self.clone());
+        }
+
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let replicated = if let Some(entry) = entry {
+                let (cur_key, cur_value) = entry.current_key_value()?;
+                let key_refs = std::iter::repeat_n(&cur_key, batch).collect::<Vec<_>>();
+                let value_refs = std::iter::repeat_n(&cur_value, batch).collect::<Vec<_>>();
+                let key = Tensor::cat(key_refs.as_slice(), 0)?;
+                let value = Tensor::cat(value_refs.as_slice(), 0)?;
+                Some(KVCacheEntry::new(key, value, self.max_seq_len)?)
+            } else {
+                None
+            };
+            entries.push(replicated);
+        }
+
+        Ok(Self {
+            entries,
+            seq_len: self.seq_len,
+            max_seq_len: self.max_seq_len,
+        })
+    }
+
+    pub fn row0_prefix_template(&self, prefix_len: usize) -> Result<Self> {
+        if prefix_len == 0 || prefix_len > self.seq_len {
+            candle_core::bail!(
+                "prefix template len out of range: prefix_len={prefix_len} seq_len={}",
+                self.seq_len
+            );
+        }
+
+        let mut out = KVCache::with_num_layers(self.entries.len());
+        for (layer_idx, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let key = entry.key.narrow(0, 0, 1)?.narrow(2, 0, prefix_len)?;
+            let value = entry.value.narrow(0, 0, 1)?.narrow(2, 0, prefix_len)?;
+            let _ = out.update(layer_idx, &key, &value)?;
+        }
+        Ok(out)
+    }
+
     /// The next position index (0-based) to fill when appending.
     pub fn cache_position(&self) -> usize {
         self.seq_len

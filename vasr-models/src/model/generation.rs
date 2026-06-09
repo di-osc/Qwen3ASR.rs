@@ -5,6 +5,8 @@
 
 use anyhow::{Result, bail};
 use candle_core::{DType, Device, IndexOp, Tensor};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::model::kv_cache::KVCache;
 #[cfg(feature = "paged-attn")]
@@ -14,6 +16,10 @@ use crate::model::thinker::get_rope_index;
 #[cfg(feature = "paged-attn")]
 use vasr_paged_attn::PagedKvCache;
 use vasr_quant::isq_linear::set_linear_is_prefill;
+
+thread_local! {
+    static PREFIX_KV_CACHE_TEMPLATES: RefCell<HashMap<Vec<u32>, KVCache>> = RefCell::new(HashMap::new());
+}
 
 #[cfg(feature = "paged-attn")]
 const PAGED_CACHE_BLOCK_SIZE: usize = 32;
@@ -72,6 +78,65 @@ fn argmax_token_id(logits: &Tensor) -> Result<u32> {
     Ok(logits.argmax(0usize)?.to_scalar::<u32>()?)
 }
 
+fn common_audio_prefix_len(
+    input_ids: &[&[u32]],
+    attention_mask: &[&[u32]],
+    audio_token_id: u32,
+) -> usize {
+    if input_ids.len() <= 1 || input_ids.len() != attention_mask.len() {
+        return 0;
+    }
+    let first = match input_ids.first() {
+        Some(row) => *row,
+        None => return 0,
+    };
+    let first_attn = match attention_mask.first() {
+        Some(row) => *row,
+        None => return 0,
+    };
+    let Some(prefix_len) = first
+        .iter()
+        .zip(first_attn.iter())
+        .position(|(&id, &attn)| attn != 0 && id == audio_token_id)
+    else {
+        return 0;
+    };
+    if prefix_len < 8 {
+        return 0;
+    }
+    for (ids, attn) in input_ids.iter().zip(attention_mask.iter()).skip(1) {
+        let Some(row_prefix_len) = ids
+            .iter()
+            .zip(attn.iter())
+            .position(|(&id, &mask)| mask != 0 && id == audio_token_id)
+        else {
+            return 0;
+        };
+        if row_prefix_len != prefix_len
+            || ids.len() < prefix_len
+            || attn.len() < prefix_len
+            || ids[..prefix_len] != first[..prefix_len]
+            || attn[..prefix_len].iter().any(|&mask| mask == 0)
+        {
+            return 0;
+        }
+    }
+    if first_attn[..prefix_len].iter().any(|&mask| mask == 0) {
+        return 0;
+    }
+    prefix_len
+}
+
+fn cached_prefix_kv_template(prefix_ids: &[u32]) -> Option<KVCache> {
+    PREFIX_KV_CACHE_TEMPLATES.with(|cache| cache.borrow().get(prefix_ids).cloned())
+}
+
+fn store_prefix_kv_template(prefix_ids: Vec<u32>, kv_cache: KVCache) {
+    PREFIX_KV_CACHE_TEMPLATES.with(|cache| {
+        cache.borrow_mut().insert(prefix_ids, kv_cache);
+    });
+}
+
 #[cfg(feature = "metal-paged-attn")]
 fn metal_argmax_scratch_for_device(device: &Device) -> Option<vasr_quant::MetalArgmaxScratch> {
     if device.is_metal() && std::env::var_os("VASR_DISABLE_METAL_ARGMAX").is_none() {
@@ -125,6 +190,8 @@ pub struct GenerationTimings {
     pub prefill_decode_setup_us: u64,
     /// Time spent selecting the first next token after prefill.
     pub prefill_argmax_us: u64,
+    /// Total effective prompt tokens processed by prefill.
+    pub prefill_tokens: usize,
     /// Time spent in the token-by-token decode loop (including mRoPE indices).
     pub decode_us: u64,
     /// Time spent creating the one-token decode input tensor.
@@ -252,6 +319,120 @@ fn kv_cache_for_generation(
         thinker.num_text_layers(),
         max_seq_len,
     ))
+}
+
+#[cfg(feature = "paged-attn")]
+fn metal_hybrid_paged_prefill_enabled(
+    device: &Device,
+    batch: usize,
+    paged_runtime: Option<&SharedPagedCacheRuntime>,
+    audio_features: Option<&Tensor>,
+) -> bool {
+    device.is_metal()
+        && batch > 1
+        && paged_runtime.is_some()
+        && audio_features.is_some()
+        && std::env::var_os("VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID").is_some()
+}
+
+#[cfg(feature = "paged-attn")]
+fn rebuild_kv_cache_from_paged_prefill(
+    thinker: &ThinkerForConditionalGeneration,
+    runtime: &crate::model::paged_cache_runtime::PagedCacheRuntime,
+    state: &crate::model::paged_batch_engine::PagedBatchState,
+    seq_len: usize,
+    max_new_tokens: usize,
+) -> Result<KVCache> {
+    let mut kv_cache = kv_cache_for_generation(thinker, seq_len, max_new_tokens)?;
+    let block_size = runtime.cache().block_size();
+    for layer_idx in 0..thinker.num_text_layers() {
+        let (key_cache, value_cache) = runtime.cache().key_value_cache(layer_idx)?;
+        let (_, num_kv_heads, head_dim_chunks, _, key_pack) = key_cache.dims5()?;
+        let (_, _, value_head_dim, _) = value_cache.dims4()?;
+        let head_dim = head_dim_chunks
+            .checked_mul(key_pack)
+            .ok_or_else(|| anyhow::anyhow!("head_dim overflow reconstructing paged prefill"))?;
+        if value_head_dim != head_dim {
+            bail!(
+                "paged cache key/value head_dim mismatch: key={} value={}",
+                head_dim,
+                value_head_dim
+            );
+        }
+
+        let mut row_keys = Vec::with_capacity(state.batch);
+        let mut row_values = Vec::with_capacity(state.batch);
+        for row in 0..state.batch {
+            let prompt_len = *state
+                .prompt_lens_usize
+                .get(row)
+                .ok_or_else(|| anyhow::anyhow!("missing prompt_len for row {row}"))?;
+            let num_blocks = prompt_len.div_ceil(block_size);
+            let block_table = state
+                .block_tables
+                .get(row)
+                .ok_or_else(|| anyhow::anyhow!("missing block table for row {row}"))?;
+            if block_table.len() < num_blocks {
+                bail!(
+                    "paged block table too short for row {row}: have={} need={num_blocks}",
+                    block_table.len()
+                );
+            }
+
+            let mut key_blocks = Vec::with_capacity(num_blocks);
+            let mut value_blocks = Vec::with_capacity(num_blocks);
+            for &block_id in &block_table[..num_blocks] {
+                key_blocks.push(key_cache.narrow(0, block_id, 1)?);
+                value_blocks.push(value_cache.narrow(0, block_id, 1)?);
+            }
+            let key_block_refs = key_blocks.iter().collect::<Vec<_>>();
+            let value_block_refs = value_blocks.iter().collect::<Vec<_>>();
+            let key_blocks = Tensor::cat(key_block_refs.as_slice(), 0)?;
+            let value_blocks = Tensor::cat(value_block_refs.as_slice(), 0)?;
+
+            let key_row = key_blocks
+                .transpose(0, 1)?
+                .transpose(2, 3)?
+                .reshape((num_kv_heads, num_blocks * block_size, head_dim))?
+                .narrow(1, 0, prompt_len)?
+                .unsqueeze(0)?;
+            let value_row = value_blocks
+                .transpose(0, 1)?
+                .transpose(2, 3)?
+                .reshape((num_kv_heads, num_blocks * block_size, head_dim))?
+                .narrow(1, 0, prompt_len)?
+                .unsqueeze(0)?;
+
+            let pad_len = seq_len.saturating_sub(prompt_len);
+            let key_row = if pad_len > 0 {
+                let key_pad =
+                    Tensor::zeros((1usize, num_kv_heads, pad_len, head_dim), key_row.dtype(), key_row.device())?;
+                Tensor::cat(&[&key_row, &key_pad], 2)?
+            } else {
+                key_row
+            };
+            let value_row = if pad_len > 0 {
+                let value_pad = Tensor::zeros(
+                    (1usize, num_kv_heads, pad_len, head_dim),
+                    value_row.dtype(),
+                    value_row.device(),
+                )?;
+                Tensor::cat(&[&value_row, &value_pad], 2)?
+            } else {
+                value_row
+            };
+
+            row_keys.push(key_row);
+            row_values.push(value_row);
+        }
+
+        let key_refs = row_keys.iter().collect::<Vec<_>>();
+        let value_refs = row_values.iter().collect::<Vec<_>>();
+        let keys = Tensor::cat(key_refs.as_slice(), 0)?;
+        let values = Tensor::cat(value_refs.as_slice(), 0)?;
+        let _ = kv_cache.update(layer_idx, &keys, &values)?;
+    }
+    Ok(kv_cache)
 }
 
 pub(crate) fn argmax_token_ids_from_logits(logits: &Tensor, batch: usize) -> Result<Vec<u32>> {
@@ -661,72 +842,269 @@ fn greedy_generate_cached_batch_impl(
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
         t.prompt_len = seq_len;
+        t.prefill_tokens = t.prefill_tokens.saturating_add(seq_len);
     }
 
     // Prefill the cache with the full prompt (including audio features).
     #[cfg(feature = "timing")]
     let start_prefill = std::time::Instant::now();
-    let audio_placeholder_count = if opts.audio_features.is_some() {
-        count_audio_placeholders_batch(input_ids, thinker.audio_token_id())?
+    let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
+    #[cfg(feature = "timing")]
+    let mut prefill_token_count = 0usize;
+    let mut next_ids = None;
+    let mut force_masked_decode = false;
+    if metal_hybrid_paged_prefill_enabled(device, batch, opts.paged_runtime, opts.audio_features) {
+        use crate::model::paged_batch_engine::{
+            PagedBatchConfig, paged_batch_free_slots, paged_batch_prefill,
+        };
+
+        let mut runtime_guard = opts
+            .paged_runtime
+            .ok_or_else(|| anyhow::anyhow!("hybrid paged prefill requires a shared paged runtime"))?
+            .lock()
+            .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
+        let config = PagedBatchConfig::for_static_batch(opts.max_new_tokens, opts.eos_token_ids);
+        let state = paged_batch_prefill(
+            thinker,
+            device,
+            &mut runtime_guard,
+            input_ids,
+            attention_mask,
+            opts.audio_features,
+            &config,
+        )?;
+        let request_ids = state.request_ids.clone();
+        let rebuilt = rebuild_kv_cache_from_paged_prefill(
+            thinker,
+            &runtime_guard,
+            &state,
+            seq_len,
+            opts.max_new_tokens,
+        );
+        paged_batch_free_slots(&mut runtime_guard, request_ids.as_slice());
+        kv_cache = rebuilt?;
+        next_ids = Some(state.next_ids);
+        force_masked_decode = true;
+        #[cfg(feature = "timing")]
+        {
+            prefill_token_count = prompt_lens
+                .iter()
+                .map(|&len| usize::try_from(len).unwrap_or(0))
+                .sum();
+        }
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            let elapsed = duration_to_us(start_prefill.elapsed());
+            t.prefill_us = t.prefill_us.saturating_add(elapsed);
+            t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
+            t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_token_count);
+        }
+    }
+    let prefix_len = if opts.audio_features.is_some() {
+        common_audio_prefix_len(input_ids, attention_mask, thinker.audio_token_id())
     } else {
         0
     };
-    #[cfg(feature = "timing")]
-    let start_inputs = std::time::Instant::now();
-    let inputs_embeds = thinker.inputs_embeds_with_audio_features(
-        &input_ids_t,
-        opts.audio_features,
-        audio_placeholder_count,
-    )?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_inputs_us = t
-            .prefill_inputs_us
-            .saturating_add(duration_to_us(start_inputs.elapsed()));
-    }
-    #[cfg(feature = "timing")]
-    let start_rope = std::time::Instant::now();
-    let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_rope_us = t
-            .prefill_rope_us
-            .saturating_add(duration_to_us(start_rope.elapsed()));
-    }
-    #[cfg(feature = "timing")]
-    let start_forward = std::time::Instant::now();
-    let logits = {
-        let _linear_prefill_guard = set_linear_is_prefill(true);
-        thinker.forward_embeds_with_kv_cache(
-            &attention_mask_t,
-            &position_ids,
-            &inputs_embeds,
-            &mut kv_cache,
-        )?
-    };
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_forward_us = t
-            .prefill_forward_us
-            .saturating_add(duration_to_us(start_forward.elapsed()));
-    }
+    if next_ids.is_none() {
+        let prefix_ids = (prefix_len > 0).then(|| input_ids[0][..prefix_len].to_vec());
+        let mut used_cached_prefix = false;
+        let logits = if let Some(prefix_ids) = prefix_ids.as_ref() {
+        if let Some(prefix_cache) = cached_prefix_kv_template(prefix_ids.as_slice()) {
+            used_cached_prefix = true;
+        kv_cache = prefix_cache.replicate_batch(batch)?;
+        let rem_len = seq_len - prefix_len;
+        let mut rem_ids_flat = Vec::with_capacity(batch.saturating_mul(rem_len));
+        for row in input_ids {
+            rem_ids_flat.extend_from_slice(&row[prefix_len..]);
+        }
+        let rem_input_ids_t = Tensor::from_vec(rem_ids_flat, (batch, rem_len), device)?;
 
-    let prompt_lens = prompt_lens_from_attention_masks(attention_mask, seq_len)?;
-    let last_logits = gather_last_logits_for_prompt_lens(&logits, prompt_lens.as_slice())?;
-    let mut next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
-    #[cfg(feature = "timing")]
-    if let Some(t) = timings.as_mut() {
-        t.prefill_us = t
-            .prefill_us
-            .saturating_add(duration_to_us(start_prefill.elapsed()));
+        let rem_audio_placeholder_count = if opts.audio_features.is_some() {
+            count_audio_placeholders_batch(
+                &input_ids
+                    .iter()
+                    .map(|row| &row[prefix_len..])
+                    .collect::<Vec<_>>(),
+                thinker.audio_token_id(),
+            )?
+        } else {
+            0
+        };
+        #[cfg(feature = "timing")]
+        let start_inputs = std::time::Instant::now();
+        let rem_inputs_embeds = thinker.inputs_embeds_with_audio_features(
+            &rem_input_ids_t,
+            opts.audio_features,
+            rem_audio_placeholder_count,
+        )?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_inputs_us = t
+                .prefill_inputs_us
+                .saturating_add(duration_to_us(start_inputs.elapsed()));
+        }
+        #[cfg(feature = "timing")]
+        let start_rope = std::time::Instant::now();
+        let (full_position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
+        let rem_position_ids = full_position_ids.narrow(2, prefix_len, rem_len)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_rope_us = t
+                .prefill_rope_us
+                .saturating_add(duration_to_us(start_rope.elapsed()));
+        }
+        #[cfg(feature = "timing")]
+        let start_forward = std::time::Instant::now();
+        let logits = {
+            let _linear_prefill_guard = set_linear_is_prefill(true);
+            thinker.forward_embeds_with_kv_cache(
+                &attention_mask_t,
+                &rem_position_ids,
+                &rem_inputs_embeds,
+                &mut kv_cache,
+            )?
+        };
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_forward_us = t
+                .prefill_forward_us
+                .saturating_add(duration_to_us(start_forward.elapsed()));
+        }
+        logits
+        } else {
+            let audio_placeholder_count = count_audio_placeholders_batch(input_ids, thinker.audio_token_id())?;
+            #[cfg(feature = "timing")]
+            let start_inputs = std::time::Instant::now();
+            let inputs_embeds = thinker.inputs_embeds_with_audio_features(
+                &input_ids_t,
+                opts.audio_features,
+                audio_placeholder_count,
+            )?;
+            #[cfg(feature = "timing")]
+            if let Some(t) = timings.as_mut() {
+                t.prefill_inputs_us = t
+                    .prefill_inputs_us
+                    .saturating_add(duration_to_us(start_inputs.elapsed()));
+            }
+            #[cfg(feature = "timing")]
+            let start_rope = std::time::Instant::now();
+            let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
+            #[cfg(feature = "timing")]
+            if let Some(t) = timings.as_mut() {
+                t.prefill_rope_us = t
+                    .prefill_rope_us
+                    .saturating_add(duration_to_us(start_rope.elapsed()));
+            }
+            #[cfg(feature = "timing")]
+            let start_forward = std::time::Instant::now();
+            let logits = {
+                let _linear_prefill_guard = set_linear_is_prefill(true);
+                thinker.forward_embeds_with_kv_cache(
+                    &attention_mask_t,
+                    &position_ids,
+                    &inputs_embeds,
+                    &mut kv_cache,
+                )?
+            };
+            #[cfg(feature = "timing")]
+            if let Some(t) = timings.as_mut() {
+                t.prefill_forward_us = t
+                    .prefill_forward_us
+                    .saturating_add(duration_to_us(start_forward.elapsed()));
+            }
+            logits
+        }
+    } else {
+        let audio_placeholder_count = if opts.audio_features.is_some() {
+            count_audio_placeholders_batch(input_ids, thinker.audio_token_id())?
+        } else {
+            0
+        };
+        #[cfg(feature = "timing")]
+        let start_inputs = std::time::Instant::now();
+        let inputs_embeds = thinker.inputs_embeds_with_audio_features(
+            &input_ids_t,
+            opts.audio_features,
+            audio_placeholder_count,
+        )?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_inputs_us = t
+                .prefill_inputs_us
+                .saturating_add(duration_to_us(start_inputs.elapsed()));
+        }
+        #[cfg(feature = "timing")]
+        let start_rope = std::time::Instant::now();
+        let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_rope_us = t
+                .prefill_rope_us
+                .saturating_add(duration_to_us(start_rope.elapsed()));
+        }
+        #[cfg(feature = "timing")]
+        let start_forward = std::time::Instant::now();
+        let logits = {
+            let _linear_prefill_guard = set_linear_is_prefill(true);
+            thinker.forward_embeds_with_kv_cache(
+                &attention_mask_t,
+                &position_ids,
+                &inputs_embeds,
+                &mut kv_cache,
+            )?
+        };
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_forward_us = t
+                .prefill_forward_us
+                .saturating_add(duration_to_us(start_forward.elapsed()));
+        }
+        logits
+    };
+        if prefix_len > 0 && !used_cached_prefix {
+            if let Some(prefix_ids) = prefix_ids {
+                let prefix_cache = kv_cache.row0_prefix_template(prefix_len)?;
+                store_prefix_kv_template(prefix_ids, prefix_cache);
+            }
+        }
+        let effective_prefix_len = if used_cached_prefix { prefix_len } else { 0 };
+        let prefix_len_i64 = i64::try_from(effective_prefix_len).map_err(|_| {
+            anyhow::anyhow!("effective prefix_len overflows i64: {effective_prefix_len}")
+        })?;
+        let prefill_prompt_lens = if effective_prefix_len > 0 {
+            prompt_lens
+                .iter()
+                .map(|&len| len.saturating_sub(prefix_len_i64))
+                .collect::<Vec<_>>()
+        } else {
+            prompt_lens.clone()
+        };
+        #[cfg(feature = "timing")]
+        {
+            prefill_token_count = prefill_prompt_lens
+                .iter()
+                .map(|&len| usize::try_from(len).unwrap_or(0))
+                .sum();
+        }
+        let last_logits =
+            gather_last_logits_for_prompt_lens(&logits, prefill_prompt_lens.as_slice())?;
+        next_ids = Some(argmax_token_ids_from_logits(&last_logits, batch)?);
+        #[cfg(feature = "timing")]
+        if let Some(t) = timings.as_mut() {
+            t.prefill_us = t
+                .prefill_us
+                .saturating_add(duration_to_us(start_prefill.elapsed()));
+            t.prefill_tokens = t.prefill_tokens.saturating_add(prefill_token_count);
+        }
     }
+    let mut next_ids = next_ids.ok_or_else(|| anyhow::anyhow!("missing prefill next_ids"))?;
 
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); batch];
     let mut finished: Vec<bool> = next_ids
         .iter()
         .map(|id| opts.eos_token_ids.contains(id))
         .collect();
-    let dense_attention = attention_masks_are_dense(attention_mask);
+    let dense_attention = attention_masks_are_dense(attention_mask) && !force_masked_decode;
     let decode_position_ids =
         position_ids_for_decode_steps_batch(prompt_lens.as_slice(), opts.max_new_tokens, device)?;
     let ones_col = if dense_attention {
@@ -903,6 +1281,7 @@ fn greedy_generate_paged(
     #[cfg(feature = "timing")]
     if let Some(t) = timings.as_mut() {
         t.prompt_len = seq_len;
+        t.prefill_tokens = t.prefill_tokens.saturating_add(seq_len);
     }
     let input_ids_t = Tensor::from_vec(input_ids.to_vec(), (1usize, seq_len), device)?;
     let attention_mask_t = Tensor::from_vec(attention_mask.to_vec(), (1usize, seq_len), device)?;

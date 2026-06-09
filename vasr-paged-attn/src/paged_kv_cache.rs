@@ -2,7 +2,7 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
-use crate::flash::{FlashKMeta, FlashParams};
+use crate::flash::FlashParams;
 
 pub const PAD_SLOT_ID: i64 = -1;
 
@@ -30,6 +30,7 @@ pub struct PagedInputMetadata {
     pub prefill_causal_only: bool,
     pub query_lens: Option<Vec<usize>>,
     pub kv_lens: Option<Vec<usize>>,
+    pub prefill_flash_params: Option<FlashParams>,
     pub cu_seqlens_q: Option<Tensor>,
     pub cu_seqlens_kv: Option<Tensor>,
     pub max_query_len: Option<usize>,
@@ -37,15 +38,19 @@ pub struct PagedInputMetadata {
 }
 
 impl PagedInputMetadata {
+    pub fn prefill_flash_params(&self) -> Option<&FlashParams> {
+        self.prefill_flash_params.as_ref()
+    }
+
     pub fn flash_params(&self, causal: bool) -> Option<FlashParams> {
-        Some(FlashParams {
-            max_q: self.max_query_len?.try_into().ok()?,
-            cumulative_seqlens_q: self.cu_seqlens_q.clone(),
-            logical_k: FlashKMeta {
-                max: self.max_kv_len?.try_into().ok()?,
-                cumulative_seqlens: self.cu_seqlens_kv.clone(),
-            },
-            causal,
+        self.prefill_flash_params.clone().or_else(|| {
+            FlashParams::new_prefill(
+                self.max_query_len,
+                self.cu_seqlens_q.clone(),
+                self.max_kv_len,
+                self.cu_seqlens_kv.clone(),
+                causal,
+            )
         })
     }
 }
@@ -100,7 +105,13 @@ fn build_varlen_metadata(
     query_lens: Option<Vec<usize>>,
     kv_lens: Option<Vec<usize>>,
     device: &Device,
-) -> Result<(Option<Tensor>, Option<Tensor>, Option<usize>, Option<usize>)> {
+) -> Result<(
+    Option<FlashParams>,
+    Option<Tensor>,
+    Option<Tensor>,
+    Option<usize>,
+    Option<usize>,
+)> {
     let cu_seqlens_q = query_lens
         .as_ref()
         .map(|lens| cumulative_seqlens_from_lengths(lens.as_slice(), device))
@@ -115,7 +126,22 @@ fn build_varlen_metadata(
     let max_kv_len = kv_lens
         .as_ref()
         .map(|lens| lens.iter().copied().max().unwrap_or(0));
-    Ok((cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len))
+    let prefill_flash_params = FlashParams::new_prefill(
+        max_query_len,
+        cu_seqlens_q.clone(),
+        max_kv_len,
+        cu_seqlens_kv.clone(),
+        query_lens
+            .as_ref()
+            .is_some_and(|lens| lens.iter().any(|&len| len > 1)),
+    );
+    Ok((
+        prefill_flash_params,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        max_query_len,
+        max_kv_len,
+    ))
 }
 
 impl PagedKvCache {
@@ -418,7 +444,7 @@ impl PagedKvCache {
     ) -> Result<PagedInputMetadata> {
         let query_lens = Some(vec![len]);
         let kv_lens = Some(vec![context_len]);
-        let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
+        let (prefill_flash_params, cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
             build_varlen_metadata(query_lens.clone(), kv_lens.clone(), device)?;
         Ok(PagedInputMetadata {
             slot_mapping: self.slot_mapping_for_range(start, len, device)?,
@@ -430,6 +456,7 @@ impl PagedKvCache {
             prefill_causal_only: false,
             query_lens,
             kv_lens,
+            prefill_flash_params,
             cu_seqlens_q,
             cu_seqlens_kv,
             max_query_len,
@@ -495,7 +522,7 @@ impl PagedKvCache {
 
         let query_lens = Some(vec![len; batch]);
         let kv_lens = Some(context_lens.to_vec());
-        let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
+        let (prefill_flash_params, cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
             build_varlen_metadata(query_lens.clone(), kv_lens.clone(), device)?;
 
         Ok(PagedInputMetadata {
@@ -508,6 +535,7 @@ impl PagedKvCache {
             prefill_causal_only: false,
             query_lens,
             kv_lens,
+            prefill_flash_params,
             cu_seqlens_q,
             cu_seqlens_kv,
             max_query_len,
@@ -596,7 +624,7 @@ impl PagedKvCache {
 
         let query_lens = Some(vec![len; batch]);
         let kv_lens = Some(context_lens.to_vec());
-        let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
+        let (prefill_flash_params, cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
             build_varlen_metadata(query_lens.clone(), kv_lens.clone(), device)?;
 
         Ok(PagedInputMetadata {
@@ -609,6 +637,7 @@ impl PagedKvCache {
             prefill_causal_only: false,
             query_lens,
             kv_lens,
+            prefill_flash_params,
             cu_seqlens_q,
             cu_seqlens_kv,
             max_query_len,
@@ -714,7 +743,7 @@ impl PagedKvCache {
 
         let kv_lens = Some(query_lens.clone());
         let query_lens = Some(query_lens);
-        let (cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
+        let (prefill_flash_params, cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
             build_varlen_metadata(query_lens.clone(), kv_lens.clone(), device)?;
         let prefill_causal_only = query_lens
             .as_ref()
@@ -730,6 +759,7 @@ impl PagedKvCache {
             prefill_causal_only,
             query_lens,
             kv_lens,
+            prefill_flash_params,
             cu_seqlens_q,
             cu_seqlens_kv,
             max_query_len,
@@ -780,6 +810,7 @@ impl PagedKvCache {
                     prefill_causal_only: false,
                     query_lens: None,
                     kv_lens: None,
+                    prefill_flash_params: None,
                     cu_seqlens_q: None,
                     cu_seqlens_kv: None,
                     max_query_len: None,
@@ -882,6 +913,7 @@ impl PagedKvCache {
                     prefill_causal_only: false,
                     query_lens: None,
                     kv_lens: None,
+                    prefill_flash_params: None,
                     cu_seqlens_q: None,
                     cu_seqlens_kv: None,
                     max_query_len: None,

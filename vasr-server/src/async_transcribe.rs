@@ -1276,44 +1276,6 @@ mod tests {
     }
 
     #[test]
-    fn no_vad_jobs_are_transcribed_as_one_batch() -> Result<()> {
-        let asr = Arc::new(BatchRecordingAsr::default());
-        let pipeline = OfflinePipeline {
-            vad: None,
-            asr: asr.clone(),
-        };
-        let jobs = vec![
-            AsrJob {
-                index: 0,
-                prepared: VadPreparation::Disabled,
-                waveform: Waveform::new(vec![0.1; 160], 16_000),
-            },
-            AsrJob {
-                index: 1,
-                prepared: VadPreparation::Disabled,
-                waveform: Waveform::new(vec![0.2; 160], 16_000),
-            },
-            AsrJob {
-                index: 2,
-                prepared: VadPreparation::Disabled,
-                waveform: Waveform::new(vec![0.3; 160], 16_000),
-            },
-        ];
-
-        let outcomes = run_asr_jobs_batch(&pipeline, jobs, &AsrOptions::default());
-
-        assert_eq!(outcomes.len(), 3);
-        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
-        assert_eq!(
-            *asr.seen_batch_sizes
-                .lock()
-                .expect("seen batch sizes poisoned"),
-            vec![3]
-        );
-        Ok(())
-    }
-
-    #[test]
     fn vad_segments_from_multiple_jobs_are_transcribed_as_one_batch() -> Result<()> {
         let asr = Arc::new(BatchRecordingAsr::default());
         let pipeline = OfflinePipeline {

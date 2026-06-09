@@ -113,10 +113,6 @@ pub struct TranscribePipelineArgs {
     #[arg(long, env = "VASR_CHUNK_MAX_SEC")]
     pub chunk_max_sec: Option<f32>,
 
-    /// Disable VAD segmentation in offline transcribe.
-    #[arg(long, default_value_t = false)]
-    pub no_vad: bool,
-
     #[command(flatten)]
     pub vad: VadCliArgs,
 }
@@ -214,25 +210,16 @@ fn build_offline_pipeline(
     pipeline: &TranscribePipelineArgs,
     asr: Arc<dyn AsrModel>,
 ) -> Result<Arc<OfflinePipeline>> {
-    let offline_vad = if pipeline.no_vad {
-        tracing::info!(
-            target: "vasr_cli::serve",
-            "Offline FSMN VAD segmentation disabled."
-        );
-        None
-    } else {
-        let vad_load_start = Instant::now();
-        let vad = load_fsmn_vad(&pipeline.vad.vad_model)?;
-        tracing::info!(
-            target: "vasr_cli::serve",
-            "FSMN VAD loaded from `{}` in {:.3}s.",
-            vad.model_dir().display(),
-            vad_load_start.elapsed().as_secs_f64()
-        );
-        Some(Arc::new(vad) as Arc<dyn VadModel>)
-    };
+    let vad_load_start = Instant::now();
+    let vad = load_fsmn_vad(&pipeline.vad.vad_model)?;
+    tracing::info!(
+        target: "vasr_cli::serve",
+        "FSMN VAD loaded from `{}` in {:.3}s.",
+        vad.model_dir().display(),
+        vad_load_start.elapsed().as_secs_f64()
+    );
     Ok(Arc::new(OfflinePipeline {
-        vad: offline_vad,
+        vad: Some(Arc::new(vad) as Arc<dyn VadModel>),
         asr,
     }))
 }

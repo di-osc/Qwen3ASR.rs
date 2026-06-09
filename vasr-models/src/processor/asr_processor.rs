@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 use crate::audio::{input::AudioInput, normalize::normalize_audio_input};
 use crate::processor::{chat_template, feat_lengths, feature_extractor, tokenizer::Tokenizer};
@@ -175,13 +176,23 @@ impl AsrProcessor {
         #[cfg(feature = "timing")]
         let start_tokenize_expand = std::time::Instant::now();
         let mut input_ids: Vec<Vec<u32>> = Vec::with_capacity(items.len());
+        let mut prompt_token_cache: HashMap<&str, Vec<u32>> = HashMap::with_capacity(items.len());
 
         for ((prompt, _), f) in items.iter().zip(feats.iter()) {
             let n_frames = f.feature_attention_mask.iter().filter(|&&x| x != 0).count();
             let audio_out_len = feat_lengths::feat_extract_output_length(n_frames);
 
-            let base_ids = self.tokenizer.encode(prompt)?;
-            let ids = expand_audio_pad_ids_first(base_ids.as_slice(), audio_pad_id, audio_out_len);
+            let base_ids = if let Some(ids) = prompt_token_cache.get(prompt) {
+                ids.as_slice()
+            } else {
+                let ids = self.tokenizer.encode(prompt)?;
+                prompt_token_cache.insert(prompt, ids);
+                prompt_token_cache
+                    .get(prompt)
+                    .expect("inserted prompt token cache entry must exist")
+                    .as_slice()
+            };
+            let ids = expand_audio_pad_ids_first(base_ids, audio_pad_id, audio_out_len);
             input_ids.push(ids);
         }
         #[cfg(feature = "timing")]

@@ -205,6 +205,176 @@ fn use_varlen_paged_prepare(paged_runtime: Option<&SharedPagedCacheRuntime>) -> 
     paged_runtime.is_some() && crate::inference::batch_scheduler::continuous_paged_batch_enabled()
 }
 
+fn prepared_prompt_len(prepared: &PreparedInputs) -> usize {
+    prepared.attention_mask.iter().filter(|&&x| x != 0).count()
+}
+
+fn rebatch_prepared_inputs(
+    prepared: &[PreparedInputs],
+    pad_id: u32,
+    max_batch_size: usize,
+    _varlen_stack: bool,
+) -> Vec<Vec<(usize, PreparedInputs)>> {
+    if prepared.is_empty() {
+        return Vec::new();
+    }
+
+    let count_cap = if max_batch_size == 0 {
+        prepared.len().max(1)
+    } else {
+        max_batch_size
+    };
+
+    let mut order: Vec<(usize, usize)> = prepared
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| (idx, prepared_prompt_len(item)))
+        .collect();
+    order.sort_unstable_by_key(|(_, len)| *len);
+
+    let mut grouped: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut current: Vec<(usize, usize)> = Vec::new();
+    let mut current_min = 0usize;
+    let mut current_max = 0usize;
+
+    for (idx, len) in order {
+        let should_split = if current.is_empty() {
+            false
+        } else {
+            let next_max = current_max.max(len);
+            current.len() >= count_cap
+                || next_max > current_min.saturating_mul(4).div_ceil(3)
+                || next_max.saturating_sub(current_min) > 256
+        };
+        if should_split {
+            grouped.push(current);
+            current = Vec::new();
+            current_min = 0;
+            current_max = 0;
+        }
+        if current.is_empty() {
+            current_min = len;
+            current_max = len;
+        } else {
+            current_max = current_max.max(len);
+        }
+        current.push((idx, len));
+    }
+    if !current.is_empty() {
+        grouped.push(current);
+    }
+
+    grouped
+        .into_iter()
+        .map(|group| {
+            let group_max = group.iter().map(|(_, len)| *len).max().unwrap_or(0);
+            group
+                .into_iter()
+                .map(|(idx, len)| {
+                    let src = &prepared[idx];
+                    let mut item = PreparedInputs {
+                        input_ids: src.input_ids[..len].to_vec(),
+                        attention_mask: vec![1u32; len],
+                        input_features: src.input_features.clone(),
+                        feature_attention_mask: src.feature_attention_mask.clone(),
+                    };
+                    if len < group_max {
+                        item.input_ids
+                            .extend(std::iter::repeat_n(pad_id, group_max - len));
+                        item.attention_mask
+                            .extend(std::iter::repeat_n(0u32, group_max - len));
+                    }
+                    (idx, item)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[cfg(feature = "timing")]
+fn merge_generation_timings(dst: &mut TranscribeTimings, src: &GenerationTimings) {
+    dst.generation.prompt_tensors_us = dst
+        .generation
+        .prompt_tensors_us
+        .saturating_add(src.prompt_tensors_us);
+    dst.generation.prefill_us = dst.generation.prefill_us.saturating_add(src.prefill_us);
+    dst.generation.prefill_inputs_us = dst
+        .generation
+        .prefill_inputs_us
+        .saturating_add(src.prefill_inputs_us);
+    dst.generation.prefill_rope_us = dst
+        .generation
+        .prefill_rope_us
+        .saturating_add(src.prefill_rope_us);
+    dst.generation.prefill_metadata_us = dst
+        .generation
+        .prefill_metadata_us
+        .saturating_add(src.prefill_metadata_us);
+    dst.generation.prefill_mask_us = dst
+        .generation
+        .prefill_mask_us
+        .saturating_add(src.prefill_mask_us);
+    dst.generation.prefill_forward_us = dst
+        .generation
+        .prefill_forward_us
+        .saturating_add(src.prefill_forward_us);
+    dst.generation.prefill_gather_us = dst
+        .generation
+        .prefill_gather_us
+        .saturating_add(src.prefill_gather_us);
+    dst.generation.prefill_decode_setup_us = dst
+        .generation
+        .prefill_decode_setup_us
+        .saturating_add(src.prefill_decode_setup_us);
+    dst.generation.prefill_argmax_us = dst
+        .generation
+        .prefill_argmax_us
+        .saturating_add(src.prefill_argmax_us);
+    dst.generation.prefill_tokens = dst
+        .generation
+        .prefill_tokens
+        .saturating_add(src.prefill_tokens);
+    dst.generation.decode_us = dst.generation.decode_us.saturating_add(src.decode_us);
+    dst.generation.decode_token_tensor_us = dst
+        .generation
+        .decode_token_tensor_us
+        .saturating_add(src.decode_token_tensor_us);
+    dst.generation.decode_embed_us = dst
+        .generation
+        .decode_embed_us
+        .saturating_add(src.decode_embed_us);
+    dst.generation.decode_position_us = dst
+        .generation
+        .decode_position_us
+        .saturating_add(src.decode_position_us);
+    dst.generation.decode_metadata_us = dst
+        .generation
+        .decode_metadata_us
+        .saturating_add(src.decode_metadata_us);
+    dst.generation.decode_graph_replay_us = dst
+        .generation
+        .decode_graph_replay_us
+        .saturating_add(src.decode_graph_replay_us);
+    dst.generation.decode_forward_us = dst
+        .generation
+        .decode_forward_us
+        .saturating_add(src.decode_forward_us);
+    dst.generation.decode_pre_argmax_sync_us = dst
+        .generation
+        .decode_pre_argmax_sync_us
+        .saturating_add(src.decode_pre_argmax_sync_us);
+    dst.generation.decode_argmax_us = dst
+        .generation
+        .decode_argmax_us
+        .saturating_add(src.decode_argmax_us);
+    dst.generation.prompt_len = dst.generation.prompt_len.max(src.prompt_len);
+    dst.generation.steps = dst.generation.steps.saturating_add(src.steps);
+    dst.generation.tokens_generated = dst
+        .generation
+        .tokens_generated
+        .saturating_add(src.tokens_generated);
+}
+
 pub(crate) fn generate_raw_prepared_batch(
     thinker: &ThinkerForConditionalGeneration,
     processor: &AsrProcessor,
@@ -225,46 +395,62 @@ pub(crate) fn generate_raw_prepared_batch(
         max_new_tokens
     };
 
-    let ids_rows: Vec<&[u32]> = prepared.iter().map(|p| p.input_ids.as_slice()).collect();
-    let attn_rows: Vec<&[u32]> = prepared
-        .iter()
-        .map(|p| p.attention_mask.as_slice())
-        .collect();
-
     #[cfg(feature = "paged-attn")]
     let varlen_stack = use_varlen_paged_prepare(paged_runtime);
     #[cfg(not(feature = "paged-attn"))]
     let varlen_stack = false;
-    let (input_features, feature_lens) = if varlen_stack {
-        stack_features_varlen(prepared, device)?
-    } else {
-        stack_features(prepared, device)?
-    };
-
-    let audio_features =
-        thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
     let effective_max_batch = if max_batch_size == 0 {
         prepared.len().max(1)
     } else {
         max_batch_size
     };
-    #[cfg(feature = "paged-attn")]
-    let gen_ids = if let Some(runtime) = paged_runtime {
-        use crate::inference::batch_scheduler::run_paged_prepared_batch;
-        let pad_id = paged_token_pad_id(processor)?;
-        run_paged_prepared_batch(
-            thinker,
-            device,
-            runtime,
-            prepared,
-            &audio_features,
-            max_new_tokens,
-            eos_token_ids,
-            effective_max_batch,
-            pad_id,
-        )?
-    } else {
-        greedy_generate_cached_batch_with_paged_runtime(
+    let pad_id = paged_token_pad_id(processor)?;
+    let micro_batches =
+        rebatch_prepared_inputs(prepared, pad_id, effective_max_batch, varlen_stack);
+    let mut out: Vec<Option<String>> = vec![None; prepared.len()];
+
+    for batch in micro_batches {
+        let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let ids_rows: Vec<&[u32]> = batch_prepared.iter().map(|p| p.input_ids.as_slice()).collect();
+        let attn_rows: Vec<&[u32]> = batch_prepared
+            .iter()
+            .map(|p| p.attention_mask.as_slice())
+            .collect();
+        let (input_features, feature_lens) = if varlen_stack {
+            stack_features_varlen(batch_prepared.as_slice(), device)?
+        } else {
+            stack_features(batch_prepared.as_slice(), device)?
+        };
+        let audio_features =
+            thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+        #[cfg(feature = "paged-attn")]
+        let gen_ids = if let Some(runtime) = paged_runtime {
+            use crate::inference::batch_scheduler::run_paged_prepared_batch;
+            run_paged_prepared_batch(
+                thinker,
+                device,
+                runtime,
+                batch_prepared.as_slice(),
+                &audio_features,
+                max_new_tokens,
+                eos_token_ids,
+                batch_prepared.len(),
+                pad_id,
+            )?
+        } else {
+            greedy_generate_cached_batch_with_paged_runtime(
+                thinker,
+                device,
+                ids_rows.as_slice(),
+                attn_rows.as_slice(),
+                Some(&audio_features),
+                max_new_tokens,
+                eos_token_ids,
+                None,
+            )?
+        };
+        #[cfg(not(feature = "paged-attn"))]
+        let gen_ids = greedy_generate_cached_batch(
             thinker,
             device,
             ids_rows.as_slice(),
@@ -272,33 +458,24 @@ pub(crate) fn generate_raw_prepared_batch(
             Some(&audio_features),
             max_new_tokens,
             eos_token_ids,
-            None,
-        )?
-    };
-    #[cfg(not(feature = "paged-attn"))]
-    let gen_ids = greedy_generate_cached_batch(
-        thinker,
-        device,
-        ids_rows.as_slice(),
-        attn_rows.as_slice(),
-        Some(&audio_features),
-        max_new_tokens,
-        eos_token_ids,
-    )?;
+        )?;
 
-    if gen_ids.len() != prepared.len() {
-        bail!(
-            "internal error: generated batch size mismatch: expected={}, got={}",
-            prepared.len(),
-            gen_ids.len()
-        );
-    }
+        if gen_ids.len() != batch_prepared.len() {
+            bail!(
+                "internal error: generated micro-batch size mismatch: expected={}, got={}",
+                batch_prepared.len(),
+                gen_ids.len()
+            );
+        }
 
-    let mut out: Vec<String> = Vec::with_capacity(gen_ids.len());
-    for ids in gen_ids {
-        out.push(processor.tokenizer.decode(ids.as_slice())?);
+        for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
+            out[orig_idx] = Some(processor.tokenizer.decode(ids.as_slice())?);
+        }
     }
-    Ok(out)
+    out.into_iter()
+        .enumerate()
+        .map(|(i, text)| text.ok_or_else(|| anyhow::anyhow!("missing generated text {i}")))
+        .collect()
 }
 
 fn normalize_forced_language(lang: Option<String>) -> Result<Option<String>> {
@@ -663,38 +840,41 @@ fn generate_raw_prepared_batch_timed(
     } else {
         max_new_tokens
     };
-
-    let ids_rows: Vec<&[u32]> = prepared.iter().map(|p| p.input_ids.as_slice()).collect();
-    let attn_rows: Vec<&[u32]> = prepared
-        .iter()
-        .map(|p| p.attention_mask.as_slice())
-        .collect();
-
-    let start_stack = std::time::Instant::now();
     #[cfg(feature = "paged-attn")]
     let varlen_stack = use_varlen_paged_prepare(paged_runtime);
     #[cfg(not(feature = "paged-attn"))]
     let varlen_stack = false;
-    let (input_features, feature_lens) = if varlen_stack {
-        stack_features_varlen(prepared, device)?
-    } else {
-        stack_features(prepared, device)?
-    };
-    timings.stack_features_us = timings
-        .stack_features_us
-        .saturating_add(duration_to_us(start_stack.elapsed()));
+    let pad_id = paged_token_pad_id(processor)?;
+    let micro_batches = rebatch_prepared_inputs(prepared, pad_id, prepared.len(), varlen_stack);
+    let mut out: Vec<Option<String>> = vec![None; prepared.len()];
 
-    let start_audio = std::time::Instant::now();
-    let audio_features =
-        thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
-    timings.audio_encoder_us = timings
-        .audio_encoder_us
-        .saturating_add(duration_to_us(start_audio.elapsed()));
+    for batch in micro_batches {
+        let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
+        let ids_rows: Vec<&[u32]> = batch_prepared.iter().map(|p| p.input_ids.as_slice()).collect();
+        let attn_rows: Vec<&[u32]> = batch_prepared
+            .iter()
+            .map(|p| p.attention_mask.as_slice())
+            .collect();
 
-    #[cfg(feature = "paged-attn")]
-    let gen_ids = if use_varlen_paged_prepare(paged_runtime) {
-        // varlen paged path: wrap with timing via the timed generate function
-        let (ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
+        let start_stack = std::time::Instant::now();
+        let (input_features, feature_lens) = if varlen_stack {
+            stack_features_varlen(batch_prepared.as_slice(), device)?
+        } else {
+            stack_features(batch_prepared.as_slice(), device)?
+        };
+        timings.stack_features_us = timings
+            .stack_features_us
+            .saturating_add(duration_to_us(start_stack.elapsed()));
+
+        let start_audio = std::time::Instant::now();
+        let audio_features =
+            thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+        timings.audio_encoder_us = timings
+            .audio_encoder_us
+            .saturating_add(duration_to_us(start_audio.elapsed()));
+
+        #[cfg(feature = "paged-attn")]
+        let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
             thinker,
             device,
             ids_rows.as_slice(),
@@ -704,93 +884,8 @@ fn generate_raw_prepared_batch_timed(
             eos_token_ids,
             paged_runtime,
         )?;
-        timings.generation.prompt_tensors_us = timings
-            .generation
-            .prompt_tensors_us
-            .saturating_add(gen_timings.prompt_tensors_us);
-        timings.generation.prefill_us = timings
-            .generation
-            .prefill_us
-            .saturating_add(gen_timings.prefill_us);
-        timings.generation.prefill_inputs_us = timings
-            .generation
-            .prefill_inputs_us
-            .saturating_add(gen_timings.prefill_inputs_us);
-        timings.generation.prefill_rope_us = timings
-            .generation
-            .prefill_rope_us
-            .saturating_add(gen_timings.prefill_rope_us);
-        timings.generation.prefill_metadata_us = timings
-            .generation
-            .prefill_metadata_us
-            .saturating_add(gen_timings.prefill_metadata_us);
-        timings.generation.prefill_mask_us = timings
-            .generation
-            .prefill_mask_us
-            .saturating_add(gen_timings.prefill_mask_us);
-        timings.generation.prefill_forward_us = timings
-            .generation
-            .prefill_forward_us
-            .saturating_add(gen_timings.prefill_forward_us);
-        timings.generation.prefill_gather_us = timings
-            .generation
-            .prefill_gather_us
-            .saturating_add(gen_timings.prefill_gather_us);
-        timings.generation.prefill_decode_setup_us = timings
-            .generation
-            .prefill_decode_setup_us
-            .saturating_add(gen_timings.prefill_decode_setup_us);
-        timings.generation.prefill_argmax_us = timings
-            .generation
-            .prefill_argmax_us
-            .saturating_add(gen_timings.prefill_argmax_us);
-        timings.generation.decode_us = timings
-            .generation
-            .decode_us
-            .saturating_add(gen_timings.decode_us);
-        timings.generation.decode_token_tensor_us = timings
-            .generation
-            .decode_token_tensor_us
-            .saturating_add(gen_timings.decode_token_tensor_us);
-        timings.generation.decode_embed_us = timings
-            .generation
-            .decode_embed_us
-            .saturating_add(gen_timings.decode_embed_us);
-        timings.generation.decode_position_us = timings
-            .generation
-            .decode_position_us
-            .saturating_add(gen_timings.decode_position_us);
-        timings.generation.decode_metadata_us = timings
-            .generation
-            .decode_metadata_us
-            .saturating_add(gen_timings.decode_metadata_us);
-        timings.generation.decode_graph_replay_us = timings
-            .generation
-            .decode_graph_replay_us
-            .saturating_add(gen_timings.decode_graph_replay_us);
-        timings.generation.decode_forward_us = timings
-            .generation
-            .decode_forward_us
-            .saturating_add(gen_timings.decode_forward_us);
-        timings.generation.decode_pre_argmax_sync_us = timings
-            .generation
-            .decode_pre_argmax_sync_us
-            .saturating_add(gen_timings.decode_pre_argmax_sync_us);
-        timings.generation.decode_argmax_us = timings
-            .generation
-            .decode_argmax_us
-            .saturating_add(gen_timings.decode_argmax_us);
-        timings.generation.tokens_generated = timings
-            .generation
-            .tokens_generated
-            .saturating_add(gen_timings.tokens_generated);
-        timings.generation.steps = timings
-            .generation
-            .steps
-            .saturating_add(gen_timings.steps);
-        ids
-    } else {
-        let (ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
+        #[cfg(not(feature = "paged-attn"))]
+        let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed(
             thinker,
             device,
             ids_rows.as_slice(),
@@ -798,204 +893,31 @@ fn generate_raw_prepared_batch_timed(
             Some(&audio_features),
             max_new_tokens,
             eos_token_ids,
-            paged_runtime,
         )?;
-        timings.generation.prompt_tensors_us = timings
-            .generation
-            .prompt_tensors_us
-            .saturating_add(gen_timings.prompt_tensors_us);
-        timings.generation.prefill_us = timings
-            .generation
-            .prefill_us
-            .saturating_add(gen_timings.prefill_us);
-        timings.generation.prefill_inputs_us = timings
-            .generation
-            .prefill_inputs_us
-            .saturating_add(gen_timings.prefill_inputs_us);
-        timings.generation.prefill_rope_us = timings
-            .generation
-            .prefill_rope_us
-            .saturating_add(gen_timings.prefill_rope_us);
-        timings.generation.prefill_metadata_us = timings
-            .generation
-            .prefill_metadata_us
-            .saturating_add(gen_timings.prefill_metadata_us);
-        timings.generation.prefill_mask_us = timings
-            .generation
-            .prefill_mask_us
-            .saturating_add(gen_timings.prefill_mask_us);
-        timings.generation.prefill_forward_us = timings
-            .generation
-            .prefill_forward_us
-            .saturating_add(gen_timings.prefill_forward_us);
-        timings.generation.prefill_gather_us = timings
-            .generation
-            .prefill_gather_us
-            .saturating_add(gen_timings.prefill_gather_us);
-        timings.generation.prefill_decode_setup_us = timings
-            .generation
-            .prefill_decode_setup_us
-            .saturating_add(gen_timings.prefill_decode_setup_us);
-        timings.generation.prefill_argmax_us = timings
-            .generation
-            .prefill_argmax_us
-            .saturating_add(gen_timings.prefill_argmax_us);
-        timings.generation.decode_us = timings
-            .generation
-            .decode_us
-            .saturating_add(gen_timings.decode_us);
-        timings.generation.decode_token_tensor_us = timings
-            .generation
-            .decode_token_tensor_us
-            .saturating_add(gen_timings.decode_token_tensor_us);
-        timings.generation.decode_embed_us = timings
-            .generation
-            .decode_embed_us
-            .saturating_add(gen_timings.decode_embed_us);
-        timings.generation.decode_position_us = timings
-            .generation
-            .decode_position_us
-            .saturating_add(gen_timings.decode_position_us);
-        timings.generation.decode_metadata_us = timings
-            .generation
-            .decode_metadata_us
-            .saturating_add(gen_timings.decode_metadata_us);
-        timings.generation.decode_graph_replay_us = timings
-            .generation
-            .decode_graph_replay_us
-            .saturating_add(gen_timings.decode_graph_replay_us);
-        timings.generation.decode_forward_us = timings
-            .generation
-            .decode_forward_us
-            .saturating_add(gen_timings.decode_forward_us);
-        timings.generation.decode_pre_argmax_sync_us = timings
-            .generation
-            .decode_pre_argmax_sync_us
-            .saturating_add(gen_timings.decode_pre_argmax_sync_us);
-        timings.generation.decode_argmax_us = timings
-            .generation
-            .decode_argmax_us
-            .saturating_add(gen_timings.decode_argmax_us);
-        timings.generation.steps = timings.generation.steps.saturating_add(gen_timings.steps);
-        timings.generation.tokens_generated = timings
-            .generation
-            .tokens_generated
-            .saturating_add(gen_timings.tokens_generated);
-        ids
-    };
-    #[cfg(not(feature = "paged-attn"))]
-    let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed(
-        thinker,
-        device,
-        ids_rows.as_slice(),
-        attn_rows.as_slice(),
-        Some(&audio_features),
-        max_new_tokens,
-        eos_token_ids,
-    )?;
-    #[cfg(not(feature = "paged-attn"))]
-    {
-        timings.generation.prompt_tensors_us = timings
-            .generation
-            .prompt_tensors_us
-            .saturating_add(gen_timings.prompt_tensors_us);
-        timings.generation.prefill_us = timings
-            .generation
-            .prefill_us
-            .saturating_add(gen_timings.prefill_us);
-        timings.generation.prefill_inputs_us = timings
-            .generation
-            .prefill_inputs_us
-            .saturating_add(gen_timings.prefill_inputs_us);
-        timings.generation.prefill_rope_us = timings
-            .generation
-            .prefill_rope_us
-            .saturating_add(gen_timings.prefill_rope_us);
-        timings.generation.prefill_metadata_us = timings
-            .generation
-            .prefill_metadata_us
-            .saturating_add(gen_timings.prefill_metadata_us);
-        timings.generation.prefill_mask_us = timings
-            .generation
-            .prefill_mask_us
-            .saturating_add(gen_timings.prefill_mask_us);
-        timings.generation.prefill_forward_us = timings
-            .generation
-            .prefill_forward_us
-            .saturating_add(gen_timings.prefill_forward_us);
-        timings.generation.prefill_gather_us = timings
-            .generation
-            .prefill_gather_us
-            .saturating_add(gen_timings.prefill_gather_us);
-        timings.generation.prefill_decode_setup_us = timings
-            .generation
-            .prefill_decode_setup_us
-            .saturating_add(gen_timings.prefill_decode_setup_us);
-        timings.generation.prefill_argmax_us = timings
-            .generation
-            .prefill_argmax_us
-            .saturating_add(gen_timings.prefill_argmax_us);
-        timings.generation.decode_us = timings
-            .generation
-            .decode_us
-            .saturating_add(gen_timings.decode_us);
-        timings.generation.decode_token_tensor_us = timings
-            .generation
-            .decode_token_tensor_us
-            .saturating_add(gen_timings.decode_token_tensor_us);
-        timings.generation.decode_embed_us = timings
-            .generation
-            .decode_embed_us
-            .saturating_add(gen_timings.decode_embed_us);
-        timings.generation.decode_position_us = timings
-            .generation
-            .decode_position_us
-            .saturating_add(gen_timings.decode_position_us);
-        timings.generation.decode_metadata_us = timings
-            .generation
-            .decode_metadata_us
-            .saturating_add(gen_timings.decode_metadata_us);
-        timings.generation.decode_graph_replay_us = timings
-            .generation
-            .decode_graph_replay_us
-            .saturating_add(gen_timings.decode_graph_replay_us);
-        timings.generation.decode_forward_us = timings
-            .generation
-            .decode_forward_us
-            .saturating_add(gen_timings.decode_forward_us);
-        timings.generation.decode_pre_argmax_sync_us = timings
-            .generation
-            .decode_pre_argmax_sync_us
-            .saturating_add(gen_timings.decode_pre_argmax_sync_us);
-        timings.generation.decode_argmax_us = timings
-            .generation
-            .decode_argmax_us
-            .saturating_add(gen_timings.decode_argmax_us);
-        timings.generation.prompt_len = timings.generation.prompt_len.max(gen_timings.prompt_len);
-        timings.generation.steps = timings.generation.steps.saturating_add(gen_timings.steps);
-        timings.generation.tokens_generated = timings
-            .generation
-            .tokens_generated
-            .saturating_add(gen_timings.tokens_generated);
+
+        merge_generation_timings(timings, &gen_timings);
+
+        if gen_ids.len() != batch_prepared.len() {
+            bail!(
+                "internal error: generated micro-batch size mismatch: expected={}, got={}",
+                batch_prepared.len(),
+                gen_ids.len()
+            );
+        }
+
+        let start_decode = std::time::Instant::now();
+        for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
+            out[orig_idx] = Some(processor.tokenizer.decode(ids.as_slice())?);
+        }
+        timings.tokenizer_decode_us = timings
+            .tokenizer_decode_us
+            .saturating_add(duration_to_us(start_decode.elapsed()));
     }
 
-    if gen_ids.len() != prepared.len() {
-        bail!(
-            "internal error: generated batch size mismatch: expected={}, got={}",
-            prepared.len(),
-            gen_ids.len()
-        );
-    }
-
-    let start_decode = std::time::Instant::now();
-    let mut out: Vec<String> = Vec::with_capacity(gen_ids.len());
-    for ids in gen_ids {
-        out.push(processor.tokenizer.decode(ids.as_slice())?);
-    }
-    timings.tokenizer_decode_us = timings
-        .tokenizer_decode_us
-        .saturating_add(duration_to_us(start_decode.elapsed()));
-    Ok(out)
+    out.into_iter()
+        .enumerate()
+        .map(|(i, text)| text.ok_or_else(|| anyhow::anyhow!("missing generated text {i}")))
+        .collect()
 }
 
 #[cfg(feature = "timing")]

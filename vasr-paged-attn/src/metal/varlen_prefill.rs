@@ -49,6 +49,70 @@ pub fn pack_query_for_varlen_prefill(q: &Tensor, query_lens: &[usize]) -> Result
     Tensor::cat(chunks.as_slice(), 0)
 }
 
+fn cumulative_seqlens_from_lengths(lengths: &[usize], device: &Device) -> Result<Tensor> {
+    let mut out = Vec::with_capacity(lengths.len().saturating_add(1));
+    out.push(0u32);
+    let mut total = 0u32;
+    for &len in lengths {
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            candle_core::Error::Msg(format!("sequence length overflows u32: {len}"))
+        })?;
+        total = total.checked_add(len_u32).ok_or_else(|| {
+            candle_core::Error::Msg("cumulative sequence length overflow".to_string())
+        })?;
+        out.push(total);
+    }
+    Tensor::from_vec(out, (lengths.len() + 1,), device)
+}
+
+pub fn pack_kv_for_varlen_prefill(
+    k: &Tensor,
+    v: &Tensor,
+    query_lens: &[usize],
+) -> Result<(Tensor, Tensor)> {
+    let (batch, num_kv_heads, seq_len, head_dim) = k.dims4()?;
+    let (v_batch, v_num_kv_heads, v_seq_len, v_head_dim) = v.dims4()?;
+    if query_lens.len() != batch
+        || v_batch != batch
+        || v_num_kv_heads != num_kv_heads
+        || v_seq_len != seq_len
+        || v_head_dim != head_dim
+    {
+        candle_core::bail!(
+            "packed kv shape mismatch: k={:?} v={:?} query_lens={}",
+            k.shape(),
+            v.shape(),
+            query_lens.len()
+        );
+    }
+    let mut k_chunks = Vec::with_capacity(batch);
+    let mut v_chunks = Vec::with_capacity(batch);
+    for (row, &len) in query_lens.iter().enumerate() {
+        if len > seq_len {
+            candle_core::bail!("query_len exceeds padded seq_len: len={len} seq_len={seq_len}");
+        }
+        if len == 0 {
+            candle_core::bail!("query_len must be non-zero for row {row}");
+        }
+        k_chunks.push(
+            k.narrow(0, row, 1)?
+                .narrow(2, 0, len)?
+                .transpose(1, 2)?
+                .reshape((len, num_kv_heads, head_dim))?,
+        );
+        v_chunks.push(
+            v.narrow(0, row, 1)?
+                .narrow(2, 0, len)?
+                .transpose(1, 2)?
+                .reshape((len, num_kv_heads, head_dim))?,
+        );
+    }
+    Ok((
+        Tensor::cat(k_chunks.as_slice(), 0)?,
+        Tensor::cat(v_chunks.as_slice(), 0)?,
+    ))
+}
+
 pub fn unpack_varlen_attn_to_batched(
     attn: &Tensor,
     query_lens: &[usize],
@@ -89,6 +153,117 @@ pub fn unpack_varlen_attn_to_batched(
         offset += len;
     }
     Tensor::cat(rows.as_slice(), 0)
+}
+
+pub fn dense_attention_varlen_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    query_lens: &[usize],
+    scale: f32,
+    softcapping: f32,
+    block_size: usize,
+) -> Result<Tensor> {
+    if !q.device().is_metal() {
+        candle_core::bail!("metal dense varlen prefill requires a Metal device");
+    }
+    let (batch, num_q_heads, seq_len, head_dim) = q.dims4()?;
+    if query_lens.len() != batch {
+        candle_core::bail!(
+            "query_lens batch mismatch: expected={batch}, got={}",
+            query_lens.len()
+        );
+    }
+    if !supports_metal_varlen_prefill(q.device(), head_dim, block_size) {
+        candle_core::bail!(
+            "unsupported metal dense varlen prefill configuration: head_dim={head_dim} block_size={block_size}"
+        );
+    }
+
+    let q_packed = pack_query_for_varlen_prefill(q, query_lens)?;
+    let (k_packed, v_packed) = pack_kv_for_varlen_prefill(k, v, query_lens)?;
+    let cu_seqlens_q = cumulative_seqlens_from_lengths(query_lens, q.device())?;
+    let seq_lens = Tensor::from_vec(
+        query_lens
+            .iter()
+            .map(|&len| {
+                u32::try_from(len).map_err(|_| {
+                    candle_core::Error::Msg(format!("sequence length overflows u32: {len}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        (batch,),
+        q.device(),
+    )?;
+
+    let ty = VarlenPrefillDType::from_candle(q.dtype())
+        .map_err(|e| candle_core::Error::Msg(format!("dense varlen prefill dtype: {e:?}")))?;
+    let dev = q.device().as_metal_device()?;
+
+    let (q_s, q_l) = q_packed.storage_and_layout();
+    let Storage::Metal(q_s) = &*q_s else {
+        candle_core::bail!("query must be a metal tensor");
+    };
+    let (k_s, k_l) = k_packed.storage_and_layout();
+    let Storage::Metal(k_s) = &*k_s else {
+        candle_core::bail!("key must be a metal tensor");
+    };
+    let (v_s, v_l) = v_packed.storage_and_layout();
+    let Storage::Metal(v_s) = &*v_s else {
+        candle_core::bail!("value must be a metal tensor");
+    };
+    let (seq_s, seq_l) = seq_lens.storage_and_layout();
+    let Storage::Metal(seq_s) = &*seq_s else {
+        candle_core::bail!("seq_lens must be a metal tensor");
+    };
+    let (cu_s, cu_l) = cu_seqlens_q.storage_and_layout();
+    let Storage::Metal(cu_s) = &*cu_s else {
+        candle_core::bail!("cu_seqlens_q must be a metal tensor");
+    };
+
+    let encoder = dev.command_encoder()?;
+    encoder.set_label("vasr-dense-varlen-prefill");
+    let elem_count = q_packed.elem_count();
+    let out_buf = dev.new_buffer(elem_count, q.dtype(), "vasr-dense-varlen-prefill-out")?;
+
+    kernels::call_dense_varlen_prefill(
+        dev.device(),
+        &encoder,
+        kernels(),
+        ty,
+        &out_buf,
+        q_s.buffer(),
+        q_l.start_offset() * q.dtype().size_in_bytes(),
+        k_s.buffer(),
+        k_l.start_offset() * k.dtype().size_in_bytes(),
+        v_s.buffer(),
+        v_l.start_offset() * v.dtype().size_in_bytes(),
+        seq_s.buffer(),
+        seq_l.start_offset() * seq_lens.dtype().size_in_bytes(),
+        cu_s.buffer(),
+        cu_l.start_offset() * cu_seqlens_q.dtype().size_in_bytes(),
+        k.dim(1)? as i32,
+        scale,
+        batch as i32,
+        num_q_heads as i32,
+        q_packed.dim(0)? as i32,
+        head_dim as i32,
+        block_size as i32,
+        softcapping,
+        q_l.stride()[0] as i32,
+    )
+    .map_err(|e| candle_core::Error::Msg(format!("vasr dense varlen prefill kernel: {e}")))?;
+
+    let packed_out = Tensor::from((
+        Storage::Metal(MetalStorage::new(
+            out_buf,
+            dev.clone(),
+            elem_count,
+            q.dtype(),
+        )),
+        q_l.shape().clone(),
+    ));
+    unpack_varlen_attn_to_batched(&packed_out, query_lens, batch, seq_len)
 }
 
 fn resolve_fp8_scales(
