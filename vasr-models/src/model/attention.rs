@@ -176,6 +176,70 @@ fn sequence_lengths_from_cu(cu: &Tensor) -> Result<Vec<usize>> {
         .collect())
 }
 
+fn cumulative_seqlens_from_lengths(lengths: &[usize], device: &Device) -> Result<Tensor> {
+    let mut out = Vec::with_capacity(lengths.len().saturating_add(1));
+    out.push(0u32);
+    let mut total = 0u32;
+    for &len in lengths {
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            candle_core::Error::Msg(format!("sequence length overflows u32: {len}"))
+        })?;
+        total = total.checked_add(len_u32).ok_or_else(|| {
+            candle_core::Error::Msg("cumulative sequence length overflow".to_string())
+        })?;
+        out.push(total);
+    }
+    Tensor::from_vec(out, (lengths.len() + 1,), device)
+}
+
+pub fn make_flash_params(
+    query_lens: &[usize],
+    kv_lens: &[usize],
+    device: &Device,
+    causal: bool,
+) -> Result<Option<FlashParams>> {
+    let cu_seqlens_q = cumulative_seqlens_from_lengths(query_lens, device)?;
+    let cu_seqlens_kv = cumulative_seqlens_from_lengths(kv_lens, device)?;
+    let max_query_len = query_lens.iter().copied().max();
+    let max_kv_len = kv_lens.iter().copied().max();
+    Ok(FlashParams::new_prefill(
+        max_query_len,
+        Some(cu_seqlens_q),
+        max_kv_len,
+        Some(cu_seqlens_kv),
+        causal,
+    ))
+}
+
+fn attention_is_causal(flash_params: Option<&FlashParams>, causal_default: bool) -> bool {
+    flash_params.map_or(causal_default, |params| params.causal)
+}
+
+fn can_try_flash_attention(q: &Tensor, mask: &AttentionMask) -> bool {
+    !matches!(mask, AttentionMask::Custom(_))
+        && (q.device().is_cuda() || q.device().is_cpu() && cfg!(feature = "flash-attn"))
+}
+
+fn prepare_sdpa_mask(
+    q: &Tensor,
+    k: &Tensor,
+    mask: &AttentionMask,
+    causal: bool,
+) -> Result<Option<Tensor>> {
+    match mask {
+        AttentionMask::None => Ok(None),
+        AttentionMask::Custom(mask) => {
+            // For pure causal prefill (q_len == k_len) on Metal, let the backend
+            // use its internal causal kernel instead of materializing an explicit mask.
+            if q.device().is_metal() && causal && q.dim(2)? == k.dim(2)? {
+                Ok(None)
+            } else {
+                Ok(Some(mask.clone()))
+            }
+        }
+    }
+}
+
 fn run_single_sequence_attention(
     q: &Tensor,
     k: &Tensor,
@@ -219,6 +283,92 @@ fn run_single_sequence_attention(
     }
     let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
     attn_weights.matmul(&v)
+}
+
+#[cfg(feature = "metal-paged-attn")]
+fn metal_dense_varlen_prefill_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    flash_params: &FlashParams,
+    softmax_scale: f32,
+) -> Result<Option<Tensor>> {
+    if std::env::var_os("VASR_ENABLE_METAL_DENSE_VARLEN_PREFILL").is_none() {
+        return Ok(None);
+    }
+    let (batch, _num_heads, seq_len, head_dim) = q.dims4()?;
+    let (k_batch, num_kv_heads, k_seq_len, k_head_dim) = k.dims4()?;
+    let (v_batch, v_kv_heads, v_seq_len, v_head_dim) = v.dims4()?;
+    if !q.device().is_metal()
+        || batch <= 1
+        || seq_len <= 1
+        || batch != k_batch
+        || batch != v_batch
+        || seq_len != k_seq_len
+        || seq_len != v_seq_len
+        || head_dim != k_head_dim
+        || head_dim != v_head_dim
+        || num_kv_heads != v_kv_heads
+        || !flash_params.causal
+    {
+        return Ok(None);
+    }
+
+    const BLOCK_SIZE: usize = 32;
+    if !vasr_paged_attn::supports_metal_varlen_prefill(q.device(), head_dim, BLOCK_SIZE) {
+        return Ok(None);
+    }
+
+    let (Some(cu_q), Some(cu_k)) = (
+        flash_params.cumulative_seqlens_q.as_ref(),
+        flash_params.logical_k.cumulative_seqlens.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let query_lens = sequence_lengths_from_cu(cu_q)?;
+    let kv_lens = sequence_lengths_from_cu(cu_k)?;
+    if query_lens.len() != batch || kv_lens.len() != batch {
+        return Ok(None);
+    }
+    if query_lens
+        .iter()
+        .zip(kv_lens.iter())
+        .any(|(&q_len, &kv_len)| q_len == 0 || q_len != kv_len || q_len > seq_len)
+    {
+        return Ok(None);
+    }
+    if query_lens.iter().all(|&len| len == seq_len) {
+        return Ok(None);
+    }
+    let total_tokens = batch
+        .checked_mul(seq_len)
+        .ok_or_else(|| candle_core::Error::Msg("dense varlen token count overflow".into()))?;
+    let active_tokens: usize = query_lens.iter().sum();
+    let padded_tokens = total_tokens.saturating_sub(active_tokens);
+    if padded_tokens < BLOCK_SIZE || padded_tokens.saturating_mul(5) < active_tokens {
+        return Ok(None);
+    }
+    let out = vasr_paged_attn::dense_attention_varlen_prefill(
+        q,
+        k,
+        v,
+        query_lens.as_slice(),
+        softmax_scale,
+        1.0,
+        BLOCK_SIZE,
+    )?;
+    Ok(Some(out))
+}
+
+#[cfg(not(feature = "metal-paged-attn"))]
+fn metal_dense_varlen_prefill_attention(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _flash_params: &FlashParams,
+    _softmax_scale: f32,
+) -> Result<Option<Tensor>> {
+    Ok(None)
 }
 
 /// Packed varlen attention for gathered paged K/V: `(1, kv_heads, total_kv, dim)`.
@@ -486,10 +636,8 @@ pub fn run_attention(
     causal_default: bool,
     n_kv_groups: usize,
 ) -> Result<Tensor> {
-    let causal = flash_params.map_or(causal_default, |p| p.causal);
-    let can_try_flash = !matches!(mask, AttentionMask::Custom(_))
-        && (q.device().is_cuda() || q.device().is_cpu() && cfg!(feature = "flash-attn"));
-    if can_try_flash {
+    let causal = attention_is_causal(flash_params, causal_default);
+    if can_try_flash_attention(q, mask) {
         let q_t = q.transpose(1, 2)?;
         let k_t = k.transpose(1, 2)?;
         let v_t = v.transpose(1, 2)?;
@@ -505,6 +653,12 @@ pub fn run_attention(
         }
     }
 
+    if let Some(params) = flash_params {
+        if let Some(out) = metal_dense_varlen_prefill_attention(q, k, v, params, softmax_scale)? {
+            return Ok(out);
+        }
+    }
+
     if should_use_packed_varlen(q, k, flash_params) {
         if let Some(params) = flash_params {
             if let Some(out) =
@@ -515,24 +669,24 @@ pub fn run_attention(
         }
     }
 
-    let mask_tensor = match mask {
-        AttentionMask::None => None,
-        AttentionMask::Custom(mask) => {
-            // For pure causal prefill (q_len == k_len, no padding) on Metal,
-            // pass mask=None + causal=true so MPS SDPA uses the faster
-            // internal causal kernel instead of an explicit mask tensor.
-            if q.device().is_metal() && causal && q.dim(2)? == k.dim(2)? {
-                None
-            } else {
-                Some(mask)
-            }
-        }
-    };
-    if let Some(out) = accelerated_sdpa(q, k, v, mask_tensor, softmax_scale, causal)? {
+    run_attention_noflash(q, k, v, mask, softmax_scale, causal, n_kv_groups)
+}
+
+pub fn run_attention_noflash(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &AttentionMask,
+    softmax_scale: f32,
+    causal: bool,
+    n_kv_groups: usize,
+) -> Result<Tensor> {
+    let mask_tensor = prepare_sdpa_mask(q, k, mask, causal)?;
+    if let Some(out) = accelerated_sdpa(q, k, v, mask_tensor.as_ref(), softmax_scale, causal)? {
         return Ok(out);
     }
 
-    run_single_sequence_attention(q, k, v, mask_tensor, softmax_scale, causal, n_kv_groups)
+    run_single_sequence_attention(q, k, v, mask_tensor.as_ref(), softmax_scale, causal, n_kv_groups)
 }
 
 /// Narrow an attention mask to the trailing `kv_seq_len` key positions.

@@ -40,7 +40,6 @@ use candle_core::{DType, Device};
 #[cfg(feature = "flash-attn")]
 use candle_flash_attn::{flash_attn, flash_attn_varlen};
 
-#[cfg(feature = "paged-attn")]
 fn cache_input_is_packed(tensor: &Tensor) -> Result<bool> {
     if tensor.dims().len() != 3 {
         return Ok(false);
@@ -50,7 +49,6 @@ fn cache_input_is_packed(tensor: &Tensor) -> Result<bool> {
     Ok(stride[2] == 1 && stride[1] == head_size && stride[0] == heads * head_size)
 }
 
-#[cfg(feature = "paged-attn")]
 fn maybe_contiguous_for_accelerator(x: Tensor) -> Result<Tensor> {
     if x.device().is_metal() || x.device().is_cuda() {
         if cache_input_is_packed(&x)? {
@@ -163,6 +161,11 @@ fn paged_prefill_attention_mask(
 }
 
 #[cfg(feature = "paged-attn")]
+fn metal_hybrid_paged_prefill_enabled() -> bool {
+    std::env::var_os("VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID").is_some()
+}
+
+#[cfg(feature = "paged-attn")]
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
 fn run_paged_prefill_attention_fallback(
@@ -201,8 +204,9 @@ fn run_paged_prefill_attention_fallback(
         q.dtype(),
         q.device(),
     )?;
-    let flash_params = input_metadata.flash_params(seq_len > 1);
-    if attention::supports_packed_varlen_sdpa(q) {
+    let flash_params = input_metadata.prefill_flash_params();
+    let avoid_packed_varlen = q.device().is_metal() && metal_hybrid_paged_prefill_enabled();
+    if !avoid_packed_varlen && attention::supports_packed_varlen_sdpa(q) {
         let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
         let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
         attention::run_attention(
@@ -210,7 +214,7 @@ fn run_paged_prefill_attention_fallback(
             &k_4d,
             &v_4d,
             &mask,
-            flash_params.as_ref(),
+            flash_params,
             scaling,
             true,
             num_key_value_groups,
@@ -237,7 +241,7 @@ fn run_paged_prefill_attention_fallback(
             &k,
             &v,
             &mask,
-            flash_params.as_ref(),
+            flash_params,
             scaling,
             true,
             num_key_value_groups,
@@ -728,12 +732,26 @@ impl ThinkerTextAttention {
             Some(mask) => attention::AttentionMask::Custom(mask.clone()),
             None => attention::AttentionMask::None,
         };
+        let flash_params = if seq_len > 1 {
+            let query_lens = vec![seq_len; batch];
+            attention::make_flash_params(
+                query_lens.as_slice(),
+                query_lens.as_slice(),
+                hidden_states.device(),
+                true,
+            )?
+        } else {
+            None
+        };
+        let q = maybe_contiguous_for_accelerator(q)?;
+        let k = maybe_contiguous_for_accelerator(k)?;
+        let v = maybe_contiguous_for_accelerator(v)?;
         let attn_output = attention::run_attention(
             &q,
             &k,
             &v,
             &mask,
-            None,
+            flash_params.as_ref(),
             self.scaling as f32,
             true,
             self.num_key_value_groups,
@@ -965,12 +983,28 @@ impl ThinkerTextAttention {
             Some(mask) => attention::AttentionMask::Custom(mask.clone()),
             None => attention::AttentionMask::None,
         };
+        let flash_params = if seq_len > 1 {
+            let cache_len = kv_cache.seq_len();
+            let query_lens = vec![seq_len; batch];
+            let kv_lens = vec![cache_len.saturating_add(seq_len); batch];
+            attention::make_flash_params(
+                query_lens.as_slice(),
+                kv_lens.as_slice(),
+                hidden_states.device(),
+                true,
+            )?
+        } else {
+            None
+        };
+        let q = maybe_contiguous_for_accelerator(q)?;
+        let k = maybe_contiguous_for_accelerator(k)?;
+        let v = maybe_contiguous_for_accelerator(v)?;
         let attn_output = attention::run_attention(
             &q,
             &k,
             &v,
             &mask,
-            None,
+            flash_params.as_ref(),
             self.scaling as f32,
             true,
             self.num_key_value_groups,
@@ -1112,7 +1146,8 @@ impl ThinkerTextAttention {
                 #[cfg(feature = "metal-paged-attn")]
                 {
                     let block_size = key_cache.dim(3)?;
-                    if vasr_paged_attn::supports_metal_varlen_prefill(
+                    if !metal_hybrid_paged_prefill_enabled()
+                        && vasr_paged_attn::supports_metal_varlen_prefill(
                         q.device(),
                         self.head_dim,
                         block_size,

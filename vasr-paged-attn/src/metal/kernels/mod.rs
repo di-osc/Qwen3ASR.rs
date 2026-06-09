@@ -281,3 +281,100 @@ pub fn call_varlen_prefill(
     );
     Ok(())
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_dense_varlen_prefill(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    ty: VarlenPrefillDType,
+    output: &Buffer,
+    q: &Buffer,
+    q_offset: usize,
+    k: &Buffer,
+    k_offset: usize,
+    v: &Buffer,
+    v_offset: usize,
+    seq_lens: &Buffer,
+    seq_lens_offset: usize,
+    query_start_len: &Buffer,
+    query_start_len_offset: usize,
+    num_kv_heads: i32,
+    scale: f32,
+    num_seqs: i32,
+    num_query_heads: i32,
+    num_query_tokens: i32,
+    head_size: i32,
+    block_size: i32,
+    softcapping: f32,
+    o_stride_tokens: i32,
+) -> Result<(), MetalKernelError> {
+    const TOKEN_CHUNK_SIZE: u64 = 64;
+    let name = format!(
+        "chunked_prefill_dense_{}_hs{head_size}_bs{block_size}_tcs{TOKEN_CHUNK_SIZE}",
+        ty.type_name(),
+    );
+
+    let pipeline = kernels.load_pipeline(device, name)?;
+    let encoder = ep.encoder();
+    let encoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_output_buffer(0, Some(output), 0);
+    encoder.set_input_buffer(1, Some(q), q_offset);
+    encoder.set_input_buffer(2, Some(k), k_offset);
+    encoder.set_input_buffer(3, Some(v), v_offset);
+    encoder.set_bytes_raw(
+        4,
+        core::mem::size_of_val(&num_kv_heads),
+        &num_kv_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes_raw(
+        5,
+        core::mem::size_of_val(&scale),
+        &scale as *const _ as *const c_void,
+    );
+    encoder.set_input_buffer(6, Some(seq_lens), seq_lens_offset);
+    encoder.set_bytes_raw(
+        7,
+        core::mem::size_of_val(&num_seqs),
+        &num_seqs as *const _ as *const c_void,
+    );
+    encoder.set_bytes_raw(
+        8,
+        core::mem::size_of_val(&num_query_heads),
+        &num_query_heads as *const _ as *const c_void,
+    );
+    encoder.set_bytes_raw(
+        9,
+        core::mem::size_of_val(&num_query_tokens),
+        &num_query_tokens as *const _ as *const c_void,
+    );
+    encoder.set_bytes_raw(
+        10,
+        core::mem::size_of_val(&softcapping),
+        &softcapping as *const _ as *const c_void,
+    );
+    encoder.set_bytes_raw(
+        11,
+        core::mem::size_of_val(&o_stride_tokens),
+        &o_stride_tokens as *const _ as *const c_void,
+    );
+    encoder.set_input_buffer(12, Some(query_start_len), query_start_len_offset);
+
+    let num_queries_per_kv = (num_query_heads / num_kv_heads) as u64;
+    let num_token_chunks = (num_query_tokens as u64).div_ceil(TOKEN_CHUNK_SIZE).max(1);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: num_queries_per_kv as usize,
+            height: num_kv_heads as usize,
+            depth: num_token_chunks as usize,
+        },
+        MTLSize {
+            width: TOKEN_CHUNK_SIZE as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
