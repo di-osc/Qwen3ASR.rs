@@ -5,9 +5,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use vasr_data::AudioSource;
-use vasr_protocol::{InferenceData, InferencePerformance, TranscribeResponse};
-use vasr_server::{TranscribeInput, TranscribeItemOutcome};
-
+use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
+use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 
 #[derive(Debug, Clone, Args)]
@@ -65,7 +64,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         .collect::<Vec<_>>();
 
     tracing::info!(
-        target: "vasr_cli::run",
+        target: "vasr_transcribe::run",
         "Transcribing {} audio file(s) from `{}`.",
         files.len(),
         args.input.display()
@@ -98,7 +97,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
             .with_context(|| format!("failed to write JSON to {}", output_path.display()))?;
 
         tracing::debug!(
-            target: "vasr_cli::run",
+            target: "vasr_transcribe::run",
             "Wrote `{}`.",
             output_path.display()
         );
@@ -107,7 +106,7 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
     let speedup = total_audio_seconds / batch_wall.max(f64::EPSILON);
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
     tracing::info!(
-        target: "vasr_cli::run",
+        target: "vasr_transcribe::run",
         "Done: files={} bad={} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4}",
         files.len(),
         bad_count,

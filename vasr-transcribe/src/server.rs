@@ -3,10 +3,10 @@ use std::time::Instant;
 
 use axum::{Json, Router, routing::post};
 use vasr_data::AudioSource;
-use vasr_protocol::{InferenceData, InferencePerformance, TranscribeRequest, TranscribeResponse};
 use vasr_runtime::{AsrOptions, VadOptions};
 
-use crate::async_transcribe::{AsyncTranscribePipeline, TranscribeInput};
+use crate::pipeline::{AsyncTranscribePipeline, TranscribeInput};
+use crate::protocol::{InferenceData, InferencePerformance, TranscribeRequest, TranscribeResponse};
 
 pub struct TranscribeService {
     pub pipeline: Arc<AsyncTranscribePipeline>,

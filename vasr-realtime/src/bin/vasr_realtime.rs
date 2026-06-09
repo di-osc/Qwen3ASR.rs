@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use vasr_cli::{RealtimeArgs, init_logging, run_realtime};
+use vasr_realtime::{RealtimeArgs, init_logging, run_realtime};
 
 #[derive(Debug, Parser)]
 #[command(

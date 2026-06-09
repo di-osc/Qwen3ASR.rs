@@ -9,9 +9,8 @@ use serde::Serialize;
 use vasr_data::{
     AudioAsset, AudioSource, CerStats, VasrRecord, VasrRecordList, compute_cer, normalize_for_cer,
 };
-use vasr_protocol::InferencePerformance;
-use vasr_server::TranscribeInput;
-
+use crate::pipeline::TranscribeInput;
+use crate::protocol::InferencePerformance;
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 
 #[derive(Debug, Clone, Args)]
@@ -107,7 +106,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
     }
 
     tracing::info!(
-        target: "vasr_cli::benchmark",
+        target: "vasr_transcribe::benchmark",
         "Benchmarking {} record(s) from `{}`.",
         records.len(),
         args.input.display()
@@ -233,7 +232,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
         serde_json::to_writer_pretty(&file, &report)
             .with_context(|| format!("failed to write JSON to {}", output.display()))?;
         tracing::info!(
-            target: "vasr_cli::benchmark",
+            target: "vasr_transcribe::benchmark",
             "Wrote benchmark report to `{}`.",
             output.display()
         );
@@ -242,7 +241,7 @@ pub async fn run_benchmark(args: BenchmarkTranscribeArgs) -> Result<()> {
     let speedup = total_audio_seconds / batch_wall.max(f64::EPSILON);
     let rtf = batch_wall / total_audio_seconds.max(f64::EPSILON);
     tracing::info!(
-        target: "vasr_cli::benchmark",
+        target: "vasr_transcribe::benchmark",
         "Done: records={} evaluated={} failed={} skipped_empty_ref={} macro_cer={:.4} micro_cer={:.4} audio_seconds={:.3} wall_seconds={:.3} speedup={:.3} rtf={:.4}",
         report.summary.num_records,
         report.summary.num_evaluated,

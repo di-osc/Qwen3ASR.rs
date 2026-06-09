@@ -5042,28 +5042,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vasr-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "candle-core",
- "clap",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vasr-audio",
- "vasr-data",
- "vasr-models",
- "vasr-protocol",
- "vasr-runtime",
- "vasr-server",
-]
-
-[[package]]
 name = "vasr-data"
 version = "0.1.0"
 dependencies = [
@@ -5129,15 +5107,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vasr-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "vasr-data",
-]
-
-[[package]]
 name = "vasr-quant"
 version = "0.1.0"
 dependencies = [
@@ -5149,6 +5118,28 @@ dependencies = [
  "mistralrs-quant",
  "objc2-metal",
  "tracing",
+]
+
+[[package]]
+name = "vasr-realtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "candle-core",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "vasr-audio",
+ "vasr-data",
+ "vasr-models",
+ "vasr-runtime",
 ]
 
 [[package]]
@@ -5171,20 +5162,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "vasr-server"
+name = "vasr-transcribe"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
- "futures-util",
+ "candle-core",
+ "clap",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "vasr-audio",
  "vasr-data",
- "vasr-protocol",
+ "vasr-models",
  "vasr-runtime",
 ]
 

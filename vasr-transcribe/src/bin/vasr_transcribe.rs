@@ -1,9 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use vasr_cli::{
-    BenchmarkTranscribeArgs, ConvertFasrArgs, ExtractAudioArgs, RunTranscribeArgs,
-    ServeTranscribeArgs, init_logging, run_benchmark, run_convert_fasr, run_extract_audio,
-    run_local, run_transcribe,
+use vasr_transcribe::{
+    BenchmarkTranscribeArgs, ExtractAudioArgs, RunTranscribeArgs, ServeTranscribeArgs, init_logging,
+    run_benchmark, run_extract_audio, run_local, run_transcribe,
 };
 
 #[derive(Debug, Parser)]
@@ -29,8 +28,6 @@ enum Command {
     Run(RunTranscribeArgs),
     /// Benchmark ASR CER against a `VasrRecordList` MessagePack file.
     Benchmark(BenchmarkTranscribeArgs),
-    /// Convert a FASR `FASRAL01` AudioList binary file to `VasrRecordList` MessagePack.
-    ConvertFasr(ConvertFasrArgs),
     /// Extract embedded audio from a `VasrRecordList` MessagePack file.
     ExtractAudio(ExtractAudioArgs),
 }
@@ -43,7 +40,6 @@ async fn main() -> Result<()> {
         Command::Serve(args) => run_transcribe(args).await,
         Command::Run(args) => run_local(args).await,
         Command::Benchmark(args) => run_benchmark(args).await,
-        Command::ConvertFasr(args) => run_convert_fasr(args),
         Command::ExtractAudio(args) => run_extract_audio(args),
     }
 }

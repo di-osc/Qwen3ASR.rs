@@ -911,7 +911,6 @@ fn finish_segment_asr_batch(
                 inference.active_job_count,
                 segments.len(),
                 inference.segment_audio_seconds,
-                inference.original_audio_seconds,
                 stage_start.elapsed().as_secs_f64(),
             );
             if timelines.len() == inference.targets.len() {
@@ -1026,7 +1025,6 @@ fn run_asr_jobs_batch(
             indices.len(),
             waveforms.len(),
             total_audio_seconds,
-            total_audio_seconds,
             stage_start.elapsed().as_secs_f64(),
         );
         match result {
@@ -1130,12 +1128,9 @@ fn vad_preparation_stats(prepared: &VadPreparation) -> (usize, f64) {
 
 fn log_loader(index: usize, audio_seconds: f64, wall_seconds: f64) {
     let metrics = stage_metrics(audio_seconds, wall_seconds);
-    tracing::info!(
-        target: "vasr_server::async_transcribe",
-        "loader | job={} | audio={:.2}s | spent={:.2}s | speed={:.2}x | rtf={:.3}",
-        index,
-        audio_seconds,
-        wall_seconds,
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "loader | job={index} | audio={audio_seconds:.2}s | spent={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
         metrics.speedup,
         metrics.rtf
     );
@@ -1149,14 +1144,9 @@ fn log_vad(
     wall_seconds: f64,
 ) {
     let metrics = stage_metrics(audio_seconds, wall_seconds);
-    tracing::info!(
-        target: "vasr_server::async_transcribe",
-        "vad | job={} | audio={:.2}s | segments={} | speech={:.2}s | spent={:.2}s | speed={:.2}x | rtf={:.3}",
-        index,
-        audio_seconds,
-        segments,
-        speech_seconds,
-        wall_seconds,
+    tracing::debug!(
+        target: "vasr_transcribe::pipeline",
+        "vad | job={index} | audio={audio_seconds:.2}s | segments={segments} | speech={speech_seconds:.2}s | spent={wall_seconds:.2}s | speed={:.2}x | rtf={:.3}",
         metrics.speedup,
         metrics.rtf
     );
@@ -1164,24 +1154,15 @@ fn log_vad(
 
 fn log_asr(
     kind: &'static str,
-    batch_size: usize,
+    jobs: usize,
     segments: usize,
-    segment_audio_seconds: f64,
-    original_audio_seconds: f64,
-    wall_seconds: f64,
+    audio_s: f64,
+    wall_s: f64,
 ) {
-    let metrics = stage_metrics(segment_audio_seconds, wall_seconds);
+    let speedup = audio_s / wall_s.max(f64::EPSILON);
     tracing::info!(
-        target: "vasr_server::async_transcribe",
-        "asr | kind={} | batch={} | segments={} | segment_audio={:.2}s | original_audio={:.2}s | spent={:.2}s | speed={:.2}x | rtf={:.3}",
-        kind,
-        batch_size,
-        segments,
-        segment_audio_seconds,
-        original_audio_seconds,
-        wall_seconds,
-        metrics.speedup,
-        metrics.rtf
+        target: "vasr_transcribe::pipeline",
+        "asr | {kind} | jobs={jobs} segs={segments} | audio={audio_s:.1}s | wall={wall_s:.1}s | speed={speedup:.1}x"
     );
 }
 
@@ -1193,7 +1174,7 @@ fn log_pipeline(job_count: usize, outcomes: &[TranscribeItemOutcome], wall_secon
         .count();
     let metrics = stage_metrics(audio_seconds, wall_seconds);
     tracing::info!(
-        target: "vasr_server::async_transcribe",
+        target: "vasr_transcribe::pipeline",
         "pipeline | batch={} | returned={} | audio={:.2}s | spent={:.2}s | speed={:.2}x | rtf={:.3} | bad={}",
         job_count,
         outcomes.len(),

@@ -1,0 +1,37 @@
+[package]
+name = "vasr-realtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vasr-realtime"
+path = "src/bin/vasr_realtime.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["ansi", "env-filter", "fmt", "time"] }
+uuid = { version = "1", features = ["v4"] }
+vasr-audio = { path = "../vasr-audio" }
+vasr-data = { path = "../vasr-data" }
+vasr-models = { path = "../vasr-models" }
+vasr-runtime = { path = "../vasr-runtime", features = ["async"] }
+
+[features]
+default = []
+accelerate = ["vasr-runtime/accelerate"]
+cuda = ["vasr-runtime/cuda", "vasr-runtime/cuda-graph", "vasr-runtime/flash-attn", "vasr-runtime/cuda-quant", "vasr-runtime/timing"]
+metal = ["vasr-runtime/metal", "vasr-runtime/timing"]
+
+[lints]
+workspace = true

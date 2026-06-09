@@ -2,11 +2,10 @@
 members = [
   "vasr-models",
   "vasr-audio",
-  "vasr-cli",
   "vasr-data",
-  "vasr-protocol",
   "vasr-runtime",
-  "vasr-server",
+  "vasr-transcribe",
+  "vasr-realtime",
   "vasr-paged-attn",
   "vasr-quant",
 ]

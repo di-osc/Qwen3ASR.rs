@@ -393,12 +393,14 @@ fn rebuild_kv_cache_from_paged_prefill(
             let key_row = key_blocks
                 .transpose(0, 1)?
                 .transpose(2, 3)?
+                .contiguous()?
                 .reshape((num_kv_heads, num_blocks * block_size, head_dim))?
                 .narrow(1, 0, prompt_len)?
                 .unsqueeze(0)?;
             let value_row = value_blocks
                 .transpose(0, 1)?
                 .transpose(2, 3)?
+                .contiguous()?
                 .reshape((num_kv_heads, num_blocks * block_size, head_dim))?
                 .narrow(1, 0, prompt_len)?
                 .unsqueeze(0)?;
@@ -853,7 +855,12 @@ fn greedy_generate_cached_batch_impl(
     let mut prefill_token_count = 0usize;
     let mut next_ids = None;
     let mut force_masked_decode = false;
+    #[cfg(feature = "paged-attn")]
     if metal_hybrid_paged_prefill_enabled(device, batch, opts.paged_runtime, opts.audio_features) {
+        tracing::debug!(
+            target: "vasr_models::generation",
+            "hybrid-paged-prefill | batch={batch} seq_len={seq_len}"
+        );
         use crate::model::paged_batch_engine::{
             PagedBatchConfig, paged_batch_free_slots, paged_batch_prefill,
         };

@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use axum::{Json, Router, routing::get};
-use candle_core::{DType, Device};
+#[cfg(any(feature = "metal", feature = "cuda"))]
+use candle_core::Device;
 use clap::Args;
 use vasr_audio::AudioLoader;
 use vasr_models::qwen3_asr::LoadOptions;
@@ -14,27 +15,22 @@ use vasr_models::qwen3_asr::model::paged_cache_runtime::{
     PagedCacheConfig, PagedCacheMemory, PagedCacheStats,
 };
 use vasr_runtime::{
-    AsrModel, AsrOptions, FsmnVadModel, OfflinePipeline, Qwen3AsrModel, RealtimePipeline, VadModel,
-    VadOptions,
+    AsrModel, AsrOptions, FsmnVadModel, InferenceScheduler, OfflinePipeline, Qwen3AsrModel,
+    ScheduledAsrModel, VadModel, VadOptions, auto_dtype, device_label, resolve_device,
 };
-use vasr_server::{
-    AsyncTranscribePipeline, InferenceScheduler, RealtimeService, RealtimeSession,
-    ScheduledAsrModel, build_transcribe_service_from_parts,
-};
+
+use crate::pipeline::AsyncTranscribePipeline;
+use crate::server::build_transcribe_service_from_parts;
 
 #[derive(Debug, Clone, Args)]
 pub struct CommonModelArgs {
-    /// Qwen3-ASR model id or local model directory.
-    #[arg(long, env = "VASR_MODEL")]
+    /// Qwen3-ASR model: `Qwen/Qwen3-ASR-0.6B` or `Qwen/Qwen3-ASR-1.7B`, or a local directory.
+    #[arg(long, default_value = "Qwen/Qwen3-ASR-0.6B", env = "VASR_MODEL")]
     pub model: String,
 
     /// Device: auto, cpu, metal, cuda.
     #[arg(long, default_value = "auto", env = "VASR_DEVICE")]
     pub device: String,
-
-    /// Enable Qwen3-ASR flash attention where supported.
-    #[arg(long, default_value_t = false, env = "VASR_FLASH_ATTN")]
-    pub flash_attn: bool,
 
     /// Enable in-situ quantization, for example q8_0.
     #[arg(long, env = "VASR_ISQ")]
@@ -134,28 +130,11 @@ pub struct ServeTranscribeArgs {
 /// Backward-compatible alias for the HTTP serve entry point.
 pub type TranscribeArgs = ServeTranscribeArgs;
 
-#[derive(Debug, Clone, Args)]
-pub struct RealtimeArgs {
-    #[command(flatten)]
-    pub model: CommonModelArgs,
-
-    /// Bind host.
-    #[arg(long, default_value = "127.0.0.1", env = "VASR_HOST")]
-    pub host: String,
-
-    /// Bind port.
-    #[arg(long, default_value_t = 8000, env = "VASR_PORT")]
-    pub port: u16,
-
-    #[command(flatten)]
-    pub vad: VadCliArgs,
-}
-
 pub fn init_logging(verbose: bool) {
     let default = if verbose {
-        "warn,vasr_cli=info,vasr_runtime=info,vasr_server=info"
+        "warn,vasr_transcribe=info,vasr_runtime=info"
     } else {
-        "warn,vasr_cli=info"
+        "warn,vasr_transcribe=info"
     };
     let filter = std::env::var("VASR_LOG").unwrap_or_else(|_| default.to_string());
 
@@ -180,9 +159,9 @@ pub async fn run_transcribe(args: ServeTranscribeArgs) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .merge(vasr_server::transcribe_router(transcribe_service));
+        .merge(crate::server::transcribe_router(transcribe_service));
     let addr = bind_addr(&args.host, args.port)?;
-    serve_app(app, addr, "transcribe").await
+    serve_app(app, addr).await
 }
 
 pub fn build_async_transcribe_pipeline(
@@ -213,7 +192,7 @@ fn build_offline_pipeline(
     let vad_load_start = Instant::now();
     let vad = load_fsmn_vad(&pipeline.vad.vad_model)?;
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "FSMN VAD loaded from `{}` in {:.3}s.",
         vad.model_dir().display(),
         vad_load_start.elapsed().as_secs_f64()
@@ -250,39 +229,6 @@ fn vad_options_from_args(vad: &VadCliArgs) -> VadOptions {
 
 fn vad_options_from_pipeline(pipeline: &TranscribePipelineArgs) -> VadOptions {
     vad_options_from_args(&pipeline.vad)
-}
-
-pub async fn run_realtime(args: RealtimeArgs) -> Result<()> {
-    validate_model_args(&args.model)?;
-    validate_vad_args(&args.vad)?;
-    let asr = load_asr_model(&args.model, Some(1))?;
-
-    let realtime_asr = Arc::clone(&asr);
-    let max_new_tokens = args.model.max_new_tokens;
-    let vad_model = args.vad.vad_model.clone();
-    let vad_options = vad_options_from_args(&args.vad);
-    let realtime_service = Arc::new(RealtimeService {
-        make_session: Arc::new(move || {
-            let vad = load_fsmn_vad(&vad_model)?.start_stream(&vad_options)?;
-            let asr_stream = realtime_asr.start_stream(&AsrOptions {
-                max_new_tokens,
-                ..AsrOptions::default()
-            })?;
-            Ok(RealtimeSession::new(
-                16_000,
-                RealtimePipeline {
-                    vad,
-                    asr: asr_stream,
-                },
-            ))
-        }),
-    });
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(vasr_server::realtime_router(realtime_service));
-    let addr = bind_addr(&args.host, args.port)?;
-    serve_app(app, addr, "realtime").await
 }
 
 fn validate_model_args(args: &CommonModelArgs) -> Result<()> {
@@ -328,7 +274,7 @@ fn log_paged_cache_stats(stats: &PagedCacheStats, config: &PagedCacheConfig) {
         }
     };
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "PagedAttention KV cache: {sizing}, block_size={}, blocks={}, free_blocks={}, max_context_tokens={}, bytes={:.2} MiB.",
         stats.block_size,
         stats.num_blocks,
@@ -374,14 +320,14 @@ fn load_asr_model(
     )?;
     let load_options = LoadOptions {
         dtype,
-        use_flash_attn: args.flash_attn,
+        use_flash_attn: device.is_cuda(),
         isq: args.isq.clone(),
         #[cfg(any(feature = "metal", feature = "cuda"))]
         paged_cache: Some(paged_cache_config),
     };
 
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "avx: {}, neon: {}, simd128: {}, f16c: {}",
         cfg!(target_feature = "avx"),
         cfg!(target_feature = "neon"),
@@ -389,18 +335,18 @@ fn load_asr_model(
         cfg!(target_feature = "f16c")
     );
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "Model kind is: qwen3-asr (no adapters)"
     );
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "Auto-selected DType {:?} for {}.",
         dtype,
         device_label(&device)
     );
     if let Some(isq) = args.isq.as_deref() {
         tracing::info!(
-            target: "vasr_cli::serve",
+            target: "vasr_transcribe::serve",
             "ISQ selected is {} (requested={}, backend={}).",
             resolve_isq_display(isq, &device)?,
             isq,
@@ -408,11 +354,10 @@ fn load_asr_model(
         );
     }
     tracing::info!(
-        target: "vasr_cli::serve",
-        "Loading Qwen3-ASR model `{}` on {} (flash_attn={}, isq={:?}).",
+        target: "vasr_transcribe::serve",
+        "Loading Qwen3-ASR model `{}` on {} (isq={:?}).",
         args.model,
         device_label(&device),
-        args.flash_attn,
         args.isq
     );
     let model_load_start = Instant::now();
@@ -427,13 +372,13 @@ fn load_asr_model(
         let prewarm_start = Instant::now();
         let captured = qwen3_asr.inner().prewarm_cuda_decode_graphs(max_batch)?;
         tracing::info!(
-            target: "vasr_cli::serve",
+            target: "vasr_transcribe::serve",
             "CUDA decode graph prewarm: graphs={captured} max_batch={max_batch} elapsed={:.3}s.",
             prewarm_start.elapsed().as_secs_f64()
         );
     }
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "Model loaded in {:.3}s.",
         model_load_start.elapsed().as_secs_f64()
     );
@@ -450,22 +395,15 @@ fn bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
     Ok(format!("{host}:{port}").parse()?)
 }
 
-async fn serve_app(app: Router, addr: SocketAddr, service: &'static str) -> Result<()> {
+async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    match service {
-        "transcribe" => tracing::info!(
-            target: "vasr_cli::serve",
-            "HTTP endpoints: GET /health, POST /transcribe, POST /inference"
-        ),
-        "realtime" => tracing::info!(
-            target: "vasr_cli::serve",
-            "WebSocket endpoints: /v1/realtime, /api-ws/v1/realtime"
-        ),
-        _ => {}
-    }
     tracing::info!(
-        target: "vasr_cli::serve",
-        "vASR {service} service listening on http://{addr}"
+        target: "vasr_transcribe::serve",
+        "HTTP endpoints: GET /health, POST /transcribe, POST /inference"
+    );
+    tracing::info!(
+        target: "vasr_transcribe::serve",
+        "vASR transcribe service listening on http://{addr}"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -485,79 +423,12 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-fn resolve_device(value: &str) -> Result<Device> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => auto_device(),
-        "cpu" => Ok(Device::Cpu),
-        "metal" => {
-            #[cfg(feature = "metal")]
-            {
-                Device::new_metal(0)
-                    .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"))
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                bail!("metal requested but vasr was built without the metal feature")
-            }
-        }
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                Device::new_cuda(0)
-                    .map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"))
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                bail!("cuda requested but vasr was built without the cuda feature")
-            }
-        }
-        other => bail!("unknown device {other:?}; expected auto, cpu, metal, or cuda"),
-    }
-}
-
-fn auto_device() -> Result<Device> {
-    #[cfg(feature = "cuda")]
-    {
-        return Device::new_cuda(0)
-            .map_err(|err| anyhow::anyhow!("failed to create CUDA device 0: {err}"));
-    }
-    #[cfg(all(not(feature = "cuda"), feature = "metal"))]
-    {
-        return Device::new_metal(0)
-            .map_err(|err| anyhow::anyhow!("failed to create Metal device 0: {err}"));
-    }
-    #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
-    {
-        Ok(Device::Cpu)
-    }
-}
-
-fn auto_dtype(device: &Device) -> Result<DType> {
-    Ok(if device.is_cpu() {
-        DType::F32
-    } else {
-        DType::BF16
-    })
-}
-
-fn device_label(device: &Device) -> &'static str {
-    if device.is_cpu() {
-        "cpu"
-    } else if device.is_metal() {
-        "metal"
-    } else if device.is_cuda() {
-        "cuda"
-    } else {
-        "unknown"
-    }
-}
-
 fn log_model_config(model: &Qwen3AsrModel) {
     let config = model.inner().config();
     let text = &config.thinker_config.text_config;
     let audio = &config.thinker_config.audio_config;
     tracing::info!(
-        target: "vasr_cli::serve",
+        target: "vasr_transcribe::serve",
         "Model config: model_type={:?}, thinker_type={:?}, text_layers={}, hidden_size={}, kv_heads={}, audio_layers={}, audio_dim={}",
         config.model_type,
         config.thinker_config.model_type,

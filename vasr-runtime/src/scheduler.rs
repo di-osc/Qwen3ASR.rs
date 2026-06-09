@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+#[cfg(feature = "async")]
 use std::future::Future;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -8,9 +9,11 @@ use std::sync::{
 use std::thread;
 
 use anyhow::{Result, anyhow};
+#[cfg(feature = "async")]
 use tokio::sync::oneshot;
 use vasr_data::{Timeline, Waveform};
-use vasr_runtime::{AsrModel, AsrOptions, StreamingAsrModel};
+
+use crate::model::{AsrModel, AsrOptions, StreamingAsrModel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferencePriority {
@@ -60,6 +63,7 @@ impl InferenceScheduler {
         scheduler
     }
 
+    #[cfg(feature = "async")]
     pub fn submit<T, F>(
         &self,
         label: impl Into<String>,
@@ -229,10 +233,11 @@ mod tests {
 
     use anyhow::Result;
     use vasr_data::{Timeline, Waveform};
-    use vasr_runtime::{AsrModel, AsrOptions, StreamingAsrModel};
 
     use super::{InferencePriority, InferenceScheduler, ScheduledAsrModel};
+    use crate::model::{AsrModel, AsrOptions, StreamingAsrModel};
 
+    #[cfg(feature = "async")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scheduler_serializes_concurrent_submissions() {
         let scheduler = InferenceScheduler::start("test");
@@ -259,6 +264,7 @@ mod tests {
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scheduler_runs_realtime_before_queued_transcribe_work() {
         let scheduler = InferenceScheduler::start("priority-test");
