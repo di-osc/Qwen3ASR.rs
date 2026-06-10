@@ -8,7 +8,7 @@ use crate::model::rope::scaling::RopeScalingType;
 
 /// Whether to use the mistralrs Metal/CUDA rotary kernel for seq_len==1 decode.
 fn use_accelerated_rotary(device: &Device) -> bool {
-    (device.is_metal() || device.is_cuda()) && std::env::var_os("VASR_DISABLE_ACCEL_ROPE").is_none()
+    device.is_metal() || device.is_cuda()
 }
 
 /// Multimodal rotary embedding generator for 3D positions.
@@ -109,10 +109,7 @@ impl MultimodalRotaryEmbedding {
             .to_dtype(DType::F32)?;
 
         // pos_first: (batch, seq_len) -> (batch, 1, 1, seq_len)
-        let pos_first = pos_first
-            .unsqueeze(1)?
-            .unsqueeze(1)?
-            .to_dtype(DType::F32)?;
+        let pos_first = pos_first.unsqueeze(1)?.unsqueeze(1)?.to_dtype(DType::F32)?;
 
         // freqs: (batch, 1, half_dim, seq_len) -> (batch, 1, seq_len, half_dim)
         let freqs = inv_freq.broadcast_mul(&pos_first)?;
@@ -139,9 +136,14 @@ pub fn apply_multimodal_rotary_pos_emb(
     mrope_section: &[usize],
     interleaved: bool,
 ) -> Result<(Tensor, Tensor)> {
-    // seq_len==1 fast path: use Metal/CUDA accelerated rotary kernel
-    if q.dim(2).unwrap_or(0) == 1 && use_accelerated_rotary(q.device()) {
-        return apply_multimodal_rotary_pos_emb_seq_one(q, k, cos, sin, interleaved);
+    // seq_len==1 fast path: only the first modality is needed for decode.
+    // If the accelerator is disabled, keep the same first-modality semantics
+    // instead of falling through to the full 3-modality prefill path.
+    if q.dim(2).unwrap_or(0) == 1 {
+        if use_accelerated_rotary(q.device()) {
+            return apply_multimodal_rotary_pos_emb_seq_one(q, k, cos, sin, interleaved);
+        }
+        return apply_rope_batched_generic(q, k, cos, sin);
     }
 
     if interleaved {
@@ -180,10 +182,11 @@ fn apply_multimodal_rotary_pos_emb_seq_one(
         )
     };
 
-    // Qwen3 uses NeoX-style RoPE (half-dimension rotation, not GPT-NeoX's interleaved)
-    // For interleaved mRoPE the order differs but the accelerator kernel handles both
-    // via the is_neox parameter: interleaved=true means GPT-NeoX style
-    let is_neox = !interleaved;
+    // Decode-one uses the first-modality half-dimension RoPE embedding, matching
+    // `apply_rope_batched_generic`/`rotate_half` regardless of the prefill mRoPE
+    // section interleaving layout.
+    let is_neox = true;
+    let _ = interleaved;
 
     #[cfg(any(
         feature = "metal-paged-attn",
@@ -205,20 +208,19 @@ fn apply_multimodal_rotary_pos_emb_seq_one(
     }
 }
 
-#[cfg(not(any(
-    feature = "metal-paged-attn",
-    feature = "cuda-paged-attn",
-    feature = "cuda-quant"
-)))]
 fn apply_rope_batched_generic(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    // Simplified non-accelerated path: take first modality and use apply_rope_batched
-    let cos_first = cos.i(0)?.squeeze(1)?;
-    let sin_first = sin.i(0)?.squeeze(1)?;
+    // Simplified non-accelerated path: take first modality and keep
+    // (batch, seq_len, half_dim) for the generic batched RoPE helper.
+    let (cos_first, sin_first) = if cos.rank() == 4 && cos.dim(0)? == 3 {
+        (cos.i(0)?, sin.i(0)?)
+    } else {
+        (cos.clone(), sin.clone())
+    };
     let q_embed = apply_rope_batched(q, &cos_first, &sin_first)?;
     let k_embed = apply_rope_batched(k, &cos_first, &sin_first)?;
     Ok((q_embed, k_embed))
@@ -438,6 +440,217 @@ mod tests {
             anyhow::bail!("unexpected output dims for interleaved mRoPE");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_seq_one_first_modality_matches_standard_when_positions_match() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let head_dim = 128usize;
+        let rope = MultimodalRotaryEmbedding::new(head_dim, 1024, 10000.0, &device)?;
+
+        let batch = 2usize;
+        let seq_len = 1usize;
+        let x = candle_core::Tensor::zeros(
+            (batch, 1, seq_len, head_dim),
+            candle_core::DType::F32,
+            &device,
+        )?;
+        let pos = candle_core::Tensor::from_vec(vec![70i64, 71], (batch, seq_len), &device)?;
+        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
+        let (cos_full, sin_full) = rope.forward(&x, &position_ids)?;
+        let (cos_one, sin_one) = rope.forward_first_modality(&x, &position_ids)?;
+
+        let q = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, 4usize, seq_len, head_dim),
+            &device,
+        )?;
+        let k = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, 4usize, seq_len, head_dim),
+            &device,
+        )?;
+        let mrope_section = &[24usize, 20, 20];
+
+        let (q_standard, k_standard) = super::apply_multimodal_rotary_pos_emb_standard(
+            &q,
+            &k,
+            &cos_full,
+            &sin_full,
+            mrope_section,
+        )?;
+        let (q_one, k_one) = super::apply_rope_batched_generic(&q, &k, &cos_one, &sin_one)?;
+
+        let q_diff = (q_standard - q_one)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let k_diff = (k_standard - k_one)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(q_diff < 1e-6, "q diff {q_diff}");
+        assert!(k_diff < 1e-6, "k diff {k_diff}");
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    fn test_metal_accelerated_seq_one_matches_generic() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let head_dim = 128usize;
+        let rope = MultimodalRotaryEmbedding::new(head_dim, 1024, 10000.0, &device)?;
+
+        let batch = 3usize;
+        let heads = 4usize;
+        let seq_len = 1usize;
+        let x = candle_core::Tensor::zeros(
+            (batch, 1, seq_len, head_dim),
+            candle_core::DType::F32,
+            &device,
+        )?;
+        let pos =
+            candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
+        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
+        let (cos, sin) = rope.forward_first_modality(&x, &position_ids)?;
+
+        let q = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, heads, seq_len, head_dim),
+            &device,
+        )?;
+        let k = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, heads, seq_len, head_dim),
+            &device,
+        )?;
+
+        let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
+        let (q_accel, k_accel) = vasr_quant::apply_rotary_qk(&q, &k, &cos, &sin, true)?;
+
+        let q_diff = (q_generic - q_accel)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let k_diff = (k_generic - k_accel)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(q_diff < 1e-5, "q diff {q_diff}");
+        assert!(k_diff < 1e-5, "k diff {k_diff}");
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    fn test_metal_accelerated_seq_one_matches_generic_bf16_gqa() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let head_dim = 128usize;
+        let rope = MultimodalRotaryEmbedding::new(head_dim, 1024, 10000.0, &device)?;
+
+        let batch = 3usize;
+        let q_heads = 16usize;
+        let k_heads = 8usize;
+        let seq_len = 1usize;
+        let x = candle_core::Tensor::zeros(
+            (batch, 1, seq_len, head_dim),
+            candle_core::DType::BF16,
+            &device,
+        )?;
+        let pos =
+            candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
+        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
+        let (cos, sin) = rope.forward_first_modality(&x, &position_ids)?;
+
+        let q = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, q_heads, seq_len, head_dim),
+            &device,
+        )?
+        .to_dtype(candle_core::DType::BF16)?;
+        let k = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, k_heads, seq_len, head_dim),
+            &device,
+        )?
+        .to_dtype(candle_core::DType::BF16)?;
+
+        let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
+        let (q_accel, k_accel) = vasr_quant::apply_rotary_qk(&q, &k, &cos, &sin, true)?;
+
+        let q_diff = (q_generic.to_dtype(candle_core::DType::F32)?
+            - q_accel.to_dtype(candle_core::DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+        let k_diff = (k_generic.to_dtype(candle_core::DType::F32)?
+            - k_accel.to_dtype(candle_core::DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+        assert!(q_diff < 1e-2, "q diff {q_diff}");
+        assert!(k_diff < 1e-2, "k diff {k_diff}");
+        Ok(())
+    }
+
+    #[cfg(feature = "metal-paged-attn")]
+    #[test]
+    fn test_metal_accelerated_seq_one_interleaved_matches_generic() -> anyhow::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let head_dim = 128usize;
+        let rope = MultimodalRotaryEmbedding::new(head_dim, 1024, 10000.0, &device)?;
+
+        let batch = 2usize;
+        let q_heads = 16usize;
+        let k_heads = 8usize;
+        let seq_len = 1usize;
+        let x = candle_core::Tensor::zeros(
+            (batch, 1, seq_len, head_dim),
+            candle_core::DType::BF16,
+            &device,
+        )?;
+        let pos = candle_core::Tensor::from_vec(vec![70i64, 71], (batch, seq_len), &device)?;
+        let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
+        let (cos, sin) = rope.forward_first_modality(&x, &position_ids)?;
+
+        let q = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, q_heads, seq_len, head_dim),
+            &device,
+        )?
+        .to_dtype(candle_core::DType::BF16)?;
+        let k = candle_core::Tensor::randn(
+            0f32,
+            0.02f32,
+            (batch, k_heads, seq_len, head_dim),
+            &device,
+        )?
+        .to_dtype(candle_core::DType::BF16)?;
+
+        let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
+        let (q_accel, k_accel) =
+            super::apply_multimodal_rotary_pos_emb_seq_one(&q, &k, &cos, &sin, true)?;
+
+        let q_diff = (q_generic.to_dtype(candle_core::DType::F32)?
+            - q_accel.to_dtype(candle_core::DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+        let k_diff = (k_generic.to_dtype(candle_core::DType::F32)?
+            - k_accel.to_dtype(candle_core::DType::F32)?)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+        assert!(q_diff < 1e-2, "q diff {q_diff}");
+        assert!(k_diff < 1e-2, "k diff {k_diff}");
         Ok(())
     }
 }

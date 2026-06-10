@@ -176,61 +176,6 @@ This means:
 - the issue was the interaction of those two fast paths with the current batched paged
   prefill semantics.
 
-#### One-token isolation test
-
-To separate "prefill quality" from "multi-step decode handoff", a one-token run was
-measured with `--max-new-tokens 1`.
-
-Baseline command shape:
-
-```bash
-./target/release/vasr-transcribe run \
-  --device metal \
-  --input raw_audios \
-  --model /Users/wangmengdi/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-0.6B/snapshots/5eb144179a02acc5e5ba31e748d22b0cf3e303b0 \
-  --output /tmp/vasr-bench-vad-out-1tok-base \
-  --isq 8 \
-  --max-batch-audio-sec 60 \
-  --max-new-tokens 1 \
-  --limit 20
-```
-
-Baseline result:
-
-```text
-Done: files=20 bad=0 audio_seconds=1652.085 wall_seconds=25.153 speedup=65.680 rtf=0.0152
-```
-
-Hybrid command shape:
-
-```bash
-VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID=1 \
-./target/release/vasr-transcribe run \
-  --device metal \
-  --input raw_audios \
-  --model /Users/wangmengdi/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-0.6B/snapshots/5eb144179a02acc5e5ba31e748d22b0cf3e303b0 \
-  --output /tmp/vasr-bench-vad-out-1tok-hybrid \
-  --isq 8 \
-  --max-batch-audio-sec 60 \
-  --max-new-tokens 1 \
-  --limit 20
-```
-
-Hybrid result:
-
-```text
-Done: files=20 bad=0 audio_seconds=1652.085 wall_seconds=12.488 speedup=132.296 rtf=0.0076
-```
-
-Interpretation:
-
-- This is the strongest evidence so far that the paged/varlen prefill itself is
-  useful on Metal for this workload.
-- The hybrid path works very well when the task is reduced to prefill plus only the
-  first decode token.
-- Therefore the current blocker is specifically multi-step decode continuation after
-  paged prefill, not the prefill optimization itself.
-
 #### Current corrected hybrid result
 
 After restricting the experimental hybrid mode to avoid the two incorrect fast paths
@@ -264,6 +209,52 @@ Interpretation:
   wall time by about `13.3%`.
 - The remaining optimization work should now focus on recovering more of the fast-path
   prefill benefit without reintroducing the correctness regressions seen earlier.
+
+#### 2026-06-10 Reproduction Note
+
+After fixing the seq_len==1 mRoPE accelerated decode path, the old `21.077s`
+hybrid number above did not reproduce as the fastest complete-recognition path.
+It is retained as historical context, but should not be treated as the current
+Metal baseline because the earlier run generated fewer tokens than current
+complete runs (`generated_tokens=1013` in the old aggregate, versus roughly
+`1500+` tokens in current complete-recognition runs).
+
+Current reproducible command for the fastest complete Metal path observed in this
+pass:
+
+```bash
+VASR_LOG='info,vasr_models::inference::transcribe=info' \
+./target/release/vasr-transcribe run \
+  --device metal \
+  --input raw_audios \
+  --output /tmp/vasr-repro-metal-default-clean-info \
+  --isq 8 \
+  --max-batch-audio-sec 60 \
+  --max-new-tokens 128 \
+  --limit 20
+```
+
+Observed summary:
+
+```text
+Done: files=20 bad=0 audio_seconds=1652.085 wall_seconds=27.610 speedup=59.836 rtf=0.0167
+```
+
+Correctness/output sanity:
+
+- `ISQ selected is afq8 (requested=8, backend=metal)`.
+- 20/20 files returned.
+- Output scan found no `퓮`, replacement character, `<asr_text>`, or `<|...|>` markers.
+- Output contained 120 transcript text fields, 111 non-empty, with 2173 total
+  non-whitespace transcript characters.
+
+Other reproduction attempts from the same pass:
+
+| Path | Command difference | Wall | Notes |
+| --- | --- | ---: | --- |
+| Default eager | `--max-batch-audio-sec 60` | **27.610s** | Fastest complete run reproduced in this pass |
+| Hybrid prefill | `VASR_ENABLE_METAL_PAGED_PREFILL_HYBRID=1` | 29.007s | Complete output, but slower after the mRoPE fix |
+| Larger micro-batches | `--max-batch-audio-sec 180` | 46.162s | Slower; large batches increase decode argmax cost |
 
 #### Current detailed timing breakdown
 

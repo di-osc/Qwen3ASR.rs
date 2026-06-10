@@ -12,13 +12,15 @@ use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
 #[cfg(feature = "paged-attn")]
-use mistralrs_quant::{
-    AfqBits, AfqGroupSize, AfqLayer, GluActivationType, QuantMethod, QuantMethodConfig,
-};
+use mistralrs_quant::{AfqBits, AfqGroupSize, AfqLayer, QuantMethod, QuantMethodConfig};
+#[cfg(feature = "metal-paged-attn")]
+use mistralrs_quant::GluActivationType;
 
 #[cfg(feature = "timing")]
 static ISQ_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
 static AFQ_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "metal")]
+static METAL_ISQ_DISABLED_WARNED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static LINEAR_IS_PREFILL: Cell<bool> = const { Cell::new(false) };
@@ -254,6 +256,11 @@ impl LinearX {
 
         let spec = parse_isq_spec(isq, target_device)?;
         if should_skip_module(module_path, &spec.modules_to_not_convert) {
+            let linear = linear_to_device(linear, target_device)?;
+            return Ok(Self::Linear(linear));
+        }
+
+        if spec.disable_quantization {
             let linear = linear_to_device(linear, target_device)?;
             return Ok(Self::Linear(linear));
         }
@@ -626,6 +633,7 @@ struct IsqSpec {
     dtype: Option<GgmlDType>,
     #[cfg(feature = "paged-attn")]
     afq: Option<AfqBits>,
+    disable_quantization: bool,
     modules_to_not_convert: Vec<String>,
 }
 
@@ -642,23 +650,43 @@ fn parse_isq_spec(value: &str, device: &Device) -> Result<IsqSpec> {
         dtype = None;
         afq = Some(bits);
     }
-    if let ResolvedIsq::AfqFallback {
-        requested,
-        fallback,
-    } = resolved
-        && !AFQ_FALLBACK_WARNED.swap(true, Ordering::Relaxed)
-    {
-        tracing::warn!(
-            "ISQ `{}` resolved by auto selection, but AFQ is not implemented in this runtime yet; falling back to {}.",
+    #[cfg(not(feature = "metal"))]
+    let disable_quantization = false;
+    #[cfg(feature = "metal")]
+    let mut disable_quantization = false;
+    #[cfg(feature = "metal")]
+    if device.is_metal() && std::env::var_os("VASR_DISABLE_METAL_ISQ").is_some() {
+        disable_quantization = true;
+        if !METAL_ISQ_DISABLED_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "Metal ISQ was disabled by VASR_DISABLE_METAL_ISQ=1; using dense linear layers instead."
+            );
+        }
+    }
+    match resolved {
+        ResolvedIsq::AfqFallback {
             requested,
-            ggml_dtype_name(fallback)
-        );
+            fallback,
+        } if !AFQ_FALLBACK_WARNED.swap(true, Ordering::Relaxed) => {
+            tracing::warn!(
+                "ISQ `{}` resolved by auto selection, but AFQ is not implemented in this runtime yet; falling back to {}.",
+                requested,
+                ggml_dtype_name(fallback)
+            );
+        }
+        _ => {}
     }
     let mut modules_to_not_convert = Vec::new();
+    let mut reading_skip_values = false;
 
     for part in value.split([';', ',']) {
         let part = part.trim();
+        if reading_skip_values && !part.contains('=') {
+            modules_to_not_convert.extend(split_skip_values(part));
+            continue;
+        }
         let Some((key, values)) = part.split_once('=') else {
+            reading_skip_values = false;
             continue;
         };
         let key = key.trim().to_ascii_lowercase();
@@ -666,13 +694,10 @@ fn parse_isq_spec(value: &str, device: &Device) -> Result<IsqSpec> {
             key.as_str(),
             "skip" | "skip_modules" | "modules_to_not_convert"
         ) {
-            modules_to_not_convert.extend(
-                values
-                    .split(['|', '+'])
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(ToOwned::to_owned),
-            );
+            reading_skip_values = true;
+            modules_to_not_convert.extend(split_skip_values(values));
+        } else {
+            reading_skip_values = false;
         }
     }
 
@@ -682,8 +707,17 @@ fn parse_isq_spec(value: &str, device: &Device) -> Result<IsqSpec> {
         dtype,
         #[cfg(feature = "paged-attn")]
         afq,
+        disable_quantization,
         modules_to_not_convert,
     })
+}
+
+fn split_skip_values(values: &str) -> impl Iterator<Item = String> + '_ {
+    values
+        .split(['|', '+', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(feature = "paged-attn")]
@@ -831,6 +865,21 @@ mod tests {
             "thinker.lm_head",
             "lm_head"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_isq_skip_accepts_comma_separated_values() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let weight =
+            candle_core::Tensor::zeros((4usize, 32usize), candle_core::DType::F32, &device)?;
+        let linear = IsqLinear::new_with_module_path(
+            candle_nn::Linear::new(weight, None),
+            Some("q8_0;skip=q_proj,k_proj"),
+            &device,
+            "thinker.model.layers.0.self_attn.k_proj",
+        )?;
+        assert!(matches!(linear, LinearX::Linear(_)));
         Ok(())
     }
 

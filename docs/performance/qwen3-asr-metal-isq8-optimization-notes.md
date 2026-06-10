@@ -1937,8 +1937,7 @@ Files:
 
 Behavior:
 
-- Added `use_accelerated_rotary()` helper: true when device is Metal/CUDA and
-  `VASR_DISABLE_ACCEL_ROPE` is unset.
+- Added `use_accelerated_rotary()` helper: true when device is Metal/CUDA.
 - `apply_multimodal_rotary_pos_emb` now dispatches seq_len==1 to
   `apply_multimodal_rotary_pos_emb_seq_one`, which extracts the first (temporal)
   mRoPE modality cos/sin and calls `mistralrs_quant::rotary::apply_rotary_qk`
@@ -2048,11 +2047,6 @@ cargo run --release -p vasr-models --example bench_text_decode \
 
 # Force paged-attn (opt-in regression test)
 VASR_FORCE_PAGED_ATTN=1 cargo run --release -p vasr-models --example bench_text_decode \
-  --features "metal,metal-paged-attn,paged-attn,timing" \
-  -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
-
-# Disable accelerated RoPE (fallback regression test)
-VASR_DISABLE_ACCEL_ROPE=1 cargo run --release -p vasr-models --example bench_text_decode \
   --features "metal,metal-paged-attn,paged-attn,timing" \
   -- Qwen/Qwen3-ASR-0.6B "The capital of France is" 3 64 bf16 8 --warmup 1
 
