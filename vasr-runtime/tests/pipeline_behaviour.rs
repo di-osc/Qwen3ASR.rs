@@ -139,7 +139,7 @@ fn offline_pipeline_merges_vad_and_asr_annotations() -> Result<()> {
     let timeline = pipeline.transcribe(&waveform, &AsrOptions::default())?;
 
     assert!(timeline.annotations.len() >= 2);
-    assert_eq!(timeline.transcript().text, "hello batch");
+    assert_eq!(timeline.transcript().text, "hello world");
     Ok(())
 }
 
@@ -170,7 +170,7 @@ fn offline_pipeline_merges_nearby_vad_segments_before_asr() -> Result<()> {
             .lock()
             .expect("seen batch durations poisoned")
             .as_slice(),
-        &[vec![4_000]]
+        &[vec![5_000]]
     );
     assert!(
         asr.seen_durations_ms
@@ -184,9 +184,84 @@ fn offline_pipeline_merges_nearby_vad_segments_before_asr() -> Result<()> {
         .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
         .collect::<Vec<_>>();
     assert_eq!(final_segments.len(), 1);
-    assert_eq!(final_segments[0].range.start, DurationMs(1_000));
-    assert_eq!(final_segments[0].range.end, DurationMs(5_000));
+    assert_eq!(final_segments[0].range.start, DurationMs(500));
+    assert_eq!(final_segments[0].range.end, DurationMs(5_500));
     assert_eq!(timeline.transcript().text, "hello batch");
+    Ok(())
+}
+
+#[test]
+fn offline_pipeline_pads_vad_slice_for_asr_context() -> Result<()> {
+    let waveform = Waveform::new(vec![0.05; 80_000], 16_000);
+    let asr = Arc::new(FakeAsr::default());
+    let pipeline = OfflinePipeline {
+        vad: Some(Arc::new(FakeVad {
+            segments: vec![VadSegment {
+                range: TimeRange::new(DurationMs(150), DurationMs(4_180)),
+                probability: 0.9,
+            }],
+        })),
+        asr: asr.clone(),
+    };
+
+    let timeline = pipeline.transcribe(&waveform, &AsrOptions::default())?;
+
+    assert_eq!(
+        asr.seen_batch_durations_ms
+            .lock()
+            .expect("seen batch durations poisoned")
+            .as_slice(),
+        &[vec![4_680]]
+    );
+    let final_segments = timeline
+        .annotations
+        .iter()
+        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
+        .collect::<Vec<_>>();
+    assert_eq!(final_segments.len(), 1);
+    assert_eq!(final_segments[0].range.start, DurationMs(0));
+    assert_eq!(final_segments[0].range.end, DurationMs(4_680));
+    Ok(())
+}
+
+#[test]
+fn offline_pipeline_uses_full_waveform_when_padded_vad_covers_audio() -> Result<()> {
+    let waveform = Waveform::new(vec![0.05; 67_264], 16_000);
+    let asr = Arc::new(FakeAsr::default());
+    let pipeline = OfflinePipeline {
+        vad: Some(Arc::new(FakeVad {
+            segments: vec![VadSegment {
+                range: TimeRange::new(DurationMs(150), DurationMs(4_180)),
+                probability: 0.9,
+            }],
+        })),
+        asr: asr.clone(),
+    };
+
+    let timeline = pipeline.transcribe(&waveform, &AsrOptions::default())?;
+
+    assert_eq!(
+        asr.seen_durations_ms
+            .lock()
+            .expect("seen durations poisoned")
+            .as_slice(),
+        &[4_204]
+    );
+    assert_eq!(
+        asr.seen_batch_durations_ms
+            .lock()
+            .expect("seen batch durations poisoned")
+            .as_slice(),
+        &[] as &[Vec<u64>]
+    );
+    let final_segments = timeline
+        .annotations
+        .iter()
+        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
+        .collect::<Vec<_>>();
+    assert_eq!(final_segments.len(), 1);
+    assert_eq!(final_segments[0].range.start, DurationMs(0));
+    assert_eq!(final_segments[0].range.end, DurationMs(4_204));
     Ok(())
 }
 

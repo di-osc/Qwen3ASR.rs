@@ -16,9 +16,9 @@ impl Default for AsrOptions {
         Self {
             language: None,
             context: String::new(),
-            max_new_tokens: 512,
+            max_new_tokens: 128,
             max_batch_size: 0,
-            max_batch_audio_sec: 180.0,
+            max_batch_audio_sec: 60.0,
             chunk_max_sec: None,
         }
     }

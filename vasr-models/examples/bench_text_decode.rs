@@ -109,10 +109,7 @@ fn main() -> Result<()> {
                 .processor()
                 .tokenizer
                 .token_to_id(chat_template::IM_END)?,
-            model
-                .processor()
-                .tokenizer
-                .token_to_id("<|endoftext|>")?,
+            model.processor().tokenizer.token_to_id("<|endoftext|>")?,
         ]
     } else {
         vec![u32::MAX]
@@ -172,15 +169,16 @@ fn main() -> Result<()> {
             None, // Metal defaults to eager, paged is opt-in
         )?;
         #[cfg(not(feature = "paged-attn"))]
-        let (gen_seqs, timings) = vasr_models::qwen3_asr::model::generation::greedy_generate_cached_batch_timed(
-            &model.inner_model().thinker,
-            model.device(),
-            input_rows.as_slice(),
-            attn_rows.as_slice(),
-            None,
-            max_new_tokens,
-            eos_token_ids.as_slice(),
-        )?;
+        let (gen_seqs, timings) =
+            vasr_models::qwen3_asr::model::generation::greedy_generate_cached_batch_timed(
+                &model.inner_model().thinker,
+                model.device(),
+                input_rows.as_slice(),
+                attn_rows.as_slice(),
+                None,
+                max_new_tokens,
+                eos_token_ids.as_slice(),
+            )?;
         let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
         let decode_us = timings.decode_us;
         let decode_ms = decode_us as f64 / 1000.0;
@@ -196,13 +194,7 @@ fn main() -> Result<()> {
         let per_seq_tokens_per_s = batch_tokens_per_s / batch_size as f64;
         let text = gen_seqs
             .first()
-            .and_then(|ids| {
-                model
-                    .processor()
-                    .tokenizer
-                    .decode(ids.as_slice())
-                    .ok()
-            })
+            .and_then(|ids| model.processor().tokenizer.decode(ids.as_slice()).ok())
             .unwrap_or_default();
         println!(
             "run={} wall_ms={:.3} decode_ms={:.3} decode_steps={} batch={} tokens={} batch_tok_per_s={:.3} per_seq_tok_per_s={:.3} text={:?}",

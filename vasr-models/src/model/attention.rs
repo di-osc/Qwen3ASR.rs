@@ -686,7 +686,15 @@ pub fn run_attention_noflash(
         return Ok(out);
     }
 
-    run_single_sequence_attention(q, k, v, mask_tensor.as_ref(), softmax_scale, causal, n_kv_groups)
+    run_single_sequence_attention(
+        q,
+        k,
+        v,
+        mask_tensor.as_ref(),
+        softmax_scale,
+        causal,
+        n_kv_groups,
+    )
 }
 
 /// Narrow an attention mask to the trailing `kv_seq_len` key positions.

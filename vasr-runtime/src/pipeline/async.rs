@@ -1,6 +1,6 @@
 //! Async parallel offline transcribe: VAD and ASR stages overlap across jobs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -265,11 +265,17 @@ fn spawn_asr_worker(
 ) -> JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let mut segment_state = SegmentAsrState::default();
-        while let Some(message) = asr_rx.recv().await {
+        let mut pending = VecDeque::new();
+        while let Some(message) = recv_asr_message(&mut pending, &mut asr_rx).await {
             match message {
                 AsrPipelineMessage::Job(job) => {
-                    let jobs =
-                        collect_job_microbatch(job, max_batch_size.max(1), &mut asr_rx).await;
+                    let jobs = collect_job_microbatch(
+                        job,
+                        max_batch_size.max(1),
+                        &mut asr_rx,
+                        &mut pending,
+                    )
+                    .await;
                     if jobs.is_empty() {
                         continue;
                     }
@@ -293,9 +299,13 @@ fn spawn_asr_worker(
                     }
                 }
                 AsrPipelineMessage::Segment(segment) => {
-                    let segments =
-                        collect_segment_microbatch(segment, max_batch_size.max(1), &mut asr_rx)
-                            .await;
+                    let segments = collect_segment_microbatch(
+                        segment,
+                        max_batch_size.max(1),
+                        &mut asr_rx,
+                        &mut pending,
+                    )
+                    .await;
                     prepare_segment_job_state(&mut segment_state, &segments);
                     let batch = tokio::task::spawn_blocking({
                         let pipeline = Arc::clone(&pipeline);
@@ -319,10 +329,21 @@ fn spawn_asr_worker(
     })
 }
 
+async fn recv_asr_message(
+    pending: &mut VecDeque<AsrPipelineMessage>,
+    asr_rx: &mut mpsc::Receiver<AsrPipelineMessage>,
+) -> Option<AsrPipelineMessage> {
+    match pending.pop_front() {
+        Some(message) => Some(message),
+        None => asr_rx.recv().await,
+    }
+}
+
 async fn collect_job_microbatch(
     first: AsrJob,
     max_batch_size: usize,
     asr_rx: &mut mpsc::Receiver<AsrPipelineMessage>,
+    pending: &mut VecDeque<AsrPipelineMessage>,
 ) -> Vec<AsrJob> {
     let mut jobs = vec![first];
     if max_batch_size <= 1 {
@@ -331,7 +352,10 @@ async fn collect_job_microbatch(
     while jobs.len() < max_batch_size {
         match asr_rx.try_recv() {
             Ok(AsrPipelineMessage::Job(job)) => jobs.push(job),
-            Ok(AsrPipelineMessage::Segment(_)) => break,
+            Ok(message) => {
+                pending.push_front(message);
+                break;
+            }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return jobs,
         }
@@ -342,7 +366,11 @@ async fn collect_job_microbatch(
     while jobs.len() < max_batch_size {
         match asr_rx.recv().await {
             Some(AsrPipelineMessage::Job(job)) => jobs.push(job),
-            Some(AsrPipelineMessage::Segment(_)) | None => break,
+            Some(message) => {
+                pending.push_front(message);
+                break;
+            }
+            None => break,
         }
     }
     jobs
@@ -352,6 +380,7 @@ async fn collect_segment_microbatch(
     first: AsrSegmentJob,
     max_batch_size: usize,
     asr_rx: &mut mpsc::Receiver<AsrPipelineMessage>,
+    pending: &mut VecDeque<AsrPipelineMessage>,
 ) -> Vec<AsrSegmentJob> {
     let mut segments = vec![first];
     if max_batch_size <= 1 {
@@ -360,7 +389,10 @@ async fn collect_segment_microbatch(
     while segments.len() < max_batch_size {
         match asr_rx.try_recv() {
             Ok(AsrPipelineMessage::Segment(segment)) => segments.push(segment),
-            Ok(AsrPipelineMessage::Job(_)) => break,
+            Ok(message) => {
+                pending.push_front(message);
+                break;
+            }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return segments,
         }
@@ -371,7 +403,11 @@ async fn collect_segment_microbatch(
     while segments.len() < max_batch_size {
         match asr_rx.recv().await {
             Some(AsrPipelineMessage::Segment(segment)) => segments.push(segment),
-            Some(AsrPipelineMessage::Job(_)) | None => break,
+            Some(message) => {
+                pending.push_front(message);
+                break;
+            }
+            None => break,
         }
     }
     segments
@@ -487,20 +523,38 @@ fn run_asr_jobs_batch(
     let mut results = Vec::with_capacity(jobs.len());
     let mut raw_jobs = Vec::new();
     let mut prepared_jobs = Vec::new();
+    let mut full_speech_annotations = Vec::new();
 
     for job in jobs {
-        match job.prepared {
+        match &job.prepared {
             VadPreparation::Speech(_) => prepared_jobs.push(job),
             VadPreparation::NoSpeech => results.push(StageResult::Ready {
                 index: job.index,
                 timeline: Timeline::new("offline_audio"),
             }),
+            VadPreparation::FullSpeech { speech_annotations } => {
+                full_speech_annotations.push((job.index, speech_annotations.clone()));
+                raw_jobs.push(job);
+            }
             VadPreparation::Disabled => raw_jobs.push(job),
         }
     }
 
     if !raw_jobs.is_empty() {
-        results.extend(run_raw_asr_jobs_batch(pipeline, raw_jobs, asr_options));
+        let mut raw_results = run_raw_asr_jobs_batch(pipeline, raw_jobs, asr_options);
+        for result in &mut raw_results {
+            if let StageResult::Ready { index, timeline } = result {
+                if let Some((_, annotations)) = full_speech_annotations
+                    .iter()
+                    .find(|(annotated_index, _)| annotated_index == index)
+                {
+                    let mut annotations = annotations.clone();
+                    annotations.extend(std::mem::take(&mut timeline.annotations));
+                    timeline.annotations = annotations;
+                }
+            }
+        }
+        results.extend(raw_results);
     }
 
     if !prepared_jobs.is_empty() {
@@ -559,5 +613,164 @@ fn run_raw_asr_jobs_batch(
                 error: anyhow::anyhow!("{error}"),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vasr_data::{
+        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSegment, TimeRange,
+    };
+
+    use super::*;
+    use crate::model::{AsrModel, StreamingAsrModel};
+
+    struct BatchFakeAsr;
+
+    impl AsrModel for BatchFakeAsr {
+        fn transcribe(&self, waveform: &Waveform, options: &AsrOptions) -> Result<Timeline> {
+            let mut timelines = self.transcribe_batch(std::slice::from_ref(waveform), options)?;
+            timelines
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("fake ASR returned no timeline"))
+        }
+
+        fn transcribe_batch(
+            &self,
+            waveforms: &[Waveform],
+            _options: &AsrOptions,
+        ) -> Result<Vec<Timeline>> {
+            Ok(waveforms
+                .iter()
+                .map(|_| {
+                    let mut timeline = Timeline::new("fake_batch_asr");
+                    timeline.push(Annotation::new(
+                        TimeRange::default(),
+                        AnnotationPayload::Segment(TextSegment::new("ok")),
+                        AnnotationSource::Model("fake_batch_asr".to_string()),
+                        AnnotationStatus::Final,
+                    ));
+                    timeline
+                })
+                .collect())
+        }
+
+        fn start_stream(&self, _options: &AsrOptions) -> Result<Box<dyn StreamingAsrModel>> {
+            anyhow::bail!("not implemented")
+        }
+    }
+
+    #[tokio::test]
+    async fn asr_worker_does_not_drop_job_after_segment_microbatch() -> Result<()> {
+        let pipeline = Arc::new(OfflinePipeline {
+            vad: None,
+            asr: Arc::new(BatchFakeAsr),
+        });
+        let (asr_tx, asr_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(4);
+        let handle = spawn_asr_worker(pipeline, AsrOptions::default(), 4, asr_rx, result_tx);
+
+        asr_tx
+            .send(AsrPipelineMessage::Segment(AsrSegmentJob {
+                job_index: 0,
+                speech_annotations: Vec::new(),
+                segment_index: 0,
+                segment_count: 1,
+                offset: DurationMs(0),
+                waveform: Waveform::new(vec![0.1; 160], 16_000),
+            }))
+            .await?;
+        tokio::task::yield_now().await;
+        asr_tx
+            .send(AsrPipelineMessage::Job(AsrJob {
+                index: 1,
+                prepared: VadPreparation::Disabled,
+                waveform: Waveform::new(vec![0.2; 160], 16_000),
+            }))
+            .await?;
+        drop(asr_tx);
+
+        let mut results = Vec::new();
+        while let Some(result) = result_rx.recv().await {
+            results.push(result);
+        }
+        handle.await??;
+        results.sort_unstable_by_key(|result| match result {
+            StageResult::Ready { index, .. } | StageResult::Failed { index, .. } => *index,
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| match result {
+                    StageResult::Ready { index, .. } | StageResult::Failed { index, .. } => *index,
+                })
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, StageResult::Ready { .. }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn asr_worker_does_not_drop_segment_after_job_microbatch() -> Result<()> {
+        let pipeline = Arc::new(OfflinePipeline {
+            vad: None,
+            asr: Arc::new(BatchFakeAsr),
+        });
+        let (asr_tx, asr_rx) = mpsc::channel(4);
+        let (result_tx, mut result_rx) = mpsc::channel(4);
+        let handle = spawn_asr_worker(pipeline, AsrOptions::default(), 4, asr_rx, result_tx);
+
+        asr_tx
+            .send(AsrPipelineMessage::Job(AsrJob {
+                index: 0,
+                prepared: VadPreparation::Disabled,
+                waveform: Waveform::new(vec![0.2; 160], 16_000),
+            }))
+            .await?;
+        tokio::task::yield_now().await;
+        asr_tx
+            .send(AsrPipelineMessage::Segment(AsrSegmentJob {
+                job_index: 1,
+                speech_annotations: Vec::new(),
+                segment_index: 0,
+                segment_count: 1,
+                offset: DurationMs(0),
+                waveform: Waveform::new(vec![0.1; 160], 16_000),
+            }))
+            .await?;
+        drop(asr_tx);
+
+        let mut results = Vec::new();
+        while let Some(result) = result_rx.recv().await {
+            results.push(result);
+        }
+        handle.await??;
+        results.sort_unstable_by_key(|result| match result {
+            StageResult::Ready { index, .. } | StageResult::Failed { index, .. } => *index,
+        });
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| match result {
+                    StageResult::Ready { index, .. } | StageResult::Failed { index, .. } => *index,
+                })
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, StageResult::Ready { .. }))
+        );
+        Ok(())
     }
 }

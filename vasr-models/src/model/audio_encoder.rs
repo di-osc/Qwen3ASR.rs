@@ -43,9 +43,7 @@ fn cast_input_features_to_weight_dtype(
     // Instead, convert via F32 as an intermediate (two on-device casts are
     // much cheaper than one CPU transfer because the GPU pipeline stays intact).
     if input_features.device().is_metal() && want_dtype == DType::BF16 {
-        return input_features
-            .to_dtype(DType::F32)?
-            .to_dtype(want_dtype);
+        return input_features.to_dtype(DType::F32)?.to_dtype(want_dtype);
     }
 
     input_features.to_dtype(want_dtype)

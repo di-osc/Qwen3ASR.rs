@@ -37,7 +37,7 @@ pub struct CommonModelArgs {
     pub isq: Option<String>,
 
     /// Maximum decode tokens per request.
-    #[arg(long, default_value_t = 512, env = "VASR_MAX_NEW_TOKENS")]
+    #[arg(long, default_value_t = 128, env = "VASR_MAX_NEW_TOKENS")]
     pub max_new_tokens: usize,
 
     /// PagedAttention KV pool as a fraction of total GPU memory (CUDA). Used when `pa_context_len` is 0.
@@ -102,7 +102,7 @@ pub struct TranscribePipelineArgs {
     pub max_batch_size: usize,
 
     /// Maximum total segment audio seconds per ASR micro-batch. Set 0 to disable.
-    #[arg(long, default_value_t = 180.0, env = "VASR_MAX_BATCH_AUDIO_SEC")]
+    #[arg(long, default_value_t = 60.0, env = "VASR_MAX_BATCH_AUDIO_SEC")]
     pub max_batch_audio_sec: f32,
 
     /// Maximum raw audio seconds per model chunk before ASR. If omitted, the model default is used.
@@ -214,6 +214,41 @@ fn asr_options_from_pipeline(
         max_batch_audio_sec: pipeline.max_batch_audio_sec,
         chunk_max_sec: pipeline.chunk_max_sec,
         ..AsrOptions::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_defaults_match_validated_vad_batch_bounds() {
+        let pipeline = TranscribePipelineArgs {
+            model: CommonModelArgs {
+                model: "Qwen/Qwen3-ASR-0.6B".to_string(),
+                device: "auto".to_string(),
+                isq: None,
+                max_new_tokens: 128,
+                pa_gpu_memory_fraction: 0.65,
+                pa_context_len: 0,
+                pa_block_size: 32,
+            },
+            max_batch_size: 20,
+            max_batch_audio_sec: AsrOptions::default().max_batch_audio_sec,
+            chunk_max_sec: None,
+            vad: VadCliArgs {
+                vad_model: None,
+                vad_threshold: 0.5,
+                vad_min_speech_ms: 250,
+                vad_min_silence_ms: 500,
+                vad_merge_max_gap_ms: 2_000,
+                vad_merge_max_segment_ms: 30_000,
+            },
+        };
+
+        let opts = asr_options_from_pipeline(&pipeline, None);
+        assert_eq!(opts.max_new_tokens, 128);
+        assert_eq!(opts.max_batch_audio_sec, 60.0);
     }
 }
 

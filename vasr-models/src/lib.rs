@@ -95,14 +95,16 @@ impl Qwen3Asr {
         #[cfg(feature = "paged-attn")]
         let paged_cache = if device.is_metal() || device.is_cuda() {
             let (num_layers, num_kv_heads, head_dim) = model.thinker.paged_cache_config();
-            let config = opts.paged_cache.unwrap_or_else(|| vasr_paged_attn::PagedCacheConfig {
-                block_size: 32,
-                memory: if device.is_cuda() {
-                    vasr_paged_attn::PagedCacheMemory::GpuMemoryFraction(0.8)
-                } else {
-                    vasr_paged_attn::PagedCacheMemory::ContextSize(100_000)
-                },
-            });
+            let config = opts
+                .paged_cache
+                .unwrap_or_else(|| vasr_paged_attn::PagedCacheConfig {
+                    block_size: 32,
+                    memory: if device.is_cuda() {
+                        vasr_paged_attn::PagedCacheMemory::GpuMemoryFraction(0.8)
+                    } else {
+                        vasr_paged_attn::PagedCacheMemory::ContextSize(100_000)
+                    },
+                });
             Some(Arc::new(std::sync::Mutex::new(
                 vasr_paged_attn::PagedCacheRuntime::new(
                     num_layers,

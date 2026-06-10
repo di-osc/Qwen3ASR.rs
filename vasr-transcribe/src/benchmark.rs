@@ -2,6 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::pipeline::TranscribeInput;
+use crate::protocol::InferencePerformance;
+use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use clap::Args;
@@ -9,9 +12,6 @@ use serde::Serialize;
 use vasr_data::{
     AudioAsset, AudioSource, CerStats, VasrRecord, VasrRecordList, compute_cer, normalize_for_cer,
 };
-use crate::pipeline::TranscribeInput;
-use crate::protocol::InferencePerformance;
-use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
 
 #[derive(Debug, Clone, Args)]
 pub struct BenchmarkTranscribeArgs {

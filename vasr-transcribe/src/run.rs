@@ -2,12 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
-use clap::Args;
-use vasr_data::AudioSource;
 use crate::pipeline::{TranscribeInput, TranscribeItemOutcome};
 use crate::protocol::{InferenceData, InferencePerformance, TranscribeResponse};
 use crate::serve::{TranscribePipelineArgs, build_async_transcribe_pipeline, validate_pipeline};
+use anyhow::{Context, Result, bail};
+use clap::Args;
+use vasr_data::AudioSource;
 
 #[derive(Debug, Clone, Args)]
 pub struct RunTranscribeArgs {

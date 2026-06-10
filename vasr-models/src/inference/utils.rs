@@ -250,6 +250,9 @@ pub fn parse_asr_output(raw: Option<&str>, user_language: Option<&str>) -> (Stri
     }
 
     let Some((meta_part, text_part)) = s.split_once(ASR_TEXT_TAG) else {
+        if looks_like_metadata_only_output(s.as_str()) {
+            return (String::new(), String::new());
+        }
         return (String::new(), s.trim().to_string());
     };
 
@@ -281,6 +284,23 @@ pub fn parse_asr_output(raw: Option<&str>, user_language: Option<&str>) -> (Stri
     }
 
     (lang, text_part.trim().to_string())
+}
+
+fn looks_like_metadata_only_output(s: &str) -> bool {
+    let mut parts = s.split_whitespace();
+    let Some(first) = parts.next() else {
+        return true;
+    };
+    if !first.eq_ignore_ascii_case("language") {
+        return first.to_ascii_lowercase().starts_with("language");
+    }
+    let remaining: Vec<&str> = parts.collect();
+    if remaining.is_empty() {
+        return true;
+    }
+    remaining.len() == 1
+        && (remaining[0].eq_ignore_ascii_case("none")
+            || normalize_language_name(remaining[0]).is_ok())
 }
 
 /// Merge per-chunk languages into a compact comma-separated string,
@@ -371,6 +391,22 @@ mod tests {
         let (lang, text) = parse_asr_output(Some("hello"), None);
         if !lang.is_empty() || text != "hello" {
             anyhow::bail!("unexpected parse: lang={lang:?} text={text:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_asr_output_metadata_without_text_tag_is_empty() -> anyhow::Result<()> {
+        for raw in [
+            "language",
+            "language None",
+            "language Chinese",
+            "language้ตัวรุ้ย",
+        ] {
+            let (lang, text) = parse_asr_output(Some(raw), None);
+            if !lang.is_empty() || !text.is_empty() {
+                anyhow::bail!("unexpected parse for {raw:?}: lang={lang:?} text={text:?}");
+            }
         }
         Ok(())
     }

@@ -1148,10 +1148,11 @@ impl ThinkerTextAttention {
                     let block_size = key_cache.dim(3)?;
                     if !metal_hybrid_paged_prefill_enabled()
                         && vasr_paged_attn::supports_metal_varlen_prefill(
-                        q.device(),
-                        self.head_dim,
-                        block_size,
-                    ) {
+                            q.device(),
+                            self.head_dim,
+                            block_size,
+                        )
+                    {
                         if let (Some(cu_q), Some(query_lens)) = (
                             input_metadata.cu_seqlens_q.as_ref(),
                             input_metadata.query_lens.as_ref(),
@@ -1605,7 +1606,9 @@ impl ThinkerTextModel {
         };
 
         // seq_len==1: only the first (temporal) modality is needed for mRoPE
-        let (cos, sin) = self.rotary_emb.forward_first_modality(inputs_embeds, position_ids)?;
+        let (cos, sin) = self
+            .rotary_emb
+            .forward_first_modality(inputs_embeds, position_ids)?;
         let position_embeddings = (&cos, &sin);
 
         let mut hidden_states = inputs_embeds.clone();

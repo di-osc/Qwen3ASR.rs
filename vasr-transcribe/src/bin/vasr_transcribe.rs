@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use vasr_transcribe::{
-    BenchmarkTranscribeArgs, ExtractAudioArgs, RunTranscribeArgs, ServeTranscribeArgs, init_logging,
-    run_benchmark, run_extract_audio, run_local, run_transcribe,
+    BenchmarkTranscribeArgs, ExtractAudioArgs, RunTranscribeArgs, ServeTranscribeArgs,
+    init_logging, run_benchmark, run_extract_audio, run_local, run_transcribe,
 };
 
 #[derive(Debug, Parser)]

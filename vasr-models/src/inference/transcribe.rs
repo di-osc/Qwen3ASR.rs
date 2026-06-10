@@ -411,7 +411,10 @@ pub(crate) fn generate_raw_prepared_batch(
 
     for batch in micro_batches {
         let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
-        let ids_rows: Vec<&[u32]> = batch_prepared.iter().map(|p| p.input_ids.as_slice()).collect();
+        let ids_rows: Vec<&[u32]> = batch_prepared
+            .iter()
+            .map(|p| p.input_ids.as_slice())
+            .collect();
         let attn_rows: Vec<&[u32]> = batch_prepared
             .iter()
             .map(|p| p.attention_mask.as_slice())
@@ -469,7 +472,17 @@ pub(crate) fn generate_raw_prepared_batch(
         }
 
         for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
-            out[orig_idx] = Some(processor.tokenizer.decode(ids.as_slice())?);
+            let raw = processor.tokenizer.decode(ids.as_slice())?;
+            if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
+                tracing::debug!(
+                    target: "vasr_models::inference::transcribe",
+                    orig_idx,
+                    tokens = ids.len(),
+                    raw = raw.as_str(),
+                    "raw ASR decode"
+                );
+            }
+            out[orig_idx] = Some(raw);
         }
     }
     out.into_iter()
@@ -850,7 +863,10 @@ fn generate_raw_prepared_batch_timed(
 
     for batch in micro_batches {
         let batch_prepared: Vec<PreparedInputs> = batch.iter().map(|(_, p)| p.clone()).collect();
-        let ids_rows: Vec<&[u32]> = batch_prepared.iter().map(|p| p.input_ids.as_slice()).collect();
+        let ids_rows: Vec<&[u32]> = batch_prepared
+            .iter()
+            .map(|p| p.input_ids.as_slice())
+            .collect();
         let attn_rows: Vec<&[u32]> = batch_prepared
             .iter()
             .map(|p| p.attention_mask.as_slice())
@@ -869,6 +885,24 @@ fn generate_raw_prepared_batch_timed(
         let start_audio = std::time::Instant::now();
         let audio_features =
             thinker.get_audio_features_with_lens(&input_features, feature_lens.as_slice())?;
+        if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
+            tracing::debug!(
+                target: "vasr_models::inference::transcribe",
+                batch_items = batch_prepared.len(),
+                input_features_shape = ?input_features.dims(),
+                feature_lens = ?feature_lens,
+                audio_features_shape = ?audio_features.dims(),
+                prompt_lens = ?batch_prepared
+                    .iter()
+                    .map(|p| p.attention_mask.iter().filter(|&&x| x != 0).count())
+                    .collect::<Vec<_>>(),
+                audio_placeholders = ?batch_prepared
+                    .iter()
+                    .map(|p| p.input_ids.iter().filter(|&&id| id == thinker.audio_token_id()).count())
+                    .collect::<Vec<_>>(),
+                "prepared ASR batch"
+            );
+        }
         timings.audio_encoder_us = timings
             .audio_encoder_us
             .saturating_add(duration_to_us(start_audio.elapsed()));
@@ -907,7 +941,17 @@ fn generate_raw_prepared_batch_timed(
 
         let start_decode = std::time::Instant::now();
         for ((orig_idx, _), ids) in batch.into_iter().zip(gen_ids.into_iter()) {
-            out[orig_idx] = Some(processor.tokenizer.decode(ids.as_slice())?);
+            let raw = processor.tokenizer.decode(ids.as_slice())?;
+            if std::env::var_os("VASR_DEBUG_RAW_ASR").is_some() {
+                tracing::debug!(
+                    target: "vasr_models::inference::transcribe",
+                    orig_idx,
+                    tokens = ids.len(),
+                    raw = raw.as_str(),
+                    "raw ASR decode"
+                );
+            }
+            out[orig_idx] = Some(raw);
         }
         timings.tokenizer_decode_us = timings
             .tokenizer_decode_us
@@ -977,7 +1021,10 @@ fn run_asr_on_chunks_batched_timed(
 
             let start_prepare = std::time::Instant::now();
             let (prepared, prepare_timings) = batch.prepare_items_timed(items.as_slice())?;
-            let prepare_us = start_prepare.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            let prepare_us = start_prepare
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
             timings.processor_prepare_batch_us = timings
                 .processor_prepare_batch_us
                 .saturating_add(prepare_us);
@@ -1009,12 +1056,19 @@ fn run_asr_on_chunks_batched_timed(
             // Per-batch verbose timing
             let batch_ae_ms = (timings.audio_encoder_us - pre_ae) as f64 / 1000.0;
             let batch_prefill_ms = (timings.generation.prefill_us - pre_prefill) as f64 / 1000.0;
-            let batch_prefill_inputs_ms = (timings.generation.prefill_inputs_us - pre_prefill_inputs) as f64 / 1000.0;
-            let batch_prefill_rope_ms = (timings.generation.prefill_rope_us - pre_prefill_rope) as f64 / 1000.0;
-            let batch_prefill_fwd_ms = (timings.generation.prefill_forward_us - pre_prefill_forward) as f64 / 1000.0;
-            let batch_prefill_other_ms = batch_prefill_ms - batch_prefill_inputs_ms - batch_prefill_rope_ms - batch_prefill_fwd_ms;
+            let batch_prefill_inputs_ms =
+                (timings.generation.prefill_inputs_us - pre_prefill_inputs) as f64 / 1000.0;
+            let batch_prefill_rope_ms =
+                (timings.generation.prefill_rope_us - pre_prefill_rope) as f64 / 1000.0;
+            let batch_prefill_fwd_ms =
+                (timings.generation.prefill_forward_us - pre_prefill_forward) as f64 / 1000.0;
+            let batch_prefill_other_ms = batch_prefill_ms
+                - batch_prefill_inputs_ms
+                - batch_prefill_rope_ms
+                - batch_prefill_fwd_ms;
             let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
-            let batch_decode_fwd_ms = (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
+            let batch_decode_fwd_ms =
+                (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
             let batch_steps = timings.generation.steps - pre_steps;
             let batch_tokens = timings.generation.tokens_generated - pre_tokens;
             eprintln!(
@@ -1104,7 +1158,10 @@ fn run_asr_on_chunks_batched_timed(
 
         let start_prepare = std::time::Instant::now();
         let (prepared, prepare_timings) = batch.prepare_items_timed(items.as_slice())?;
-        let prepare_us = start_prepare.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let prepare_us = start_prepare
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         timings.processor_prepare_batch_us = timings
             .processor_prepare_batch_us
             .saturating_add(prepare_us);
@@ -1143,12 +1200,19 @@ fn run_asr_on_chunks_batched_timed(
         // Per-batch verbose timing
         let batch_ae_ms = (timings.audio_encoder_us - pre_ae) as f64 / 1000.0;
         let batch_prefill_ms = (timings.generation.prefill_us - pre_prefill) as f64 / 1000.0;
-        let batch_prefill_inputs_ms = (timings.generation.prefill_inputs_us - pre_prefill_inputs) as f64 / 1000.0;
-        let batch_prefill_rope_ms = (timings.generation.prefill_rope_us - pre_prefill_rope) as f64 / 1000.0;
-        let batch_prefill_fwd_ms = (timings.generation.prefill_forward_us - pre_prefill_forward) as f64 / 1000.0;
-        let batch_prefill_other_ms = batch_prefill_ms - batch_prefill_inputs_ms - batch_prefill_rope_ms - batch_prefill_fwd_ms;
+        let batch_prefill_inputs_ms =
+            (timings.generation.prefill_inputs_us - pre_prefill_inputs) as f64 / 1000.0;
+        let batch_prefill_rope_ms =
+            (timings.generation.prefill_rope_us - pre_prefill_rope) as f64 / 1000.0;
+        let batch_prefill_fwd_ms =
+            (timings.generation.prefill_forward_us - pre_prefill_forward) as f64 / 1000.0;
+        let batch_prefill_other_ms = batch_prefill_ms
+            - batch_prefill_inputs_ms
+            - batch_prefill_rope_ms
+            - batch_prefill_fwd_ms;
         let batch_decode_ms = (timings.generation.decode_us - pre_decode) as f64 / 1000.0;
-        let batch_decode_fwd_ms = (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
+        let batch_decode_fwd_ms =
+            (timings.generation.decode_forward_us - pre_decode_forward) as f64 / 1000.0;
         let batch_steps = timings.generation.steps - pre_steps;
         let batch_tokens = timings.generation.tokens_generated - pre_tokens;
         eprintln!(
