@@ -768,20 +768,6 @@ fn greedy_generate_cached_batch_impl(
         )?;
         return Ok(vec![out]);
     }
-    #[cfg(all(feature = "paged-attn", feature = "timing"))]
-    if batch > 1 && use_paged_attn && opts.paged_runtime.is_some() {
-        return greedy_generate_paged_batch(
-            thinker,
-            device,
-            input_ids,
-            attention_mask,
-            opts.audio_features,
-            opts.max_new_tokens,
-            opts.eos_token_ids,
-            opts.paged_runtime,
-            timings.as_deref_mut(),
-        );
-    }
     #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
     if batch == 1 && use_paged_attn && attention_masks_are_dense(attention_mask) {
         let out = greedy_generate_paged(
@@ -795,20 +781,6 @@ fn greedy_generate_cached_batch_impl(
             None,
         )?;
         return Ok(vec![out]);
-    }
-    #[cfg(all(feature = "paged-attn", not(feature = "timing")))]
-    if batch > 1 && use_paged_attn && opts.paged_runtime.is_some() {
-        return greedy_generate_paged_batch(
-            thinker,
-            device,
-            input_ids,
-            attention_mask,
-            opts.audio_features,
-            opts.max_new_tokens,
-            opts.eos_token_ids,
-            opts.paged_runtime,
-            None,
-        );
     }
 
     let eos_fill_id = *opts
@@ -873,7 +845,11 @@ fn greedy_generate_cached_batch_impl(
             .ok_or_else(|| anyhow::anyhow!("hybrid paged prefill requires a shared paged runtime"))?
             .lock()
             .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-        let config = PagedBatchConfig::for_static_batch(opts.max_new_tokens, opts.eos_token_ids);
+        let config = PagedBatchConfig {
+            max_new_tokens: opts.max_new_tokens,
+            eos_token_ids: opts.eos_token_ids.to_vec(),
+            request_id_base: 0,
+        };
         let state = paged_batch_prefill(
             thinker,
             device,
@@ -1484,37 +1460,6 @@ fn greedy_generate_paged(
     }
 
     Ok(generated)
-}
-
-#[cfg(feature = "paged-attn")]
-fn greedy_generate_paged_batch(
-    thinker: &ThinkerForConditionalGeneration,
-    device: &Device,
-    input_ids: &[&[u32]],
-    attention_mask: &[&[u32]],
-    audio_features: Option<&Tensor>,
-    max_new_tokens: usize,
-    eos_token_ids: &[u32],
-    paged_runtime: Option<&SharedPagedCacheRuntime>,
-    #[cfg(feature = "timing")] _timings: Option<&mut GenerationTimings>,
-    #[cfg(not(feature = "timing"))] _timings: Option<&mut GenerationTimings>,
-) -> Result<Vec<Vec<u32>>> {
-    use crate::model::paged_batch_engine::{PagedBatchConfig, paged_batch_run};
-
-    let mut runtime_guard = paged_runtime
-        .ok_or_else(|| anyhow::anyhow!("paged batch generation requires a shared paged runtime"))?
-        .lock()
-        .map_err(|_| anyhow::anyhow!("paged cache runtime lock poisoned"))?;
-    let config = PagedBatchConfig::for_static_batch(max_new_tokens, eos_token_ids);
-    paged_batch_run(
-        thinker,
-        device,
-        &mut runtime_guard,
-        input_ids,
-        attention_mask,
-        audio_features,
-        &config,
-    )
 }
 
 #[cfg(feature = "paged-attn")]

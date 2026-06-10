@@ -13,7 +13,7 @@ path = "src/bin/vasr_realtime.rs"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

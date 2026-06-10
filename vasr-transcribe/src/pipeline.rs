@@ -1225,6 +1225,18 @@ fn log_pipeline(job_count: usize, outcomes: &[TranscribeItemOutcome], wall_secon
         .filter(|outcome| outcome.result.is_err())
         .count();
     let metrics = stage_metrics(audio_seconds, wall_seconds);
+    for outcome in outcomes {
+        if let Err(error) = &outcome.result {
+            tracing::error!(
+                target: "vasr_transcribe::pipeline",
+                index = outcome.index,
+                component = outcome.bad_component.unwrap_or("unknown"),
+                error = %error,
+                audio_s = outcome.audio_seconds,
+                "Pipeline job failed"
+            );
+        }
+    }
     tracing::info!(
         target: "vasr_transcribe::pipeline",
         "pipeline | batch={} | returned={} | audio={:.2}s | spent={:.2}s | speed={:.2}x | rtf={:.3} | bad={}",

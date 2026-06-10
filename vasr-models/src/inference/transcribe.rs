@@ -17,7 +17,7 @@ use crate::model::generation::greedy_generate_cached_batch;
 #[cfg(all(feature = "timing", not(feature = "paged-attn")))]
 use crate::model::generation::greedy_generate_cached_batch_timed;
 #[cfg(all(feature = "timing", feature = "paged-attn"))]
-use crate::model::generation::greedy_generate_cached_batch_timed_with_paged_runtime;
+use crate::model::generation::greedy_generate_cached_batch_timed;
 #[cfg(feature = "paged-attn")]
 use crate::model::generation::greedy_generate_cached_batch_with_paged_runtime;
 #[cfg(feature = "paged-attn")]
@@ -907,17 +907,42 @@ fn generate_raw_prepared_batch_timed(
             .audio_encoder_us
             .saturating_add(duration_to_us(start_audio.elapsed()));
 
+        #[cfg_attr(not(feature = "paged-attn"), allow(unused_mut))]
+        let mut gen_timings = GenerationTimings::default();
         #[cfg(feature = "paged-attn")]
-        let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed_with_paged_runtime(
-            thinker,
-            device,
-            ids_rows.as_slice(),
-            attn_rows.as_slice(),
-            Some(&audio_features),
-            max_new_tokens,
-            eos_token_ids,
-            paged_runtime,
-        )?;
+        let gen_ids = if let Some(runtime) = paged_runtime {
+            let start_gen = std::time::Instant::now();
+            use crate::inference::batch_scheduler::run_paged_prepared_batch;
+            let ids = run_paged_prepared_batch(
+                thinker,
+                device,
+                runtime,
+                batch_prepared.as_slice(),
+                &audio_features,
+                max_new_tokens,
+                eos_token_ids,
+                batch_prepared.len(),
+                pad_id,
+            )?;
+            gen_timings = GenerationTimings {
+                decode_us: duration_to_us(start_gen.elapsed()),
+                tokens_generated: ids.iter().map(Vec::len).sum(),
+                ..GenerationTimings::default()
+            };
+            ids
+        } else {
+            let (ids, gt) = greedy_generate_cached_batch_timed(
+                thinker,
+                device,
+                ids_rows.as_slice(),
+                attn_rows.as_slice(),
+                Some(&audio_features),
+                max_new_tokens,
+                eos_token_ids,
+            )?;
+            gen_timings = gt;
+            ids
+        };
         #[cfg(not(feature = "paged-attn"))]
         let (gen_ids, gen_timings) = greedy_generate_cached_batch_timed(
             thinker,

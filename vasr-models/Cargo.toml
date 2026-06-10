@@ -8,10 +8,10 @@ categories = ["science"]
 keywords = ["asr", "speech-recognition", "machine-learning", "qwen"]
 
 [dependencies]
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-candle-flash-attn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
+candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-transformers = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-flash-attn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348", optional = true }
 float8 = "0.7"
 
 anyhow = "1"
@@ -20,7 +20,8 @@ serde_json = "1"
 tracing = "0.1"
 
 tokenizers = "0.23"
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+modelscope = "0.1"
+tokio = { version = "1", features = ["rt"] }
 safetensors = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 rustfft = "6"

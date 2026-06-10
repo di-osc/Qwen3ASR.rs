@@ -205,7 +205,8 @@ fn run_paged_prefill_attention_fallback(
         q.device(),
     )?;
     let flash_params = input_metadata.prefill_flash_params();
-    let avoid_packed_varlen = q.device().is_metal() && metal_hybrid_paged_prefill_enabled();
+    let avoid_packed_varlen = q.device().is_cuda()
+        || (q.device().is_metal() && metal_hybrid_paged_prefill_enabled());
     if !avoid_packed_varlen && attention::supports_packed_varlen_sdpa(q) {
         let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
         let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;

@@ -7,20 +7,20 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+modelscope = "0.1"
 kaldi-fbank-rust-kautism = "0.1.0"
 ndarray = "0.17"
 rayon = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"], optional = true }
+tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 vasr-models = { path = "../vasr-models" }
 vasr-data = { path = "../vasr-data" }
 
 [features]
 default = []
-async = ["dep:tokio"]
+async = []
 accelerate = ["vasr-models/accelerate"]
 cuda-vad = ["candle-core/cuda", "candle-nn/cuda"]
 cuda = ["cuda-vad", "vasr-models/cuda"]

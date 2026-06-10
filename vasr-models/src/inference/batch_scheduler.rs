@@ -22,7 +22,6 @@ use vasr_paged_attn::{PagedBlockManager, PagedCacheRuntime, SharedPagedCacheRunt
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
     pub max_num_seqs: usize,
-    pub compact_finished: bool,
     pub continuous_batch: bool,
 }
 
@@ -30,7 +29,6 @@ impl Default for AsrBatchSchedulerConfig {
     fn default() -> Self {
         Self {
             max_num_seqs: 8,
-            compact_finished: compact_batch_enabled(),
             continuous_batch: continuous_batch_enabled(),
         }
     }
@@ -44,10 +42,6 @@ impl AsrBatchSchedulerConfig {
         }
         config
     }
-}
-
-fn compact_batch_enabled() -> bool {
-    std::env::var_os("VASR_DISABLE_COMPACT_BATCH").is_none()
 }
 
 fn continuous_batch_enabled() -> bool {
@@ -244,7 +238,6 @@ impl AsrBatchScheduler {
         let engine_config = PagedBatchConfig {
             max_new_tokens,
             eos_token_ids: eos_token_ids.to_vec(),
-            compact_finished: self.config.compact_finished,
             request_id_base,
         };
         paged_batch_run(
@@ -435,7 +428,6 @@ impl AsrBatchScheduler {
                     let engine_config = PagedBatchConfig {
                         max_new_tokens,
                         eos_token_ids: eos_token_ids.to_vec(),
-                        compact_finished: true,
                         request_id_base,
                     };
                     let state = paged_batch_prefill(
@@ -457,6 +449,12 @@ impl AsrBatchScheduler {
                             slot: PagedDecodeSlot::from_prefill_state(&state, wave_row)?,
                         });
                     }
+                    let running_count = running.iter().filter(|s| s.is_some()).count();
+                    let waiting_count = waiting.len();
+                    tracing::info!(
+                        target: "vasr_transcribe::pipeline",
+                        "continuous | admit wave={wave} running={running_count}/{max_slots} waiting={waiting_count}",
+                    );
                     admitted = true;
                 }
 
@@ -564,18 +562,10 @@ pub fn run_paged_prepared_batch(
 mod tests {
     use super::{
         AsrBatchSchedulerConfig, PagedBlockManager, can_admit_with_projected_kv,
-        compact_batch_enabled, continuous_batch_enabled, group_running_by_decode_step,
+        continuous_batch_enabled, group_running_by_decode_step,
         pad_prepared_wave_for_prefill,
     };
     use crate::processor::asr_processor::PreparedInputs;
-
-    #[test]
-    fn compact_batch_defaults_on() {
-        if std::env::var_os("VASR_DISABLE_COMPACT_BATCH").is_none() {
-            assert!(compact_batch_enabled());
-            assert!(AsrBatchSchedulerConfig::default().compact_finished);
-        }
-    }
 
     #[test]
     fn continuous_batch_defaults_on() {

@@ -11,9 +11,38 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+
+fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
+    use modelscope::ModelScope;
+
+    let cache = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join(".cache")
+        .join("modelscope");
+
+    block_on_async(ModelScope::download(repo_id, &cache))
+        .with_context(|| format!("failed to download tokenizer for {repo_id:?} from ModelScope"))?;
+
+    Ok(cache.join(repo_id))
+}
+
+fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
+where
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let rt = tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime");
+            rt.block_on(future)
+        }).join()
+        .expect("tokio download thread panicked")
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
@@ -63,40 +92,14 @@ impl Tokenizer {
         })
     }
 
-    /// Load tokenizer files from HuggingFace (downloaded into the local cache).
+    /// Load tokenizer files from ModelScope (downloaded into the local cache).
     pub fn from_hf(model_id: &str) -> Result<Self> {
-        use hf_hub::api::sync::Api;
-        use hf_hub::{Repo, RepoType};
-
-        let api = Api::new().context("failed to create HuggingFace API")?;
-        let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
-
-        // Preferred format: tokenizer.json
-        if let Ok(tok) = repo.get("tokenizer.json") {
-            let model_dir = tok.parent().map(Path::to_path_buf).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "failed to determine HuggingFace snapshot directory for {model_id:?}"
-                )
-            })?;
-            return Self::from_pretrained_dir(&model_dir);
-        }
-
-        // Fallback format: vocab.json + merges.txt (+ optional tokenizer_config.json)
-        let vocab = repo
-            .get("vocab.json")
-            .with_context(|| format!("failed to download vocab.json for {model_id:?}"))?;
-        let _merges = repo
-            .get("merges.txt")
-            .with_context(|| format!("failed to download merges.txt for {model_id:?}"))?;
-        let _tokenizer_config = repo.get("tokenizer_config.json");
-
-        let model_dir = vocab.parent().map(Path::to_path_buf).ok_or_else(|| {
-            anyhow::anyhow!("failed to determine HuggingFace snapshot directory for {model_id:?}")
-        })?;
+        let model_dir = modelscope_download(model_id)
+            .with_context(|| format!("failed to download tokenizer for {model_id:?}"))?;
         Self::from_pretrained_dir(&model_dir)
     }
 
-    /// Convenience loader: accepts either a local directory path or a HuggingFace model id.
+    /// Convenience loader: accepts either a local directory path or a ModelScope model id.
     pub fn from_pretrained(model_id_or_path: &str) -> Result<Self> {
         let path = Path::new(model_id_or_path);
         if path.exists() {

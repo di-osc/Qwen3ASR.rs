@@ -163,26 +163,43 @@ fn validate_load_options(device: &Device, opts: &LoadOptions) -> Result<()> {
     Ok(())
 }
 
+fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
+where
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let rt = tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime");
+            rt.block_on(future)
+        }).join()
+        .expect("tokio download thread panicked")
+    })
+}
+
+fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
+    use modelscope::ModelScope;
+
+    let cache = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join(".cache")
+        .join("modelscope");
+
+    block_on_async(ModelScope::download(repo_id, &cache))
+        .with_context(|| format!("failed to download model {repo_id:?} from ModelScope"))?;
+
+    Ok(cache.join(repo_id))
+}
+
 fn resolve_model_dir(model_id_or_path: &str) -> Result<PathBuf> {
     let path = Path::new(model_id_or_path);
     if path.exists() {
         return Ok(path.to_path_buf());
     }
 
-    use hf_hub::api::sync::Api;
-    use hf_hub::{Repo, RepoType};
-
-    let api = Api::new().context("failed to create HuggingFace API")?;
-    let repo = api.repo(Repo::new(model_id_or_path.to_string(), RepoType::Model));
-    let config_path = repo
-        .get("config.json")
-        .with_context(|| format!("failed to download config.json for {model_id_or_path:?}"))?;
-
-    config_path.parent().map(Path::to_path_buf).ok_or_else(|| {
-        anyhow::anyhow!(
-            "failed to determine HuggingFace snapshot directory for {model_id_or_path:?}"
-        )
-    })
+    modelscope_download(model_id_or_path)
+        .with_context(|| format!("failed to resolve model directory for {model_id_or_path:?}"))
 }
 
 fn load_config_json(model_dir: &Path) -> Result<AsrConfig> {
@@ -249,41 +266,7 @@ fn ensure_weights_files(model_id_or_path: &str, model_dir: &Path) -> Result<Vec<
         return shard_paths_from_local_index(model_dir, &index_path);
     }
 
-    // Local dir but weights missing.
-    if Path::new(model_id_or_path).exists() {
-        bail!("no model.safetensors or model.safetensors.index.json found in {model_dir:?}");
-    }
-
-    // Remote: attempt to download either a single safetensors file or an index + shards.
-    use hf_hub::api::sync::Api;
-    use hf_hub::{Repo, RepoType};
-
-    let api = Api::new().context("failed to create HuggingFace API")?;
-    let repo = api.repo(Repo::new(model_id_or_path.to_string(), RepoType::Model));
-
-    let single_res = repo.get("model.safetensors");
-    if let Ok(p) = single_res {
-        return Ok(vec![p]);
-    }
-    let single_err = single_res
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("internal error: missing error for model.safetensors"))?;
-
-    let index_path = repo.get("model.safetensors.index.json").with_context(|| {
-        format!(
-            "failed to download model.safetensors.index.json for {model_id_or_path:?} (also tried model.safetensors: {single_err:#})"
-        )
-    })?;
-
-    let shard_filenames = shard_filenames_from_index(&index_path)?;
-    let mut shard_paths: Vec<PathBuf> = Vec::with_capacity(shard_filenames.len());
-    for fname in shard_filenames {
-        let p = repo
-            .get(fname.as_str())
-            .with_context(|| format!("failed to download {fname:?} for {model_id_or_path:?}"))?;
-        shard_paths.push(p);
-    }
-    Ok(shard_paths)
+    bail!("no model.safetensors or model.safetensors.index.json found in {model_dir:?}");
 }
 
 #[cfg(test)]

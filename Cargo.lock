@@ -378,12 +378,12 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
 dependencies = [
  "accelerate-src",
  "byteorder",
  "candle-kernels",
- "candle-metal-kernels",
+ "candle-metal-kernels 0.10.2 (git+https://gitee.com/good-as-water/candle.git?rev=5404348)",
  "candle-ug",
  "cudarc 0.19.7",
  "float8",
@@ -410,7 +410,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -421,9 +421,24 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
 dependencies = [
  "cudaforge",
+]
+
+[[package]]
+name = "candle-metal-kernels"
+version = "0.10.2"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+dependencies = [
+ "block2",
+ "half",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "once_cell",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -444,11 +459,11 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
 dependencies = [
  "accelerate-src",
  "candle-core",
- "candle-metal-kernels",
+ "candle-metal-kernels 0.10.2 (git+https://gitee.com/good-as-water/candle.git?rev=5404348)",
  "half",
  "intel-mkl-src",
  "libc",
@@ -463,7 +478,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -484,7 +499,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
+source = "git+https://gitee.com/good-as-water/candle.git?rev=5404348#54043486fe252e6a068af85e659b3e822738fdb1"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -662,8 +677,8 @@ dependencies = [
  "cookie",
  "document-features",
  "idna",
- "indexmap",
  "log",
+ "publicsuffix",
  "serde",
  "serde_derive",
  "serde_json",
@@ -1779,27 +1794,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "ureq 2.12.1",
+ "ureq",
  "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "hf-hub"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
-dependencies = [
- "dirs",
- "http",
- "indicatif 0.18.4",
- "libc",
- "log",
- "rand 0.9.4",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "ureq 3.3.0",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2604,11 +2600,11 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git?rev=0a14af4a43e6f61afbed71f72f22c162ab944c0d#0a14af4a43e6f61afbed71f72f22c162ab944c0d"
+source = "git+https://gitee.com/good-as-water/mistral.rs.git?rev=0a14af4a43e6f61afbed71f72f22c162ab944c0d#0a14af4a43e6f61afbed71f72f22c162ab944c0d"
 dependencies = [
  "anyhow",
  "candle-core",
- "candle-metal-kernels",
+ "candle-metal-kernels 0.10.2 (git+https://github.com/huggingface/candle.git?rev=5404348)",
  "cudaforge",
  "dispatch2",
  "float8",
@@ -2621,17 +2617,17 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.8.3"
-source = "git+https://github.com/EricLBuehler/mistral.rs.git?rev=0a14af4a43e6f61afbed71f72f22c162ab944c0d#0a14af4a43e6f61afbed71f72f22c162ab944c0d"
+source = "git+https://gitee.com/good-as-water/mistral.rs.git?rev=0a14af4a43e6f61afbed71f72f22c162ab944c0d#0a14af4a43e6f61afbed71f72f22c162ab944c0d"
 dependencies = [
  "byteorder",
  "candle-core",
- "candle-metal-kernels",
+ "candle-metal-kernels 0.10.2 (git+https://github.com/huggingface/candle.git?rev=5404348)",
  "candle-nn",
  "cudaforge",
  "dispatch2",
  "float8",
  "half",
- "hf-hub 0.4.3",
+ "hf-hub",
  "indicatif 0.18.4",
  "lazy_static",
  "memmap2",
@@ -2647,6 +2643,22 @@ dependencies = [
  "tokio",
  "tracing",
  "yoke 0.8.2",
+]
+
+[[package]]
+name = "modelscope"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e70d3712581a1c6148246dc7cefd63d2dbb3a40ba70602170adbec34bb7319bf"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "indicatif 0.18.4",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2920,7 +2932,7 @@ dependencies = [
  "tar",
  "thiserror 1.0.69",
  "toml",
- "ureq 2.12.1",
+ "ureq",
  "url",
  "uuid",
  "walkdir",
@@ -3109,6 +3121,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
+
+[[package]]
 name = "ptr_meta"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3126,6 +3144,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "publicsuffix"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
+dependencies = [
+ "idna",
+ "psl-types",
 ]
 
 [[package]]
@@ -3480,7 +3508,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -3493,9 +3521,13 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "cookie",
+ "cookie_store",
+ "encoding_rs",
  "futures-channel",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -3504,21 +3536,26 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -4953,39 +4990,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ureq"
-version = "3.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
-dependencies = [
- "base64 0.22.1",
- "cookie_store",
- "flate2",
- "log",
- "percent-encoding",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "socks",
- "ureq-proto",
- "utf8-zero",
- "webpki-roots 1.0.7",
-]
-
-[[package]]
-name = "ureq-proto"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
-dependencies = [
- "base64 0.22.1",
- "http",
- "httparse",
- "log",
-]
-
-[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4996,12 +5000,6 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
-
-[[package]]
-name = "utf8-zero"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -5071,10 +5069,10 @@ dependencies = [
  "float8",
  "fs2",
  "half",
- "hf-hub 0.5.0",
  "intel-mkl-src",
  "lindera",
  "lindera-ipadic",
+ "modelscope",
  "rayon",
  "reqwest 0.13.4",
  "rubato",
@@ -5084,6 +5082,7 @@ dependencies = [
  "serde_json",
  "symphonia",
  "tokenizers 0.23.1",
+ "tokio",
  "tracing",
  "unicode-general-category",
  "unicode-normalization",
@@ -5097,7 +5096,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
- "candle-metal-kernels",
+ "candle-metal-kernels 0.10.2 (git+https://gitee.com/good-as-water/candle.git?rev=5404348)",
  "dispatch2",
  "mistralrs-paged-attn",
  "objc2-metal",
@@ -5113,8 +5112,9 @@ dependencies = [
  "anyhow",
  "bindgen_cuda",
  "candle-core",
- "candle-metal-kernels",
+ "candle-metal-kernels 0.10.2 (git+https://gitee.com/good-as-water/candle.git?rev=5404348)",
  "candle-nn",
+ "half",
  "mistralrs-quant",
  "objc2-metal",
  "tracing",
@@ -5149,8 +5149,8 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
- "hf-hub 0.5.0",
  "kaldi-fbank-rust-kautism",
+ "modelscope",
  "ndarray",
  "rayon",
  "serde",
@@ -5324,6 +5324,19 @@ name = "wasm-streams"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",

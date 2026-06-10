@@ -21,21 +21,8 @@ use vasr_quant::isq_linear::set_linear_is_prefill;
 pub struct PagedBatchConfig {
     pub max_new_tokens: usize,
     pub eos_token_ids: Vec<u32>,
-    /// When true, finished sequences are removed from the active forward batch.
-    pub compact_finished: bool,
     /// First `request_id` assigned to row 0; row `i` uses `request_id_base + i`.
     pub request_id_base: usize,
-}
-
-impl PagedBatchConfig {
-    pub fn for_static_batch(max_new_tokens: usize, eos_token_ids: &[u32]) -> Self {
-        Self {
-            max_new_tokens,
-            eos_token_ids: eos_token_ids.to_vec(),
-            compact_finished: false,
-            request_id_base: 0,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -52,8 +39,6 @@ pub struct PagedBatchState {
     pub decode_step: usize,
     pub max_new_tokens: usize,
     pub eos_token_ids: Vec<u32>,
-    pub eos_fill_id: u32,
-    pub compact_finished: bool,
 }
 
 impl PagedBatchState {
@@ -128,7 +113,6 @@ pub fn paged_batch_prefill_row(
     let config = PagedBatchConfig {
         max_new_tokens,
         eos_token_ids: eos_token_ids.to_vec(),
-        compact_finished: true,
         request_id_base: request_id,
     };
     let state = paged_batch_prefill(
@@ -170,6 +154,11 @@ pub fn paged_batch_decode_slots_at_step(
     let mut forward_indices: Vec<usize> = (0..slots.len())
         .filter(|&i| !slots[i].finished && slots[i].decode_step == step)
         .collect();
+    tracing::info!(
+        "paged_batch_decode_slots_at_step: step={step} slots={} forward={}",
+        slots.len(),
+        forward_indices.len(),
+    );
     if forward_indices.is_empty() {
         return Ok(());
     }
@@ -182,10 +171,16 @@ pub fn paged_batch_decode_slots_at_step(
             .checked_add(slot.generated.len())
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| anyhow::anyhow!("paged slot token count overflow"))?;
-        if runtime
+        let alloc_ok = runtime
             .manager_mut()
-            .try_allocate_slots(slot.request_id, num_tokens)?
-        {
+            .try_allocate_slots(slot.request_id, num_tokens)?;
+        tracing::info!(
+            "  slot[{i}] req={} prompt_len={} generated={} num_tokens={num_tokens} alloc={alloc_ok}",
+            slot.request_id,
+            slot.prompt_len_usize,
+            slot.generated.len(),
+        );
+        if alloc_ok {
             decodable_indices.push(i);
         }
     }
@@ -290,6 +285,15 @@ pub fn paged_batch_run(
     }
     if config.max_new_tokens == 0 {
         return Ok(vec![vec![]; batch]);
+    }
+
+    // Defensively free any stale request IDs left over from a previous failed run
+    // that shares the same `request_id_base` (commonly 0 for static batches).
+    {
+        let request_ids: Vec<usize> = (0..batch)
+            .map(|i| config.request_id_base.saturating_add(i))
+            .collect();
+        runtime.manager_mut().free_many(&request_ids);
     }
 
     let mut state = paged_batch_prefill(
@@ -475,12 +479,13 @@ pub fn paged_batch_prefill(
         decode_step: 0,
         max_new_tokens: config.max_new_tokens,
         eos_token_ids: config.eos_token_ids.clone(),
-        eos_fill_id: config.eos_token_ids[0],
-        compact_finished: config.compact_finished,
     })
 }
 
 /// Run one decode step. Returns `Ok(false)` when all sequences are finished.
+///
+/// Finished sequences are compacted out of the forward batch so only active
+/// sequences consume compute.
 pub fn paged_batch_decode_step(
     thinker: &ThinkerForConditionalGeneration,
     device: &Device,
@@ -495,24 +500,19 @@ pub fn paged_batch_decode_step(
     }
 
     let step = state.decode_step;
-    let batch = state.batch;
     let eos_token_ids = state.eos_token_ids.as_slice();
-    let compact = state.compact_finished;
 
-    let mut forward_indices: Vec<usize> = if compact {
-        state.active_indices()
-    } else {
-        (0..batch).collect()
-    };
-
+    let mut forward_indices: Vec<usize> = state.active_indices();
     if forward_indices.is_empty() {
         state.decode_step = state.decode_step.saturating_add(1);
         return Ok(!state.all_finished());
     }
 
     for &i in &forward_indices {
+        // `step + 1` covers decode position (prompt_len + step) + 1,
+        // ensuring the block table always has enough entries.
         let num_tokens = state.prompt_lens_usize[i]
-            .checked_add(state.generated[i].len())
+            .checked_add(step)
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| anyhow::anyhow!("paged batch token count overflow"))?;
         runtime
@@ -534,34 +534,28 @@ pub fn paged_batch_decode_step(
                 state.request_ids[i],
                 state.prompt_lens_usize[i] + state.generated[i].len(),
             );
-            if compact {
-                continue;
-            }
-            tokens_in.push(state.eos_fill_id);
-        } else {
-            state.generated[i].push(tok);
-            tokens_in.push(tok);
+            continue;
         }
+        state.generated[i].push(tok);
+        tokens_in.push(tok);
     }
 
-    if compact {
-        forward_indices.retain(|&i| !state.finished[i]);
-        if forward_indices.is_empty() {
-            state.decode_step = state.decode_step.saturating_add(1);
-            return Ok(!state.all_finished());
-        }
-        tokens_in = forward_indices
-            .iter()
-            .map(|&i| {
-                state
-                    .generated
-                    .get(i)
-                    .and_then(|g| g.last())
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("missing generated token for row {i}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+    forward_indices.retain(|&i| !state.finished[i]);
+    if forward_indices.is_empty() {
+        state.decode_step = state.decode_step.saturating_add(1);
+        return Ok(!state.all_finished());
     }
+    tokens_in = forward_indices
+        .iter()
+        .map(|&i| {
+            state
+                .generated
+                .get(i)
+                .and_then(|g| g.last())
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("missing generated token for row {i}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let active_batch = forward_indices.len();
     let input_ids_new = Tensor::from_vec(tokens_in, (active_batch, 1usize), device)?;
@@ -673,8 +667,6 @@ mod tests {
             decode_step: 0,
             max_new_tokens: 16,
             eos_token_ids: vec![0],
-            eos_fill_id: 0,
-            compact_finished: true,
         };
         assert_eq!(state.active_indices(), vec![0, 2]);
     }

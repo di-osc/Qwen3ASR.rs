@@ -13,7 +13,7 @@ path = "src/bin/vasr_transcribe.rs"
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
+candle-core = { git = "https://gitee.com/good-as-water/candle", version = "0.10.2", rev = "5404348" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

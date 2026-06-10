@@ -7,7 +7,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear, linear_no_bias, ops::softmax_last_dim};
-use hf_hub::api::sync::Api;
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
@@ -24,7 +23,7 @@ pub const FSMN_VAD_CHUNK_SIZE: usize = 512;
 const FSMN_VAD_FRAME_SHIFT_SAMPLES: usize = 160;
 const FSMN_VAD_FRAME_LENGTH_SAMPLES: usize = 400;
 const FSMN_VAD_FEAT_CHUNK_SIZE: usize = 6000;
-const FSMN_VAD_REPO: &str = "funasr/fsmn-vad";
+const FSMN_VAD_REPO: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
 const FSMN_VAD_LAYERS: usize = 4;
 const FSMN_VAD_PROJ_DIM: usize = 128;
 const FSMN_VAD_CACHE_FRAMES: usize = 19;
@@ -931,14 +930,33 @@ impl WavFrontend {
 }
 
 fn download_fsmn_vad() -> Result<PathBuf> {
-    let api = Api::new()?;
-    let repo = api.model(FSMN_VAD_REPO.to_string());
-    let model_path = repo.get("model.pt")?;
-    repo.get("am.mvn")?;
-    model_path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow::anyhow!("downloaded FSMN VAD model path has no parent"))
+    let cache = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join(".cache")
+        .join("modelscope");
+
+    block_on_async(modelscope::ModelScope::download(
+        FSMN_VAD_REPO,
+        &cache,
+    ))
+    .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+
+    Ok(cache.join(FSMN_VAD_REPO))
+}
+
+fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
+where
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let rt = tokio::runtime::Runtime::new()
+                .expect("failed to create tokio runtime");
+            rt.block_on(future)
+        }).join()
+        .expect("tokio download thread panicked")
+    })
 }
 
 fn sample_range(start: usize, end: usize) -> TimeRange {

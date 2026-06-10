@@ -85,7 +85,8 @@ fn slot_for_block_table_position(
     let offset = position % block_size;
     let block_id = *table.get(block_idx).ok_or_else(|| {
         candle_core::Error::Msg(format!(
-            "missing block table entry: sequence={seq} block_idx={block_idx}"
+            "missing block table entry: seq={seq} block_idx={block_idx} position={position} block_size={block_size} table_len={} table={table:?}",
+            table.len(),
         ))
     })?;
     if block_id >= num_blocks {
@@ -580,7 +581,9 @@ impl PagedKvCache {
                 let offset = position % self.block_size;
                 let block_id = *table.get(block_idx).ok_or_else(|| {
                     candle_core::Error::Msg(format!(
-                        "missing block table entry: sequence={seq} block_idx={block_idx}"
+                        "missing block table entry: sequence={seq} block_idx={block_idx} position={position} block_size={} table_len={} table={table:?}",
+                        self.block_size,
+                        table.len(),
                     ))
                 })?;
                 if block_id >= self.num_blocks {
@@ -700,7 +703,9 @@ impl PagedKvCache {
                 let offset = position % self.block_size;
                 let block_id = *table.get(block_idx).ok_or_else(|| {
                     candle_core::Error::Msg(format!(
-                        "missing block table entry: sequence={seq} block_idx={block_idx}"
+                        "missing block table entry: sequence={seq} block_idx={block_idx} position={position} block_size={} table_len={} table={table:?}",
+                        self.block_size,
+                        table.len(),
                     ))
                 })?;
                 if block_id >= self.num_blocks {
@@ -846,7 +851,7 @@ impl PagedKvCache {
         }
         #[cfg(feature = "cuda-graph")]
         let max_blocks =
-            crate::model::cuda_graph::bucket_block_table_cols(raw_max_blocks, self.block_size());
+            crate::cuda_graph::bucket_block_table_cols(raw_max_blocks, self.block_size());
         #[cfg(not(feature = "cuda-graph"))]
         let max_blocks = raw_max_blocks;
 
@@ -867,12 +872,31 @@ impl PagedKvCache {
         let mut all_contexts: Vec<u32> = Vec::with_capacity(steps.saturating_mul(batch));
         let mut max_context_lens = Vec::with_capacity(steps);
 
+        tracing::info!(
+            "decode_metadata_for_batch_steps: batch={batch} steps={steps} block_size={} max_tokens_per_seq={}",
+            self.block_size,
+            self.max_tokens_per_sequence
+        );
+        for seq in 0..batch {
+            let table = &block_tables[seq];
+            tracing::info!(
+                "  seq={seq} prompt_len={} block_table_len={} block_table={:?}",
+                prompt_lens[seq],
+                table.len(),
+                table,
+            );
+        }
         for step in 0..steps {
             let mut step_max_context = 0usize;
             for seq in 0..batch {
                 let position = prompt_lens[seq].checked_add(step).ok_or_else(|| {
                     candle_core::Error::Msg("batch decode slot position overflow".to_string())
                 })?;
+                let block_idx = position / self.block_size;
+                tracing::info!(
+                    "  step={step} seq={seq} position={position} block_idx={block_idx} table_len={}",
+                    block_tables[seq].len(),
+                );
                 let context_len = position.checked_add(1).ok_or_else(|| {
                     candle_core::Error::Msg("batch decode context length overflow".to_string())
                 })?;

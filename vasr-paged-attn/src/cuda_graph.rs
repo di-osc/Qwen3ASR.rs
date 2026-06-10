@@ -189,6 +189,7 @@ impl DecodeCudaGraph {
             max_context_len: input_metadata.max_context_len,
             token_attention_mask: None,
             prefill_attention_mask: None,
+            prefill_flash_params: None,
             prefill_causal_only: false,
             query_lens: None,
             kv_lens: None,
@@ -241,8 +242,8 @@ impl DecodeCudaGraph {
         ))
     }
 
-    pub fn capture(
-        thinker: &ThinkerForConditionalGeneration,
+    pub fn capture<M: PagedCudaDecodeForward>(
+        thinker: &M,
         paged_cache: &PagedKvCache,
         device: &Device,
         max_context_len: usize,
@@ -264,6 +265,7 @@ impl DecodeCudaGraph {
             max_context_len,
             token_attention_mask: None,
             prefill_attention_mask: None,
+            prefill_flash_params: None,
             prefill_causal_only: true,
             query_lens: None,
             kv_lens: None,
@@ -415,6 +417,7 @@ pub fn pad_decode_batch_to_max(
             max_context_len: metadata.max_context_len,
             token_attention_mask: None,
             prefill_attention_mask: None,
+            prefill_flash_params: None,
             prefill_causal_only: false,
             query_lens: None,
             kv_lens: None,

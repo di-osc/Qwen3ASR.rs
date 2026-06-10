@@ -11,6 +11,11 @@ members = [
 ]
 resolver = "3"
 
+[patch."https://github.com/huggingface/candle.git"]
+candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-kernels = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

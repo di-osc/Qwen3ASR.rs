@@ -53,7 +53,6 @@ pub struct InferenceData {
     pub sentences: Vec<SentenceResult>,
     pub is_bad: bool,
     pub bad_reason: Option<String>,
-    #[serde(rename = "bad_componet")]
     pub bad_component: Option<String>,
 }
 

@@ -89,6 +89,20 @@ pub async fn run_local(args: RunTranscribeArgs) -> Result<()> {
         let response = transcribe_response_for_outcome(path, outcome, batch_wall, files.len());
         if response.data.first().is_some_and(|item| item.is_bad) {
             bad_count += 1;
+            let reason = outcome
+                .result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string());
+            let component = outcome.bad_component.unwrap_or("unknown");
+            tracing::error!(
+                target: "vasr_transcribe::run",
+                path = %path.display(),
+                component,
+                error = %reason,
+                "Transcription failed"
+            );
         }
 
         let file = fs::File::create(&output_path)

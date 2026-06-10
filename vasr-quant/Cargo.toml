@@ -7,11 +7,12 @@ repository.workspace = true
 description = "In-situ quantization and platform-specific matmul kernels for VASR"
 
 [dependencies]
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348" }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "5404348", optional = true }
+candle-core = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-nn = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348" }
+candle-metal-kernels = { git = "https://gitee.com/good-as-water/candle.git", version = "0.10.2", rev = "5404348", optional = true }
 objc2-metal = { version = "0.3.2", optional = true }
-mistralrs-quant = { git = "https://github.com/EricLBuehler/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
+mistralrs-quant = { git = "https://gitee.com/good-as-water/mistral.rs.git", rev = "0a14af4a43e6f61afbed71f72f22c162ab944c0d", optional = true }
+half = "2"
 anyhow = "1"
 tracing = "0.1"
 
