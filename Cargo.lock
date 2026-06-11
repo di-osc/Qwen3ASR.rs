@@ -5070,6 +5070,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "half",
+ "indicatif 0.18.4",
  "intel-mkl-src",
  "lindera",
  "lindera-ipadic",

@@ -1,5 +1,4 @@
 pub mod benchmark;
-pub mod extract_audio;
 pub mod pipeline;
 pub mod protocol;
 pub mod run;
@@ -7,7 +6,6 @@ pub mod serve;
 pub mod server;
 
 pub use benchmark::{BenchmarkTranscribeArgs, run_benchmark};
-pub use extract_audio::{ExtractAudioArgs, run_extract_audio};
 pub use pipeline::{AsyncTranscribePipeline, TranscribeInput, TranscribeItemOutcome};
 pub use protocol::*;
 pub use run::{RunTranscribeArgs, run_local};
