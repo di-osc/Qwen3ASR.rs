@@ -11,10 +11,10 @@ use candle_core::quantized::k_quants;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
-#[cfg(feature = "paged-attn")]
-use mistralrs_quant::{AfqBits, AfqGroupSize, AfqLayer, QuantMethod, QuantMethodConfig};
 #[cfg(feature = "metal-paged-attn")]
 use mistralrs_quant::GluActivationType;
+#[cfg(feature = "paged-attn")]
+use mistralrs_quant::{AfqBits, AfqGroupSize, AfqLayer, QuantMethod, QuantMethodConfig};
 
 #[cfg(feature = "timing")]
 static ISQ_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);

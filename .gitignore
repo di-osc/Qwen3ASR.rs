@@ -8,3 +8,4 @@ __pycache__/
 *.so
 *.dylib
 *.dll
+raw_audios/\nresults/

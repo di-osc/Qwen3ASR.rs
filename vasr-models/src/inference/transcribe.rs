@@ -911,9 +911,8 @@ fn generate_raw_prepared_batch_timed(
         let mut gen_timings = GenerationTimings::default();
         #[cfg(feature = "paged-attn")]
         let gen_ids = if let Some(runtime) = paged_runtime {
-            let start_gen = std::time::Instant::now();
-            use crate::inference::batch_scheduler::run_paged_prepared_batch;
-            let ids = run_paged_prepared_batch(
+            use crate::inference::batch_scheduler::run_paged_prepared_batch_timed;
+            let (ids, gt) = run_paged_prepared_batch_timed(
                 thinker,
                 device,
                 runtime,
@@ -924,11 +923,7 @@ fn generate_raw_prepared_batch_timed(
                 batch_prepared.len(),
                 pad_id,
             )?;
-            gen_timings = GenerationTimings {
-                decode_us: duration_to_us(start_gen.elapsed()),
-                tokens_generated: ids.iter().map(Vec::len).sum(),
-                ..GenerationTimings::default()
-            };
+            gen_timings = gt;
             ids
         } else {
             let (ids, gt) = greedy_generate_cached_batch_timed(

@@ -461,18 +461,10 @@ mod tests {
         let (cos_full, sin_full) = rope.forward(&x, &position_ids)?;
         let (cos_one, sin_one) = rope.forward_first_modality(&x, &position_ids)?;
 
-        let q = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, 4usize, seq_len, head_dim),
-            &device,
-        )?;
-        let k = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, 4usize, seq_len, head_dim),
-            &device,
-        )?;
+        let q =
+            candle_core::Tensor::randn(0f32, 0.02f32, (batch, 4usize, seq_len, head_dim), &device)?;
+        let k =
+            candle_core::Tensor::randn(0f32, 0.02f32, (batch, 4usize, seq_len, head_dim), &device)?;
         let mrope_section = &[24usize, 20, 20];
 
         let (q_standard, k_standard) = super::apply_multimodal_rotary_pos_emb_standard(
@@ -484,14 +476,8 @@ mod tests {
         )?;
         let (q_one, k_one) = super::apply_rope_batched_generic(&q, &k, &cos_one, &sin_one)?;
 
-        let q_diff = (q_standard - q_one)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        let k_diff = (k_standard - k_one)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
+        let q_diff = (q_standard - q_one)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let k_diff = (k_standard - k_one)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(q_diff < 1e-6, "q diff {q_diff}");
         assert!(k_diff < 1e-6, "k diff {k_diff}");
         Ok(())
@@ -512,23 +498,14 @@ mod tests {
             candle_core::DType::F32,
             &device,
         )?;
-        let pos =
-            candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
+        let pos = candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
         let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
         let (cos, sin) = rope.forward_first_modality(&x, &position_ids)?;
 
-        let q = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, heads, seq_len, head_dim),
-            &device,
-        )?;
-        let k = candle_core::Tensor::randn(
-            0f32,
-            0.02f32,
-            (batch, heads, seq_len, head_dim),
-            &device,
-        )?;
+        let q =
+            candle_core::Tensor::randn(0f32, 0.02f32, (batch, heads, seq_len, head_dim), &device)?;
+        let k =
+            candle_core::Tensor::randn(0f32, 0.02f32, (batch, heads, seq_len, head_dim), &device)?;
 
         let (q_generic, k_generic) = super::apply_rope_batched_generic(&q, &k, &cos, &sin)?;
         let (q_accel, k_accel) = vasr_quant::apply_rotary_qk(&q, &k, &cos, &sin, true)?;
@@ -562,8 +539,7 @@ mod tests {
             candle_core::DType::BF16,
             &device,
         )?;
-        let pos =
-            candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
+        let pos = candle_core::Tensor::from_vec(vec![70i64, 71, 72], (batch, seq_len), &device)?;
         let position_ids = candle_core::Tensor::stack(&[&pos, &pos, &pos], 0)?;
         let (cos, sin) = rope.forward_first_modality(&x, &position_ids)?;
 

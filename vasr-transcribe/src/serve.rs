@@ -346,18 +346,30 @@ fn load_asr_model(
 ) -> Result<Arc<dyn AsrModel>> {
     let device = resolve_device(&args.device)?;
     let dtype = auto_dtype(&device)?;
-    #[cfg(any(feature = "metal", feature = "cuda"))]
-    let paged_cache_config = build_paged_cache_config(
-        &device,
-        args.pa_context_len,
-        args.pa_gpu_memory_fraction,
-        args.pa_block_size,
-    )?;
+    #[cfg(feature = "paged-attn")]
+    let paged_cache_config = {
+        #[cfg(any(feature = "metal", feature = "cuda"))]
+        {
+            build_paged_cache_config(
+                &device,
+                args.pa_context_len,
+                args.pa_gpu_memory_fraction,
+                args.pa_block_size,
+            )?
+        }
+        #[cfg(not(any(feature = "metal", feature = "cuda")))]
+        {
+            vasr_models::PagedCacheConfig {
+                block_size: 32,
+                memory: vasr_models::PagedCacheMemory::ContextSize(100_000),
+            }
+        }
+    };
     let load_options = LoadOptions {
         dtype,
         use_flash_attn: device.is_cuda(),
         isq: args.isq.clone(),
-        #[cfg(any(feature = "metal", feature = "cuda"))]
+        #[cfg(feature = "paged-attn")]
         paged_cache: Some(paged_cache_config),
     };
 

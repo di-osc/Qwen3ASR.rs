@@ -29,8 +29,9 @@ vasr-runtime = { path = "../vasr-runtime", features = ["async"] }
 [features]
 default = []
 accelerate = ["vasr-runtime/accelerate"]
-cuda = ["vasr-runtime/cuda", "vasr-runtime/cuda-graph", "vasr-runtime/flash-attn", "vasr-runtime/cuda-quant", "vasr-runtime/timing"]
-metal = ["vasr-runtime/metal", "vasr-runtime/timing"]
+cuda = ["vasr-runtime/cuda", "vasr-runtime/cuda-graph", "vasr-runtime/flash-attn", "vasr-runtime/cuda-quant", "vasr-runtime/timing", "paged-attn"]
+metal = ["vasr-runtime/metal", "vasr-runtime/timing", "paged-attn"]
+paged-attn = ["vasr-runtime/paged-attn"]
 
 [lints]
 workspace = true

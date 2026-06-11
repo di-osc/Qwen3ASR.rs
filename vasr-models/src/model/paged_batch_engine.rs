@@ -9,7 +9,7 @@ use candle_core::{Device, Tensor};
 use crate::model::attention;
 use crate::model::generation::{
     argmax_token_ids_from_logits, attention_masks_are_right_padded, count_audio_placeholders_batch,
-    gather_last_logits_for_prompt_lens, normalize_batch_for_paged_prefill, position_ids_for_step,
+    normalize_batch_for_paged_prefill, position_ids_for_step,
 };
 use crate::model::paged_cache_runtime::PagedCacheRuntime;
 use crate::model::paged_kv_cache::PagedInputMetadata;
@@ -97,6 +97,49 @@ impl PagedDecodeSlot {
 
 pub fn paged_batch_free_slots(runtime: &mut PagedCacheRuntime, request_ids: &[usize]) {
     runtime.manager_mut().free_many(request_ids);
+}
+
+fn cuda_packed_prefill_enabled() -> bool {
+    std::env::var_os("VASR_DISABLE_CUDA_PACKED_PREFILL").is_none()
+}
+
+fn gather_last_logits_for_packed_prompt_lens(
+    logits: &Tensor,
+    prompt_lens: &[i64],
+) -> Result<Tensor> {
+    let (batch, total_tokens, vocab) = logits.dims3()?;
+    if batch != 1 {
+        bail!("packed prefill logits must have batch=1, got {batch}");
+    }
+    let mut gather_idx = Vec::with_capacity(prompt_lens.len());
+    let mut offset = 0usize;
+    for (i, &len_i64) in prompt_lens.iter().enumerate() {
+        if len_i64 <= 0 {
+            bail!("prompt length must be > 0 at batch index {i}: {len_i64}");
+        }
+        let len = usize::try_from(len_i64)
+            .map_err(|_| anyhow::anyhow!("prompt length overflows usize at {i}: {len_i64}"))?;
+        let idx = offset
+            .checked_add(len - 1)
+            .ok_or_else(|| anyhow::anyhow!("packed gather index overflow at batch index {i}"))?;
+        if idx >= total_tokens {
+            bail!(
+                "packed prompt length exceeds logits: batch_index={i} idx={idx} total_tokens={total_tokens}"
+            );
+        }
+        gather_idx.push(u32::try_from(idx).map_err(|_| {
+            anyhow::anyhow!("packed gather index overflows u32 at batch index {i}: {idx}")
+        })?);
+        offset = offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("packed prompt offset overflow at batch index {i}"))?;
+    }
+    if offset != total_tokens {
+        bail!("packed prompt total mismatch: lens_total={offset} logits_total={total_tokens}");
+    }
+    let flat_logits = logits.reshape((total_tokens, vocab))?;
+    let idx = Tensor::from_vec(gather_idx, (prompt_lens.len(),), logits.device())?;
+    Ok(flat_logits.index_select(&idx, 0)?)
 }
 
 pub fn paged_batch_prefill_row(
@@ -401,11 +444,6 @@ pub fn paged_batch_prefill(
     } else {
         0
     };
-    let inputs_embeds = thinker.inputs_embeds_with_audio_features(
-        &input_ids_t,
-        audio_features,
-        audio_placeholder_count,
-    )?;
 
     let request_ids: Vec<usize> = (0..batch)
         .map(|i| config.request_id_base.saturating_add(i))
@@ -418,41 +456,127 @@ pub fn paged_batch_prefill(
     let block_tables = runtime.block_tables_for(&request_ids)?;
 
     let (position_ids, _rope_deltas) = get_rope_index(&attention_mask_t)?;
-    let mut input_metadata = runtime.cache().input_metadata_from_attention_masks(
-        &block_tables,
-        paged_mask_rows.as_slice(),
-        device,
-    )?;
-    if !input_metadata.prefill_causal_only {
-        input_metadata.prefill_attention_mask = Some(attention::make_causal_mask(
-            input_metadata.token_attention_mask.as_ref(),
-            batch,
-            seq_len,
-            inputs_embeds.dtype(),
+    let use_packed_cuda_prefill = device.is_cuda() && cuda_packed_prefill_enabled();
+    let (logits, _input_metadata, prompt_lens_i64) = if use_packed_cuda_prefill {
+        let total_tokens: usize = prompt_lens_usize.iter().sum();
+        let mut packed_ids = Vec::with_capacity(total_tokens);
+        let mut packed_audio_features: Vec<Tensor> = Vec::new();
+        let mut audio_offset = 0usize;
+        for i in 0..batch {
+            let len = prompt_lens_usize[i];
+            packed_ids.extend_from_slice(&paged_id_rows[i][..len]);
+            let row_audio_tokens = paged_id_rows[i][..len]
+                .iter()
+                .filter(|&&id| id == thinker.audio_token_id())
+                .count();
+            if let Some(af) = audio_features {
+                if row_audio_tokens > 0 {
+                    packed_audio_features.push(af.narrow(0, audio_offset, row_audio_tokens)?);
+                }
+            }
+            audio_offset = audio_offset.saturating_add(row_audio_tokens);
+        }
+        if audio_features.is_some() && audio_offset != audio_placeholder_count {
+            bail!(
+                "packed prefill audio token mismatch: packed={audio_offset} placeholders={audio_placeholder_count}"
+            );
+        }
+        let packed_input_ids_t = Tensor::from_vec(packed_ids, (1usize, total_tokens), device)?;
+        let packed_audio = if audio_features.is_some() {
+            if packed_audio_features.is_empty() {
+                None
+            } else {
+                let refs = packed_audio_features.iter().collect::<Vec<_>>();
+                Some(Tensor::cat(refs.as_slice(), 0)?)
+            }
+        } else {
+            None
+        };
+        let packed_inputs_embeds = thinker.inputs_embeds_with_audio_features(
+            &packed_input_ids_t,
+            packed_audio.as_ref(),
+            audio_placeholder_count,
+        )?;
+        let mut pos_chunks = Vec::with_capacity(batch);
+        for (row, &len) in prompt_lens_usize.iter().enumerate() {
+            pos_chunks.push(position_ids.narrow(1, row, 1)?.narrow(2, 0, len)?);
+        }
+        let pos_refs = pos_chunks.iter().collect::<Vec<_>>();
+        let packed_position_ids = Tensor::cat(pos_refs.as_slice(), 2)?;
+        let input_metadata = runtime.cache().input_metadata_from_query_lens(
+            &block_tables,
+            prompt_lens_usize.as_slice(),
             device,
-        )?);
-    }
+        )?;
+        let logits = {
+            let _linear_prefill_guard = set_linear_is_prefill(true);
+            thinker.forward_packed_prefill_embeds_with_paged_cache(
+                &packed_position_ids,
+                &packed_inputs_embeds,
+                runtime.cache(),
+                &input_metadata,
+            )?
+        };
+        let prompt_lens_i64 = input_metadata
+            .query_lens
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("packed prefill metadata missing query_lens"))?
+            .iter()
+            .map(|&len| {
+                i64::try_from(len).map_err(|_| anyhow::anyhow!("query_len overflows i64: {len}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (logits, input_metadata, prompt_lens_i64)
+    } else {
+        let inputs_embeds = thinker.inputs_embeds_with_audio_features(
+            &input_ids_t,
+            audio_features,
+            audio_placeholder_count,
+        )?;
+        let mut input_metadata = runtime.cache().input_metadata_from_attention_masks(
+            &block_tables,
+            paged_mask_rows.as_slice(),
+            device,
+        )?;
+        if !input_metadata.prefill_causal_only {
+            input_metadata.prefill_attention_mask = Some(attention::make_causal_mask(
+                input_metadata.token_attention_mask.as_ref(),
+                batch,
+                seq_len,
+                inputs_embeds.dtype(),
+                device,
+            )?);
+        }
 
-    let logits = {
-        let _linear_prefill_guard = set_linear_is_prefill(true);
-        thinker.forward_embeds_with_paged_cache(
-            &position_ids,
-            &inputs_embeds,
-            runtime.cache(),
-            &input_metadata,
-        )?
+        let logits = {
+            let _linear_prefill_guard = set_linear_is_prefill(true);
+            thinker.forward_embeds_with_paged_cache(
+                &position_ids,
+                &inputs_embeds,
+                runtime.cache(),
+                &input_metadata,
+            )?
+        };
+        let prompt_lens_i64 = input_metadata
+            .query_lens
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing query_lens"))?
+            .iter()
+            .map(|&len| {
+                i64::try_from(len).map_err(|_| anyhow::anyhow!("query_len overflows i64: {len}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (logits, input_metadata, prompt_lens_i64)
     };
 
-    let prompt_lens_i64 = input_metadata
-        .query_lens
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing query_lens"))?
-        .iter()
-        .map(|&len| {
-            i64::try_from(len).map_err(|_| anyhow::anyhow!("query_len overflows i64: {len}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let last_logits = gather_last_logits_for_prompt_lens(&logits, prompt_lens_i64.as_slice())?;
+    let last_logits = if use_packed_cuda_prefill {
+        gather_last_logits_for_packed_prompt_lens(&logits, prompt_lens_i64.as_slice())?
+    } else {
+        crate::model::generation::gather_last_logits_for_prompt_lens(
+            &logits,
+            prompt_lens_i64.as_slice(),
+        )?
+    };
     let next_ids = argmax_token_ids_from_logits(&last_logits, batch)?;
     let finished: Vec<bool> = next_ids
         .iter()

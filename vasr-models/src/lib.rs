@@ -14,6 +14,22 @@ use anyhow::Result;
 use candle_core::Device;
 use std::sync::Arc;
 
+/// Directory where ModelScope models are cached.
+///
+/// Respects the `VASR_MODEL_DIR` environment variable. When set, it is used
+/// directly (no further path composition). Otherwise defaults to
+/// `$HOME/.cache/vasr` (or `/tmp/.cache/vasr` when `$HOME` is unset).
+pub fn modelscope_cache_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("VASR_MODEL_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join(".cache")
+        .join("vasr")
+}
+
 pub use audio::input::AudioInput;
 #[cfg(feature = "paged-attn")]
 pub use inference::batch_scheduler::{AsrBatchScheduler, AsrBatchSchedulerConfig};
@@ -30,7 +46,7 @@ pub use processor::AsrProcessor;
 #[cfg(feature = "paged-attn")]
 pub use vasr_paged_attn;
 #[cfg(feature = "paged-attn")]
-pub use vasr_paged_attn::{PagedCacheConfig, PagedCacheStats};
+pub use vasr_paged_attn::{PagedCacheConfig, PagedCacheMemory, PagedCacheStats};
 pub use vasr_quant;
 
 pub mod qwen3_asr {

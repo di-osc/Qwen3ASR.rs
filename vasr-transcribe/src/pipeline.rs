@@ -796,8 +796,7 @@ async fn collect_job_microbatch(
     while messages.len() < max_batch_size {
         match asr_rx.try_recv() {
             Ok(Ok(AsrPipelineMessage::Segment(segment))) => {
-                pending.push_front(Ok(AsrPipelineMessage::Segment(segment)));
-                break;
+                pending.push_back(Ok(AsrPipelineMessage::Segment(segment)));
             }
             Ok(message) => messages.push(message),
             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -810,8 +809,7 @@ async fn collect_job_microbatch(
     while messages.len() < max_batch_size {
         match asr_rx.recv().await {
             Some(Ok(AsrPipelineMessage::Segment(segment))) => {
-                pending.push_front(Ok(AsrPipelineMessage::Segment(segment)));
-                break;
+                pending.push_back(Ok(AsrPipelineMessage::Segment(segment)));
             }
             Some(message) => messages.push(message),
             None => break,
@@ -830,12 +828,14 @@ async fn collect_segment_microbatch(
     if max_batch_size <= 1 {
         return segments;
     }
+    // Phase 1: non-blocking drain of everything already in the channel.
     while segments.len() < max_batch_size {
         match asr_rx.try_recv() {
             Ok(Ok(AsrPipelineMessage::Segment(segment))) => segments.push(segment),
             Ok(message) => {
-                pending.push_front(message);
-                break;
+                // Stash non-segment messages (e.g. Job) so we can
+                // keep collecting segments behind them.
+                pending.push_back(message);
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => return segments,
@@ -844,14 +844,22 @@ async fn collect_segment_microbatch(
     if segments.len() >= max_batch_size {
         return segments;
     }
+    // Phase 2: wait up to 10 ms for more segments to arrive so the
+    // continuous scheduler sees larger admit waves.
+    const COLLECT_WAIT_MS: u64 = 500;
     while segments.len() < max_batch_size {
-        match asr_rx.recv().await {
-            Some(Ok(AsrPipelineMessage::Segment(segment))) => segments.push(segment),
-            Some(message) => {
-                pending.push_front(message);
-                break;
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(COLLECT_WAIT_MS),
+            asr_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(Ok(AsrPipelineMessage::Segment(segment)))) => segments.push(segment),
+            Ok(Some(message)) => {
+                // Same as Phase 1: stash non-segment, keep looking.
+                pending.push_back(message);
             }
-            None => break,
+            Ok(None) | Err(tokio::time::error::Elapsed { .. }) => break,
         }
     }
     segments

@@ -18,11 +18,7 @@ use anyhow::{Context, Result, bail};
 fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
     use modelscope::ModelScope;
 
-    let cache = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join(".cache")
-        .join("modelscope");
+    let cache = crate::modelscope_cache_dir();
 
     block_on_async(ModelScope::download(repo_id, &cache))
         .with_context(|| format!("failed to download tokenizer for {repo_id:?} from ModelScope"))?;
@@ -35,12 +31,13 @@ where
     F::Output: Send,
 {
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let rt = tokio::runtime::Runtime::new()
-                .expect("failed to create tokio runtime");
-            rt.block_on(future)
-        }).join()
-        .expect("tokio download thread panicked")
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                rt.block_on(future)
+            })
+            .join()
+            .expect("tokio download thread panicked")
     })
 }
 

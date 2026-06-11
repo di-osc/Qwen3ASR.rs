@@ -11,6 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::{Result, bail};
 use candle_core::{Device, Tensor};
 
+#[cfg(feature = "timing")]
+use crate::model::generation::GenerationTimings;
 use crate::model::paged_batch_engine::{
     PagedBatchConfig, PagedDecodeSlot, paged_batch_decode_slots_at_step, paged_batch_free_slots,
     paged_batch_prefill, paged_batch_run,
@@ -18,6 +20,16 @@ use crate::model::paged_batch_engine::{
 use crate::model::thinker::ThinkerForConditionalGeneration;
 use crate::processor::asr_processor::PreparedInputs;
 use vasr_paged_attn::{PagedBlockManager, PagedCacheRuntime, SharedPagedCacheRuntime};
+
+#[cfg(feature = "timing")]
+fn duration_to_us(d: std::time::Duration) -> u64 {
+    let us = d.as_micros();
+    if us > u128::from(u64::MAX) {
+        u64::MAX
+    } else {
+        us as u64
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AsrBatchSchedulerConfig {
@@ -265,6 +277,7 @@ impl AsrBatchScheduler {
         max_new_tokens: usize,
         eos_token_ids: &[u32],
         pad_id: u32,
+        #[cfg(feature = "timing")] mut timings: Option<&mut GenerationTimings>,
     ) -> Result<Vec<Vec<u32>>> {
         let batch = prepared.len();
         if batch == 0 {
@@ -340,6 +353,8 @@ impl AsrBatchScheduler {
                             })
                             .collect::<Result<Vec<_>>>()?;
 
+                        #[cfg(feature = "timing")]
+                        let start_decode = std::time::Instant::now();
                         paged_batch_decode_slots_at_step(
                             thinker,
                             device,
@@ -349,6 +364,13 @@ impl AsrBatchScheduler {
                             max_new_tokens,
                             eos_token_ids,
                         )?;
+                        #[cfg(feature = "timing")]
+                        if let Some(t) = timings.as_deref_mut() {
+                            t.decode_us = t
+                                .decode_us
+                                .saturating_add(duration_to_us(start_decode.elapsed()));
+                            t.steps = t.steps.saturating_add(1);
+                        }
 
                         for (&slot_idx, slot) in slot_indices.iter().zip(batch_slots.iter()) {
                             if let Some(entry) = running[slot_idx].as_mut() {
@@ -430,6 +452,8 @@ impl AsrBatchScheduler {
                         eos_token_ids: eos_token_ids.to_vec(),
                         request_id_base,
                     };
+                    #[cfg(feature = "timing")]
+                    let start_prefill = std::time::Instant::now();
                     let state = paged_batch_prefill(
                         thinker,
                         device,
@@ -439,6 +463,15 @@ impl AsrBatchScheduler {
                         Some(&wave_audio),
                         &engine_config,
                     )?;
+                    #[cfg(feature = "timing")]
+                    if let Some(t) = timings.as_deref_mut() {
+                        let elapsed = duration_to_us(start_prefill.elapsed());
+                        t.prefill_us = t.prefill_us.saturating_add(elapsed);
+                        t.prefill_forward_us = t.prefill_forward_us.saturating_add(elapsed);
+                        t.prefill_tokens = t
+                            .prefill_tokens
+                            .saturating_add(state.prompt_lens_usize.iter().copied().sum::<usize>());
+                    }
                     for (wave_row, (&client_index, &slot_idx)) in wave_client_indices
                         .iter()
                         .zip(wave_slot_indices.iter())
@@ -538,6 +571,8 @@ pub fn run_paged_prepared_batch(
             max_new_tokens,
             eos_token_ids,
             pad_id,
+            #[cfg(feature = "timing")]
+            None,
         )
     } else {
         let ids_rows: Vec<&[u32]> = prepared.iter().map(|p| p.input_ids.as_slice()).collect();
@@ -558,12 +593,59 @@ pub fn run_paged_prepared_batch(
     }
 }
 
+#[cfg(feature = "timing")]
+pub fn run_paged_prepared_batch_timed(
+    thinker: &ThinkerForConditionalGeneration,
+    device: &Device,
+    runtime: &SharedPagedCacheRuntime,
+    prepared: &[PreparedInputs],
+    audio_features: &Tensor,
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    max_batch_size: usize,
+    pad_id: u32,
+) -> Result<(Vec<Vec<u32>>, GenerationTimings)> {
+    let config = AsrBatchSchedulerConfig::from_max_batch_size(max_batch_size);
+    let mut scheduler = AsrBatchScheduler::new(config);
+    let mut timings = GenerationTimings::default();
+    let ids = if scheduler.config.continuous_batch {
+        scheduler.run_continuous_prepared(
+            thinker,
+            device,
+            runtime,
+            prepared,
+            audio_features,
+            max_new_tokens,
+            eos_token_ids,
+            pad_id,
+            Some(&mut timings),
+        )?
+    } else {
+        let start = std::time::Instant::now();
+        let ids = run_paged_prepared_batch(
+            thinker,
+            device,
+            runtime,
+            prepared,
+            audio_features,
+            max_new_tokens,
+            eos_token_ids,
+            max_batch_size,
+            pad_id,
+        )?;
+        let elapsed = duration_to_us(start.elapsed());
+        timings.prefill_us = timings.prefill_us.saturating_add(elapsed);
+        ids
+    };
+    timings.tokens_generated = ids.iter().map(Vec::len).sum();
+    Ok((ids, timings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AsrBatchSchedulerConfig, PagedBlockManager, can_admit_with_projected_kv,
-        continuous_batch_enabled, group_running_by_decode_step,
-        pad_prepared_wave_for_prefill,
+        continuous_batch_enabled, group_running_by_decode_step, pad_prepared_wave_for_prefill,
     };
     use crate::processor::asr_processor::PreparedInputs;
 

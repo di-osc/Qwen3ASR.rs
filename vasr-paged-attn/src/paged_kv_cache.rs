@@ -71,7 +71,7 @@ fn cumulative_seqlens_from_lengths(lengths: &[usize], device: &Device) -> Result
     Tensor::from_vec(out, (lengths.len() + 1,), device)
 }
 
-fn slot_for_block_table_position(
+pub fn slot_for_block_table_position(
     block_tables: &[Vec<usize>],
     block_size: usize,
     num_blocks: usize,
@@ -772,6 +772,102 @@ impl PagedKvCache {
         })
     }
 
+    pub fn input_metadata_from_query_lens(
+        &self,
+        block_tables: &[Vec<usize>],
+        query_lens_in: &[usize],
+        device: &Device,
+    ) -> Result<PagedInputMetadata> {
+        let batch = query_lens_in.len();
+        if batch == 0 {
+            candle_core::bail!("paged metadata batch must be non-empty");
+        }
+        if block_tables.len() != batch {
+            candle_core::bail!(
+                "paged metadata batch mismatch: block_tables={} query_lens={}",
+                block_tables.len(),
+                batch
+            );
+        }
+        let max_blocks = block_tables.iter().map(Vec::len).max().unwrap_or(0);
+        if max_blocks == 0 {
+            candle_core::bail!("paged metadata requires at least one block per sequence");
+        }
+
+        let total_tokens = query_lens_in.iter().try_fold(0usize, |acc, &len| {
+            if len == 0 {
+                return Err(candle_core::Error::Msg(
+                    "packed prefill query length must be non-zero".to_string(),
+                ));
+            }
+            acc.checked_add(len).ok_or_else(|| {
+                candle_core::Error::Msg("packed prefill token count overflow".to_string())
+            })
+        })?;
+        let mut slots: Vec<i64> = Vec::with_capacity(total_tokens);
+        for (seq, (&len, table)) in query_lens_in.iter().zip(block_tables.iter()).enumerate() {
+            for position in 0..len {
+                slots.push(slot_for_block_table_position(
+                    block_tables,
+                    self.block_size,
+                    self.num_blocks,
+                    seq,
+                    position,
+                )?);
+            }
+            let needed_blocks = len.div_ceil(self.block_size);
+            if table.len() < needed_blocks {
+                candle_core::bail!(
+                    "paged block table too short for packed prefill: seq={seq} len={len} have={} need={needed_blocks}",
+                    table.len()
+                );
+            }
+        }
+
+        let mut block_table_host: Vec<u32> = Vec::with_capacity(batch * max_blocks);
+        for table in block_tables {
+            for &block_id in table {
+                block_table_host.push(u32::try_from(block_id).map_err(|_| {
+                    candle_core::Error::Msg(format!("block id overflows u32: {block_id}"))
+                })?);
+            }
+            for _ in table.len()..max_blocks {
+                block_table_host.push(0);
+            }
+        }
+
+        let mut context_host = Vec::with_capacity(batch);
+        let mut max_context_len = 0usize;
+        for &len in query_lens_in {
+            max_context_len = max_context_len.max(len);
+            context_host.push(u32::try_from(len).map_err(|_| {
+                candle_core::Error::Msg(format!("context length overflows u32: {len}"))
+            })?);
+        }
+
+        let query_lens = Some(query_lens_in.to_vec());
+        let kv_lens = Some(query_lens_in.to_vec());
+        let (prefill_flash_params, cu_seqlens_q, cu_seqlens_kv, max_query_len, max_kv_len) =
+            build_varlen_metadata(query_lens.clone(), kv_lens.clone(), device)?;
+
+        Ok(PagedInputMetadata {
+            slot_mapping: Tensor::from_vec(slots, (total_tokens,), device)?,
+            block_tables: Tensor::from_vec(block_table_host, (batch, max_blocks), device)?,
+            context_lens: Tensor::from_vec(context_host, (batch,), device)?,
+            max_context_len,
+            token_attention_mask: None,
+            prefill_attention_mask: None,
+            prefill_causal_only: true,
+            query_lens,
+            kv_lens,
+            prefill_flash_params,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_query_len,
+            max_kv_len,
+        })
+    }
+
     pub fn decode_metadata_for_steps(
         &self,
         prompt_len: usize,
@@ -1187,6 +1283,32 @@ mod tests {
             assert!(actual.cu_seqlens_q.is_none());
             assert!(actual.cu_seqlens_kv.is_none());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_paged_cache_metadata_from_query_lens_is_packed() -> anyhow::Result<()> {
+        let device = candle_core::Device::Cpu;
+        let cache = PagedKvCache::new_pool(1, 2, 8, 4, 8, candle_core::DType::F32, &device)?;
+
+        let meta =
+            cache.input_metadata_from_query_lens(&[vec![3, 4], vec![6, 7]], &[4, 5], &device)?;
+
+        assert_eq!(
+            meta.slot_mapping.to_vec1::<i64>()?,
+            vec![12, 13, 14, 15, 24, 25, 26, 27, 28]
+        );
+        assert_eq!(
+            meta.block_tables.to_vec2::<u32>()?,
+            vec![vec![3, 4], vec![6, 7]]
+        );
+        assert_eq!(meta.context_lens.to_vec1::<u32>()?, vec![4, 5]);
+        assert_eq!(meta.max_context_len, 5);
+        assert_eq!(meta.query_lens, Some(vec![4, 5]));
+        assert_eq!(meta.kv_lens, Some(vec![4, 5]));
+        assert!(meta.token_attention_mask.is_none());
+        assert!(meta.prefill_causal_only);
 
         Ok(())
     }

@@ -205,16 +205,22 @@ fn run_paged_prefill_attention_fallback(
         q.device(),
     )?;
     let flash_params = input_metadata.prefill_flash_params();
-    let avoid_packed_varlen = q.device().is_cuda()
-        || (q.device().is_metal() && metal_hybrid_paged_prefill_enabled());
+    let avoid_packed_varlen = q.device().is_metal() && metal_hybrid_paged_prefill_enabled();
     if !avoid_packed_varlen && attention::supports_packed_varlen_sdpa(q) {
         let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
         let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
+        let packed_mask = if q.device().is_cuda() {
+            // CUDA packed varlen relies on cu_seqlens + causal flash-attn. A custom
+            // padded mask disables flash-attn and cannot be applied to batch=1 packed K/V.
+            attention::AttentionMask::None
+        } else {
+            mask
+        };
         attention::run_attention(
             q,
             &k_4d,
             &v_4d,
-            &mask,
+            &packed_mask,
             flash_params,
             scaling,
             true,
@@ -1243,6 +1249,127 @@ impl ThinkerTextAttention {
         let attn = attn.reshape((batch, seq_len, self.num_attention_heads * self.head_dim))?;
         self.o_proj.forward(&attn)
     }
+
+    #[cfg(feature = "paged-attn")]
+    fn forward_packed_prefill_with_paged_cache(
+        &self,
+        hidden_states: &Tensor,
+        position_embeddings: (&Tensor, &Tensor),
+        input_metadata: &PagedInputMetadata,
+        rope_scaling: &ThinkerTextRotaryEmbedding,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+    ) -> Result<Tensor> {
+        let (packed_batch, total_tokens, _hidden) = hidden_states.dims3()?;
+        if packed_batch != 1 {
+            candle_core::bail!(
+                "packed paged prefill expects batch=1 packed tokens, got batch={packed_batch}"
+            );
+        }
+        let query_lens = input_metadata
+            .query_lens
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("packed prefill missing query_lens".into()))?;
+        let expected_total: usize = query_lens.iter().sum();
+        if expected_total != total_tokens {
+            candle_core::bail!(
+                "packed prefill token mismatch: hidden={total_tokens} query_lens_total={expected_total}"
+            );
+        }
+        let paged_attn = self
+            .paged_attn
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("paged attention is not initialized".into()))?;
+
+        let q = self.q_proj.forward(hidden_states)?;
+        let k = self.k_proj.forward(hidden_states)?;
+        let v = self.v_proj.forward(hidden_states)?;
+        let q = q
+            .reshape((total_tokens, self.num_attention_heads, self.head_dim))?
+            .unsqueeze(0)?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((total_tokens, self.num_key_value_heads, self.head_dim))?
+            .unsqueeze(0)?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((total_tokens, self.num_key_value_heads, self.head_dim))?
+            .unsqueeze(0)?
+            .transpose(1, 2)?;
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        let (cos, sin) = position_embeddings;
+        let (q, k) = rope::mrope::apply_multimodal_rotary_pos_emb(
+            &q,
+            &k,
+            cos,
+            sin,
+            rope_scaling.mrope_section.as_slice(),
+            rope_scaling.interleaved,
+        )?;
+
+        let k_flat = maybe_contiguous_for_accelerator(k.transpose(1, 2)?.reshape((
+            total_tokens,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?)?;
+        let v_flat = maybe_contiguous_for_accelerator(v.transpose(1, 2)?.reshape((
+            total_tokens,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?)?;
+        #[cfg(any(feature = "cuda-paged-attn", feature = "metal-paged-attn"))]
+        {
+            mistralrs_paged_attn::reshape_and_cache(
+                &k_flat,
+                &v_flat,
+                Some(&paged_attn.k_scale),
+                Some(&paged_attn.v_scale),
+                key_cache,
+                value_cache,
+                &input_metadata.slot_mapping,
+            )?;
+        }
+        #[cfg(not(any(feature = "cuda-paged-attn", feature = "metal-paged-attn")))]
+        {
+            return candle_core::bail!(
+                "paged-attn backend not enabled: build with cuda-paged-attn or metal-paged-attn"
+            );
+        }
+
+        let cu_kv = input_metadata.cu_seqlens_kv.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("packed prefill missing cu_seqlens_kv".into())
+        })?;
+        let (k_gathered, v_gathered) = mistralrs_paged_attn::gather_kv_cache(
+            key_cache,
+            value_cache,
+            Some(&paged_attn.k_scale),
+            Some(&paged_attn.v_scale),
+            &input_metadata.block_tables,
+            cu_kv,
+            hidden_states.dtype(),
+        )?;
+        let k_4d = k_gathered.unsqueeze(0)?.transpose(1, 2)?;
+        let v_4d = v_gathered.unsqueeze(0)?.transpose(1, 2)?;
+        let q = maybe_contiguous_for_accelerator(q)?;
+        let attn_output = attention::run_attention(
+            &q,
+            &k_4d,
+            &v_4d,
+            &attention::AttentionMask::None,
+            input_metadata.prefill_flash_params(),
+            self.scaling as f32,
+            true,
+            self.num_key_value_groups,
+        )?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            1usize,
+            total_tokens,
+            self.num_attention_heads * self.head_dim,
+        ))?;
+        self.o_proj.forward(&attn_output)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1344,6 +1471,34 @@ impl ThinkerTextDecoderLayer {
         let residual = hidden_states.clone();
         let x = self.input_layernorm.forward(hidden_states)?;
         let x = self.self_attn.forward_with_paged_cache(
+            &x,
+            position_embeddings,
+            input_metadata,
+            rope_scaling,
+            key_cache,
+            value_cache,
+        )?;
+        let x = (&residual + &x)?;
+
+        let residual = x.clone();
+        let x = self.post_attention_layernorm.forward(&x)?;
+        let x = self.mlp.forward(&x)?;
+        &residual + &x
+    }
+
+    #[cfg(feature = "paged-attn")]
+    fn forward_packed_prefill_with_paged_cache(
+        &self,
+        hidden_states: &Tensor,
+        position_embeddings: (&Tensor, &Tensor),
+        input_metadata: &PagedInputMetadata,
+        rope_scaling: &ThinkerTextRotaryEmbedding,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+    ) -> Result<Tensor> {
+        let residual = hidden_states.clone();
+        let x = self.input_layernorm.forward(hidden_states)?;
+        let x = self.self_attn.forward_packed_prefill_with_paged_cache(
             &x,
             position_embeddings,
             input_metadata,
@@ -1566,6 +1721,44 @@ impl ThinkerTextModel {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let (key_cache, value_cache) = paged_cache.key_value_cache(layer_idx)?;
             hidden_states = layer.forward_with_paged_cache(
+                &hidden_states,
+                position_embeddings,
+                input_metadata,
+                &self.rotary_emb,
+                key_cache,
+                value_cache,
+            )?;
+        }
+
+        self.norm.forward(&hidden_states)
+    }
+
+    #[cfg(feature = "paged-attn")]
+    pub fn forward_packed_prefill_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+    ) -> Result<Tensor> {
+        let (batch, _seq_len, hidden) = inputs_embeds.dims3()?;
+        if batch != 1 {
+            candle_core::bail!("packed prefill expects inputs_embeds batch=1, got {batch}");
+        }
+        if hidden != self.hidden_size {
+            candle_core::bail!(
+                "inputs_embeds hidden mismatch: expected={}, got={hidden}",
+                self.hidden_size
+            );
+        }
+
+        let (cos, sin) = self.rotary_emb.forward(inputs_embeds, position_ids)?;
+        let position_embeddings = (&cos, &sin);
+
+        let mut hidden_states = inputs_embeds.clone();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let (key_cache, value_cache) = paged_cache.key_value_cache(layer_idx)?;
+            hidden_states = layer.forward_packed_prefill_with_paged_cache(
                 &hidden_states,
                 position_embeddings,
                 input_metadata,

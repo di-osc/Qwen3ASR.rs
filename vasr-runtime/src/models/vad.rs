@@ -930,17 +930,10 @@ impl WavFrontend {
 }
 
 fn download_fsmn_vad() -> Result<PathBuf> {
-    let cache = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-        .join(".cache")
-        .join("modelscope");
+    let cache = vasr_models::modelscope_cache_dir();
 
-    block_on_async(modelscope::ModelScope::download(
-        FSMN_VAD_REPO,
-        &cache,
-    ))
-    .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    block_on_async(modelscope::ModelScope::download(FSMN_VAD_REPO, &cache))
+        .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
 
     Ok(cache.join(FSMN_VAD_REPO))
 }
@@ -950,12 +943,13 @@ where
     F::Output: Send,
 {
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let rt = tokio::runtime::Runtime::new()
-                .expect("failed to create tokio runtime");
-            rt.block_on(future)
-        }).join()
-        .expect("tokio download thread panicked")
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                rt.block_on(future)
+            })
+            .join()
+            .expect("tokio download thread panicked")
     })
 }
 

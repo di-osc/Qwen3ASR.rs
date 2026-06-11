@@ -54,7 +54,7 @@ accelerate = [
   "candle-nn/accelerate",
   "candle-transformers/accelerate",
 ]
-cuda = ["cuda-base", "cuda-graph"]
+cuda = ["cuda-base", "cuda-graph", "flash-attn"]
 cuda-base = [
   "candle-core/cuda",
   "candle-nn/cuda",

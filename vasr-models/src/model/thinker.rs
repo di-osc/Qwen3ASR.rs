@@ -301,6 +301,23 @@ impl ThinkerForConditionalGeneration {
     }
 
     #[cfg(feature = "paged-attn")]
+    pub fn forward_packed_prefill_embeds_with_paged_cache(
+        &self,
+        position_ids: &Tensor,
+        inputs_embeds: &Tensor,
+        paged_cache: &PagedKvCache,
+        input_metadata: &PagedInputMetadata,
+    ) -> Result<Tensor> {
+        let hidden_states = self.text_model.forward_packed_prefill_with_paged_cache(
+            position_ids,
+            inputs_embeds,
+            paged_cache,
+            input_metadata,
+        )?;
+        Ok(self.lm_head.forward(&hidden_states)?)
+    }
+
+    #[cfg(feature = "paged-attn")]
     pub fn forward_input_ids_with_paged_cache(
         &self,
         input_ids: &Tensor,

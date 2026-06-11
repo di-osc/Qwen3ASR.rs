@@ -564,9 +564,18 @@ fn flash_attn_dispatch(
         return Ok(None);
     }
 
-    let (batch, q_len, _heads, _dim) = q.dims4()?;
+    let (batch, q_len, heads, head_dim) = q.dims4()?;
     let k_len = k.dim(1)?;
-    let use_varlen = batch > 1 || q_len != k_len;
+    let use_varlen = flash_params
+        .and_then(|params| {
+            params
+                .cumulative_seqlens_q
+                .as_ref()
+                .zip(params.logical_k.cumulative_seqlens.as_ref())
+        })
+        .is_some()
+        || batch > 1
+        || q_len != k_len;
 
     if use_varlen {
         if let Some(params) = flash_params {
@@ -574,12 +583,44 @@ fn flash_attn_dispatch(
                 params.cumulative_seqlens_q.as_ref(),
                 params.logical_k.cumulative_seqlens.as_ref(),
             ) {
-                let q_shape = q.shape();
-                let q = q.flatten_to(1)?;
+                let query_lens = sequence_lengths_from_cu(cu_q)?;
+                let total_q = query_lens.iter().try_fold(0usize, |acc, &len| {
+                    if len == 0 {
+                        return Err(candle_core::Error::Msg(
+                            "flash varlen query length must be non-zero".to_string(),
+                        ));
+                    }
+                    acc.checked_add(len).ok_or_else(|| {
+                        candle_core::Error::Msg("flash varlen query length overflow".to_string())
+                    })
+                })?;
+                let q_packed = if batch == 1 && q_len == total_q {
+                    q.reshape((total_q, heads, head_dim))?
+                } else {
+                    let mut q_chunks = Vec::with_capacity(query_lens.len());
+                    for (row, &len) in query_lens.iter().enumerate() {
+                        if row >= batch {
+                            candle_core::bail!(
+                                "flash varlen query row exceeds q batch: row={row} batch={batch}"
+                            );
+                        }
+                        if len > q_len {
+                            candle_core::bail!(
+                                "flash varlen query length exceeds padded q_len: row={row} len={len} q_len={q_len}"
+                            );
+                        }
+                        q_chunks.push(
+                            q.narrow(0, row, 1)?
+                                .narrow(1, 0, len)?
+                                .reshape((len, heads, head_dim))?,
+                        );
+                    }
+                    Tensor::cat(q_chunks.as_slice(), 0)?
+                };
                 let k = k.flatten_to(1)?;
                 let v = v.flatten_to(1)?;
                 let out = flash_attn_varlen(
-                    &q,
+                    &q_packed,
                     &k,
                     &v,
                     cu_q,
@@ -589,7 +630,31 @@ fn flash_attn_dispatch(
                     softmax_scale,
                     params.causal,
                 )?;
-                return Ok(Some(out.reshape(q_shape)?));
+
+                if batch == 1 && q_len == total_q {
+                    return Ok(Some(out.reshape((1usize, total_q, heads, head_dim))?));
+                }
+
+                let mut rows = Vec::with_capacity(query_lens.len());
+                let mut offset = 0usize;
+                for &len in &query_lens {
+                    let slice = out
+                        .narrow(0, offset, len)?
+                        .reshape((1usize, len, heads, head_dim))?;
+                    let row = if len < q_len {
+                        let pad = Tensor::zeros(
+                            (1usize, q_len - len, heads, head_dim),
+                            out.dtype(),
+                            out.device(),
+                        )?;
+                        Tensor::cat(&[&slice, &pad], 1)?
+                    } else {
+                        slice
+                    };
+                    rows.push(row);
+                    offset = offset.saturating_add(len);
+                }
+                return Ok(Some(Tensor::cat(rows.as_slice(), 0)?));
             }
         }
     }
