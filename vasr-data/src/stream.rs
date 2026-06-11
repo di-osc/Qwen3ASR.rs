@@ -124,7 +124,11 @@ impl AudioBytesStream {
         bytes: &[u8],
         is_last: bool,
     ) -> Result<AudioChunk, WaveformError> {
-        let waveform = Waveform::from_i16_pcm_bytes(bytes, self.sample_rate)?;
+        let waveform = Waveform::from_i16_pcm_bytes_with_channels(
+            bytes,
+            self.sample_rate,
+            self.num_channels as u16,
+        )?;
         let samples = waveform.samples.len() as u64 / self.num_channels as u64;
         let start_sample = self.emitted_samples;
         self.emitted_samples += samples;
