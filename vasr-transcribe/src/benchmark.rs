@@ -330,8 +330,7 @@ mod tests {
     use super::{audio_source_from_record, local_path_from_uri, reference_text};
     use vasr_data::{
         Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioAsset,
-        AudioEncoding, PersistedAudioFormat, TextSegment, TimeRange, Timeline, VasrRecord,
-        Waveform,
+        AudioEncoding, PersistedAudioFormat, TextSpan, TimeRange, Timeline, VasrRecord, Waveform,
     };
 
     #[test]
@@ -339,7 +338,7 @@ mod tests {
         let mut timeline = Timeline::new("audio_1");
         timeline.push(Annotation::new(
             TimeRange::new(vasr_data::DurationMs(0), vasr_data::DurationMs(100)),
-            AnnotationPayload::Segment(TextSegment::new("hello")),
+            AnnotationPayload::Transcription(TextSpan::new("hello")),
             AnnotationSource::Model("asr".to_string()),
             AnnotationStatus::Final,
         ));

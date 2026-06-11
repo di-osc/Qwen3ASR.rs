@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use candle_core::Device;
 use vasr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSegment, TimeRange,
+    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange,
     Timeline, Token, Waveform,
 };
 use vasr_models::inference::utils::continuous_paged_batch_enabled;
@@ -98,7 +98,7 @@ impl AsrModel for Qwen3AsrModel {
                 }
                 timeline.push(Annotation::new(
                     range,
-                    AnnotationPayload::Segment(TextSegment {
+                    AnnotationPayload::Transcription(TextSpan {
                         text: output.text,
                         tokens: Vec::new(),
                         language: Some(output.language),
@@ -202,7 +202,7 @@ impl StreamingAsrModel for Qwen3AsrStreamModel {
             .map(|output| {
                 vec![Annotation::new(
                     chunk.range,
-                    AnnotationPayload::Segment(TextSegment {
+                    AnnotationPayload::Transcription(TextSpan {
                         text: output.text,
                         tokens: Vec::<Token>::new(),
                         language: Some(output.language),
@@ -222,7 +222,7 @@ impl StreamingAsrModel for Qwen3AsrStreamModel {
         let output = stream.finish()?;
         Ok(vec![Annotation::new(
             TimeRange::default(),
-            AnnotationPayload::Segment(TextSegment {
+            AnnotationPayload::Transcription(TextSpan {
                 text: output.text,
                 tokens: Vec::new(),
                 language: Some(output.language),

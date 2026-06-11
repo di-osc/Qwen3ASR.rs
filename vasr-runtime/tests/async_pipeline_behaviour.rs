@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use vasr_data::{
-    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSegment, TimeRange,
+    Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange,
     Timeline, Waveform,
 };
 use vasr_runtime::{
@@ -26,7 +26,7 @@ impl AsrModel for SlowFakeAsr {
         let mut timeline = Timeline::new("slow_asr");
         timeline.push(Annotation::new(
             TimeRange::default(),
-            AnnotationPayload::Segment(TextSegment::new("ok")),
+            AnnotationPayload::Transcription(TextSpan::new("ok")),
             AnnotationSource::Model("slow_asr".to_string()),
             AnnotationStatus::Final,
         ));

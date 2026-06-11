@@ -1,6 +1,6 @@
 use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioAsset,
-    AudioBytesStream, AudioEncoding, DurationMs, PersistedAudioFormat, TextSegment, TimeRange,
+    AudioBytesStream, AudioEncoding, DurationMs, PersistedAudioFormat, TextSpan, TimeRange,
     Timeline, Token, VasrRecord, VasrRecordList, Waveform, WaveformCache, WaveformError,
 };
 
@@ -113,7 +113,7 @@ fn timeline_derives_transcript_from_final_text_annotations_only() {
     let mut timeline = Timeline::new("audio_1");
     timeline.push(Annotation::new(
         TimeRange::new(DurationMs(0), DurationMs(100)),
-        AnnotationPayload::Segment(TextSegment {
+        AnnotationPayload::Transcription(TextSpan {
             text: "partial".to_string(),
             tokens: vec![],
             language: None,
@@ -123,7 +123,7 @@ fn timeline_derives_transcript_from_final_text_annotations_only() {
     ));
     timeline.push(Annotation::new(
         TimeRange::new(DurationMs(0), DurationMs(100)),
-        AnnotationPayload::Segment(TextSegment {
+        AnnotationPayload::Transcription(TextSpan {
             text: "hello".to_string(),
             tokens: vec![
                 Token::new("hello").with_range(TimeRange::new(DurationMs(0), DurationMs(40))),
@@ -135,7 +135,7 @@ fn timeline_derives_transcript_from_final_text_annotations_only() {
     ));
     timeline.push(Annotation::new(
         TimeRange::new(DurationMs(100), DurationMs(130)),
-        AnnotationPayload::Sentence(TextSegment {
+        AnnotationPayload::Sentence(TextSpan {
             text: "world".to_string(),
             tokens: vec![],
             language: None,
@@ -206,7 +206,7 @@ fn vasr_record_round_trips_messagepack_with_embedded_audio_bytes() {
     let mut timeline = Timeline::new("audio_1");
     timeline.push(Annotation::new(
         TimeRange::new(DurationMs(0), DurationMs(100)),
-        AnnotationPayload::Segment(TextSegment::new("hello")),
+        AnnotationPayload::Transcription(TextSpan::new("hello")),
         AnnotationSource::Model("asr".to_string()),
         AnnotationStatus::Final,
     ));

@@ -175,12 +175,14 @@ fn events_from_annotations(annotations: Vec<vasr_data::Annotation>) -> Vec<Serve
                     end_ms: annotation.range.end.0,
                 })
             }
-            AnnotationPayload::Segment(segment)
+            AnnotationPayload::Transcription(segment)
                 if annotation.status == AnnotationStatus::Partial =>
             {
                 Some(ServerRealtimeEvent::TranscriptionText { text: segment.text })
             }
-            AnnotationPayload::Segment(segment) if annotation.status == AnnotationStatus::Final => {
+            AnnotationPayload::Transcription(segment)
+                if annotation.status == AnnotationStatus::Final =>
+            {
                 Some(ServerRealtimeEvent::TranscriptionCompleted { text: segment.text })
             }
             _ => None,

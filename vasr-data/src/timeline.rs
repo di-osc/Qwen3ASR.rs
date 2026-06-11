@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{MediaId, TextSegment, TimeRange, Token, Transcript};
+use crate::{MediaId, TextSpan, TimeRange, Token, Transcript};
 
 pub type TimelineId = String;
 pub type AnnotationId = String;
@@ -47,8 +47,8 @@ pub enum AnnotationPayload {
     Speech,
     Silence,
     Token(Token),
-    Segment(TextSegment),
-    Sentence(TextSegment),
+    Transcription(TextSpan),
+    Sentence(TextSpan),
     Speaker(SpeakerId),
     Language(LanguageTag),
     Hotword(HotwordMatch),
@@ -125,7 +125,8 @@ impl Timeline {
             .iter()
             .filter(|annotation| annotation.status == AnnotationStatus::Final)
             .filter_map(|annotation| match &annotation.payload {
-                AnnotationPayload::Segment(segment) | AnnotationPayload::Sentence(segment) => {
+                AnnotationPayload::Transcription(segment)
+                | AnnotationPayload::Sentence(segment) => {
                     Some((annotation.range.start, segment.clone()))
                 }
                 _ => None,

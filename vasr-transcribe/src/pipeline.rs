@@ -1281,7 +1281,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use vasr_data::{
-        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSegment,
+        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, DurationMs, TextSpan,
         TimeRange,
     };
     use vasr_runtime::{AsrModel, StreamingAsrModel, VadSegment};
@@ -1314,7 +1314,7 @@ mod tests {
                     let mut timeline = Timeline::new("fake_batch_asr");
                     timeline.push(Annotation::new(
                         Default::default(),
-                        AnnotationPayload::Segment(TextSegment::new("ok")),
+                        AnnotationPayload::Transcription(TextSpan::new("ok")),
                         AnnotationSource::Model("fake_batch_asr".to_string()),
                         AnnotationStatus::Final,
                     ));
@@ -1596,7 +1596,7 @@ mod tests {
         let mut timeline = Timeline::new("canonical");
         timeline.push(Annotation::new(
             Default::default(),
-            AnnotationPayload::Segment(TextSegment::new("same result")),
+            AnnotationPayload::Transcription(TextSpan::new("same result")),
             AnnotationSource::Model("fake_batch_asr".to_string()),
             AnnotationStatus::Final,
         ));

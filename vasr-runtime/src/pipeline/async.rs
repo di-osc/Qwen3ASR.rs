@@ -621,7 +621,7 @@ mod tests {
     use std::sync::Arc;
 
     use vasr_data::{
-        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSegment, TimeRange,
+        Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, TextSpan, TimeRange,
     };
 
     use super::*;
@@ -648,7 +648,7 @@ mod tests {
                     let mut timeline = Timeline::new("fake_batch_asr");
                     timeline.push(Annotation::new(
                         TimeRange::default(),
-                        AnnotationPayload::Segment(TextSegment::new("ok")),
+                        AnnotationPayload::Transcription(TextSpan::new("ok")),
                         AnnotationSource::Model("fake_batch_asr".to_string()),
                         AnnotationStatus::Final,
                     ));

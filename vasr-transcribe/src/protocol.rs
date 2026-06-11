@@ -82,7 +82,8 @@ impl InferenceData {
             .filter(|annotation| annotation.status == AnnotationStatus::Final)
         {
             match &annotation.payload {
-                AnnotationPayload::Segment(segment) | AnnotationPayload::Sentence(segment) => {
+                AnnotationPayload::Transcription(segment)
+                | AnnotationPayload::Sentence(segment) => {
                     let duration = annotation.range.duration().0;
                     sentences.push(SentenceResult {
                         text: segment.text.clone(),

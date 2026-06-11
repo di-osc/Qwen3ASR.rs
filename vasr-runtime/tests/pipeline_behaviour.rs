@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use vasr_data::{
     Annotation, AnnotationPayload, AnnotationSource, AnnotationStatus, AudioChunk, DurationMs,
-    TextSegment, TimeRange, Timeline, Waveform,
+    TextSpan, TimeRange, Timeline, Waveform,
 };
 use vasr_runtime::{
     AsrModel, AsrOptions, OfflinePipeline, StreamingAsrModel, StreamingVadModel, VadModel,
@@ -27,7 +27,7 @@ impl AsrModel for FakeAsr {
                 DurationMs(0),
                 DurationMs(waveform.duration_ms().round() as u64),
             ),
-            AnnotationPayload::Segment(TextSegment::new("hello world")),
+            AnnotationPayload::Transcription(TextSpan::new("hello world")),
             AnnotationSource::Model("fake_asr".to_string()),
             AnnotationStatus::Final,
         ));
@@ -57,7 +57,7 @@ impl AsrModel for FakeAsr {
                         DurationMs(0),
                         DurationMs(waveform.duration_ms().round() as u64),
                     ),
-                    AnnotationPayload::Segment(TextSegment::new("hello batch")),
+                    AnnotationPayload::Transcription(TextSpan::new("hello batch")),
                     AnnotationSource::Model("fake_asr".to_string()),
                     AnnotationStatus::Final,
                 ));
@@ -77,7 +77,7 @@ impl StreamingAsrModel for FakeStream {
     fn push_chunk(&mut self, chunk: &AudioChunk) -> Result<Vec<Annotation>> {
         Ok(vec![Annotation::new(
             chunk.range,
-            AnnotationPayload::Segment(TextSegment::new("partial")),
+            AnnotationPayload::Transcription(TextSpan::new("partial")),
             AnnotationSource::Model("fake_asr".to_string()),
             AnnotationStatus::Partial,
         )])
@@ -86,7 +86,7 @@ impl StreamingAsrModel for FakeStream {
     fn finish(&mut self) -> Result<Vec<Annotation>> {
         Ok(vec![Annotation::new(
             TimeRange::default(),
-            AnnotationPayload::Segment(TextSegment::new("final")),
+            AnnotationPayload::Transcription(TextSpan::new("final")),
             AnnotationSource::Model("fake_asr".to_string()),
             AnnotationStatus::Final,
         )])
@@ -181,7 +181,7 @@ fn offline_pipeline_merges_nearby_vad_segments_before_asr() -> Result<()> {
     let final_segments = timeline
         .annotations
         .iter()
-        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
+        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Transcription(_)))
         .collect::<Vec<_>>();
     assert_eq!(final_segments.len(), 1);
     assert_eq!(final_segments[0].range.start, DurationMs(500));
@@ -216,7 +216,7 @@ fn offline_pipeline_pads_vad_slice_for_asr_context() -> Result<()> {
     let final_segments = timeline
         .annotations
         .iter()
-        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
+        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Transcription(_)))
         .collect::<Vec<_>>();
     assert_eq!(final_segments.len(), 1);
     assert_eq!(final_segments[0].range.start, DurationMs(0));
@@ -257,7 +257,7 @@ fn offline_pipeline_uses_full_waveform_when_padded_vad_covers_audio() -> Result<
     let final_segments = timeline
         .annotations
         .iter()
-        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Segment(_)))
+        .filter(|annotation| matches!(annotation.payload, AnnotationPayload::Transcription(_)))
         .collect::<Vec<_>>();
     assert_eq!(final_segments.len(), 1);
     assert_eq!(final_segments[0].range.start, DurationMs(0));

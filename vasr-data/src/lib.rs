@@ -20,7 +20,7 @@ pub use record::{
     AudioAsset, AudioEncoding, PersistedAudioFormat, RecordError, VasrRecord, VasrRecordList,
     WaveformCache,
 };
-pub use segment::{TextSegment, Transcript};
+pub use segment::{TextSpan, Transcript};
 pub use stream::{AudioBytesStream, AudioChunk, AudioChunkList};
 pub use time::{DurationMs, SampleIndex, TimeRange};
 pub use timeline::{

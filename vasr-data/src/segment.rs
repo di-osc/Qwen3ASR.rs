@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 use crate::Token;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TextSegment {
+pub struct TextSpan {
     pub text: String,
     #[serde(default)]
     pub tokens: Vec<Token>,
     pub language: Option<String>,
 }
 
-impl TextSegment {
+impl TextSpan {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -25,5 +25,5 @@ pub struct Transcript {
     pub text: String,
     pub language: Option<String>,
     #[serde(default)]
-    pub segments: Vec<TextSegment>,
+    pub segments: Vec<TextSpan>,
 }
