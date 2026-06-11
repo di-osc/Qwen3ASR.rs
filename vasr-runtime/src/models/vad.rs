@@ -931,11 +931,16 @@ impl WavFrontend {
 
 fn download_fsmn_vad() -> Result<PathBuf> {
     let cache = vasr_models::modelscope_cache_dir();
-
-    block_on_async(modelscope::ModelScope::download(FSMN_VAD_REPO, &cache))
-        .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
-
-    Ok(cache.join(FSMN_VAD_REPO))
+    let target = cache.join(FSMN_VAD_REPO);
+    if target.exists() {
+        return Ok(target);
+    }
+    block_on_async(vasr_models::download::download_model(
+        FSMN_VAD_REPO,
+        &cache,
+    ))
+    .with_context(|| format!("failed to download FSMN VAD model {FSMN_VAD_REPO:?}"))?;
+    Ok(target)
 }
 
 fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output

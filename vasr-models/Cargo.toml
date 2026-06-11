@@ -20,8 +20,9 @@ serde_json = "1"
 tracing = "0.1"
 
 tokenizers = "0.23"
-modelscope = "0.1"
-tokio = { version = "1", features = ["rt"] }
+futures-util = "0.3"
+reqwest = { version = "0.13", features = ["json", "stream", "blocking", "rustls"], default-features = false }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 safetensors = "0.7"
 bytemuck = { version = "1", features = ["derive"] }
 rustfft = "6"
@@ -39,7 +40,6 @@ vasr-quant = { path = "../vasr-quant", default-features = false }
 symphonia = { version = "0.6", features = ["all-codecs", "all-formats"], optional = true }
 rubato = { version = "3", optional = true }
 base64 = { version = "0.22", optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
 lindera = { version = "2.2.0", optional = true }
 lindera-ipadic = { version = "2.2.0", optional = true }
 unicode-general-category = "1.1.0"
@@ -90,7 +90,7 @@ cuda-paged-attn = [
 ]
 cudarc = ["dep:cudarc"]
 
-audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64", "dep:reqwest"]
+audio-loading = ["dep:symphonia", "dep:rubato", "dep:base64"]
 
 forced-aligner = [
   "dep:lindera",

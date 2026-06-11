@@ -179,14 +179,16 @@ where
 }
 
 fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
-    use modelscope::ModelScope;
-
     let cache = crate::modelscope_cache_dir();
-
-    block_on_async(ModelScope::download(repo_id, &cache))
+    let target = cache.join(repo_id);
+    if target.exists() {
+        tracing::info!("Model `{repo_id}` found at {}", target.display());
+        return Ok(target);
+    }
+    tracing::info!("Downloading model `{repo_id}` to {}", cache.display());
+    block_on_async(crate::download::download_model(repo_id, &cache))
         .with_context(|| format!("failed to download model {repo_id:?} from ModelScope"))?;
-
-    Ok(cache.join(repo_id))
+    Ok(target)
 }
 
 fn resolve_model_dir(model_id_or_path: &str) -> Result<PathBuf> {

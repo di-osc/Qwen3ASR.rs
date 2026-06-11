@@ -16,14 +16,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 fn modelscope_download(repo_id: &str) -> Result<PathBuf> {
-    use modelscope::ModelScope;
-
     let cache = crate::modelscope_cache_dir();
-
-    block_on_async(ModelScope::download(repo_id, &cache))
+    let target = cache.join(repo_id);
+    if target.exists() {
+        return Ok(target);
+    }
+    block_on_async(crate::download::download_model(repo_id, &cache))
         .with_context(|| format!("failed to download tokenizer for {repo_id:?} from ModelScope"))?;
-
-    Ok(cache.join(repo_id))
+    Ok(target)
 }
 
 fn block_on_async<F: std::future::Future + Send>(future: F) -> F::Output
