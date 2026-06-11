@@ -1,13 +1,14 @@
-//! Vendored ModelScope downloader (stripped of indicatif / clap / login).
+//! Vendored ModelScope downloader.
 //!
 //! Kept in-tree so we control the download UX instead of relying on the
 //! external `modelscope` crate.
 
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Deserialize;
 use std::fs;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,6 +21,8 @@ const UA: (&str, &str) = (
     "User-Agent",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.90 Safari/537.36",
 );
+
+const BAR_STYLE: &str = "{msg:<30} {bar} {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12} {percent:<3}%  {eta_precise}";
 
 #[derive(Debug, Deserialize)]
 struct ModelScopeResponse {
@@ -96,6 +99,7 @@ async fn download_file(
     model_id: String,
     repo_file: RepoFile,
     save_dir: PathBuf,
+    bar: ProgressBar,
 ) -> anyhow::Result<()> {
     let path = &repo_file.path;
     let file_path = save_dir.join(path);
@@ -107,10 +111,17 @@ async fn download_file(
     if file_path.exists() {
         if let Ok(meta) = fs::metadata(&file_path) {
             if meta.len() == repo_file.size {
+                bar.set_message(format!("{} (cached)", repo_file.name));
+                bar.set_length(1);
+                bar.set_position(1);
+                bar.finish();
                 return Ok(());
             }
         }
     }
+
+    bar.set_message(repo_file.name.clone());
+    bar.set_length(repo_file.size);
 
     let url = DOWNLOAD_URL
         .replace("<model_id>", &model_id)
@@ -121,6 +132,7 @@ async fn download_file(
 
     let status = response.status();
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        bar.abandon();
         bail!(
             "Failed to download file {}: HTTP {}",
             repo_file.name,
@@ -132,8 +144,10 @@ async fn download_file(
     while let Some(item) = stream.next().await {
         let chunk = item?;
         file.write_all(&chunk)?;
+        bar.inc(chunk.len() as u64);
     }
     file.flush()?;
+    bar.finish();
     Ok(())
 }
 
@@ -141,6 +155,8 @@ async fn download_file(
 ///
 /// `save_dir` is the *cache root* (e.g. `$HOME/.cache/vasr`).
 /// The actual files are placed under `save_dir/<model_id>`.
+///
+/// Progress bars are displayed only when files actually need downloading.
 pub async fn download_model(model_id: &str, save_dir: impl Into<PathBuf>) -> anyhow::Result<()> {
     let save_dir = save_dir.into();
     fs::create_dir_all(&save_dir)?;
@@ -172,15 +188,20 @@ pub async fn download_model(model_id: &str, save_dir: impl Into<PathBuf>) -> any
         .filter(|f| f.r#type == "blob")
         .collect();
 
-    let total = repo_files.len();
+    let bars = MultiProgress::new();
     let mut tasks = Vec::new();
 
     for repo_file in repo_files {
+        let bar = ProgressBar::new(0);
+        let style = ProgressStyle::default_bar().template(BAR_STYLE)?;
+        bar.set_style(style);
+        bars.add(bar.clone());
+
         let client = client.clone();
         let model_id = model_id.to_string();
         let save_dir = model_dir.clone();
         let task = tokio::spawn(async move {
-            download_file(client, model_id, repo_file, save_dir).await
+            download_file(client, model_id, repo_file, save_dir, bar).await
         });
         tasks.push(task);
     }
@@ -189,9 +210,6 @@ pub async fn download_model(model_id: &str, save_dir: impl Into<PathBuf>) -> any
         task.await??;
     }
 
-    tracing::info!(
-        "Downloaded `{model_id}` ({total} files) to {}",
-        model_dir.display()
-    );
+    tracing::info!("Downloaded `{model_id}` to {}", model_dir.display());
     Ok(())
 }

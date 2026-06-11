@@ -21,6 +21,7 @@ tracing = "0.1"
 
 tokenizers = "0.23"
 futures-util = "0.3"
+indicatif = "0.18"
 reqwest = { version = "0.13", features = ["json", "stream", "blocking", "rustls"], default-features = false }
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 safetensors = "0.7"
